@@ -2,12 +2,12 @@
 
 This repository isolates local orchestration and backend overrides from the upstream `llm-graph-builder` project.
 
-The goal is to keep `llm-graph-builder` vendored as an upstream dependency while carrying script-specific behavior here.
+The goal is to keep `llm-graph-builder` pinned as an upstream submodule while carrying script-specific behavior here.
 
 ## Structure
 
 - `vendor/llm-graph-builder/`
-  - Upstream checkout of `neo4j-labs/llm-graph-builder`
+  - Upstream Git submodule checkout of `neo4j-labs/llm-graph-builder`
   - Currently pinned to commit `61121df4c15716f67636a4fac2c96e909d374ada`
 - `src/`
   - Overlay package for backend modules that differ from upstream
@@ -32,7 +32,7 @@ These modules are intentionally overridden here:
 - `src/adaptive_retry.py`
 - `src/shared/common_fn.py`
 
-Everything else resolves from vendored upstream.
+Everything else resolves from the upstream submodule.
 
 Do not patch files under `vendor/llm-graph-builder/` for local behavior changes. Put those changes in the overlay package instead.
 
@@ -45,7 +45,7 @@ Do not patch files under `vendor/llm-graph-builder/` for local behavior changes.
 
 ## Runtime
 
-The local entrypoints import the vendored backend directly through the `src`
+The local entrypoints import the upstream backend directly through the `src`
 overlay package. Docker is only used where scripts explicitly provision a
 Neo4j container.
 
@@ -72,7 +72,7 @@ python scripts\postprocess_graph.py --help
 
 ## Dependencies
 
-Python dependencies for consolidation and backend-aligned execution come from vendored upstream:
+Python dependencies for consolidation and backend-aligned execution come from the upstream submodule:
 
 - `vendor/llm-graph-builder/backend/requirements.txt`
 - `vendor/llm-graph-builder/backend/constraints.txt`
@@ -82,5 +82,5 @@ Python dependencies for consolidation and backend-aligned execution come from ve
 ## Notes
 
 - This repo is meant to own orchestration code and backend deltas only.
-- The vendored upstream checkout is the baseline implementation.
+- The upstream submodule checkout is the baseline implementation.
 - Generated artifacts such as `__pycache__`, `.pytest_cache`, `tests/_tmp`, and `runs/` are ignored.

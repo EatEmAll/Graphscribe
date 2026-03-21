@@ -1,2 +1,0 @@
-langchain-neo4j
-neo4j
