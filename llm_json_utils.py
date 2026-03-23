@@ -2,15 +2,23 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import time
 from pathlib import Path
 from typing import Any, Callable
 
+from google import genai
 from google.genai import types
+from openai import OpenAI
+
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 
 
 def extract_response_text(response: Any) -> str:
+    output_text = getattr(response, "output_text", None)
+    if isinstance(output_text, str):
+        return output_text.strip()
     text = getattr(response, "text", None)
     return text.strip() if isinstance(text, str) else ""
 
@@ -123,6 +131,7 @@ def is_transient_model_error(exc: Exception) -> bool:
 def generate_json_payload(
     client: Any,
     *,
+    client_name: str = "genai",
     model_name: str,
     prompt: str,
     system_instruction: str,
@@ -136,15 +145,14 @@ def generate_json_payload(
     attempts = max(max_attempts, 1)
     for attempt in range(1, attempts + 1):
         try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    max_output_tokens=max_output_tokens,
-                    temperature=temperature,
-                    response_mime_type="application/json",
-                ),
+            response = _generate_structured_response(
+                client,
+                client_name=client_name,
+                model_name=model_name,
+                prompt=prompt,
+                system_instruction=system_instruction,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
             )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -162,3 +170,73 @@ def generate_json_payload(
             time.sleep(retry_sleep_seconds * attempt)
 
     return None, last_error
+
+
+def build_openai_compatible_client(*, api_key: str, base_url: str | None = None) -> OpenAI:
+    kwargs: dict[str, Any] = {"api_key": api_key}
+    if base_url:
+        kwargs["base_url"] = base_url
+    return OpenAI(**kwargs)
+
+
+def build_single_prompt_clients(*client_names: str) -> dict[str, Any]:
+    clients: dict[str, Any] = {}
+    for raw_client_name in client_names:
+        client_name = raw_client_name.strip().lower()
+        if not client_name or client_name in clients:
+            continue
+        if client_name == "genai":
+            api_key = os.environ.get("GOOGLE_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("Set GOOGLE_API_KEY environment variable.")
+            clients[client_name] = genai.Client(api_key=api_key)
+            continue
+        if client_name == "openai":
+            api_key = os.environ.get("OPENAI_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("Set OPENAI_API_KEY environment variable.")
+            clients[client_name] = build_openai_compatible_client(api_key=api_key)
+            continue
+        if client_name == "openrouter":
+            api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("Set OPENROUTER_API_KEY environment variable.")
+            clients[client_name] = build_openai_compatible_client(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+            continue
+        raise ValueError(f"Unsupported single-prompt client '{raw_client_name}'.")
+    return clients
+
+
+def _generate_structured_response(
+    client: Any,
+    *,
+    client_name: str,
+    model_name: str,
+    prompt: str,
+    system_instruction: str,
+    max_output_tokens: int,
+    temperature: float,
+) -> Any:
+    normalized_client = client_name.strip().lower()
+    if normalized_client == "genai":
+        return client.models.generate_content(
+            model=model_name,
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                max_output_tokens=max_output_tokens,
+                temperature=temperature,
+                response_mime_type="application/json",
+            ),
+        )
+    if normalized_client in {"openai", "openrouter"}:
+        return client.responses.create(
+            model=model_name,
+            input=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt},
+            ],
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+        )
+    raise ValueError(f"Unsupported single-prompt client '{client_name}'.")

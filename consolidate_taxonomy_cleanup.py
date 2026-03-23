@@ -9,6 +9,7 @@ only. It never creates synthetic ontology nodes.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import time
@@ -21,7 +22,8 @@ from neo4j import GraphDatabase
 
 from consolidate_tier2_relabel import load_label_catalog
 from graph_text_utils import coerce_text, normalize_name, token_set
-from llm_json_utils import generate_json_payload
+from llm_json_utils import build_single_prompt_clients, generate_json_payload
+from llm_routing import TAXONOMY_PRIMARY_ROLE, TAXONOMY_SECONDARY_ROLE, PromptRoleConfig, resolve_prompt_role
 
 DEFAULT_NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 DEFAULT_NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")
@@ -667,19 +669,25 @@ def _build_prompt(node: dict[str, Any], candidates: list[dict[str, Any]], *, rel
 
 
 def _classify_once(
-    client: genai.Client,
+    clients: dict[str, Any] | Any,
     *,
-    model_name: str,
+    role_config: PromptRoleConfig | None = None,
+    model_name: str | None = None,
     label_catalog: dict[str, Any],
     node: dict[str, Any],
     candidates: list[dict[str, Any]],
+    stage: str = "primary",
     relation_only: bool = False,
 ) -> dict[str, Any]:
+    if role_config is None:
+        if not model_name:
+            raise ValueError("role_config or model_name is required.")
+        role_config = PromptRoleConfig(client="genai", model=model_name)
     prompt = _build_prompt(node, candidates, relation_only=relation_only)
-    stage = "primary" if model_name == MODEL_NAME else "second_stage"
     payload, error_message = generate_json_payload(
-        client,
-        model_name=model_name,
+        _resolve_client(clients, role_config.client),
+        client_name=role_config.client,
+        model_name=role_config.model,
         prompt=prompt,
         system_instruction=build_system_prompt(label_catalog, relation_only=relation_only),
         max_output_tokens=220,
@@ -696,7 +704,8 @@ def _classify_once(
             "target_eid": None,
             "confidence": 0.0,
             "reason": error_message or "Invalid or empty JSON response",
-            "model_name": model_name,
+            "client_name": role_config.client,
+            "model_name": role_config.model,
             "stage": stage,
         }
 
@@ -708,25 +717,41 @@ def _classify_once(
     )
     return {
         **normalized,
-        "model_name": model_name,
+        "client_name": role_config.client,
+        "model_name": role_config.model,
         "stage": stage,
     }
 
 
 def classify_taxonomy_action(
-    client: genai.Client,
+    clients: dict[str, Any] | Any,
     *,
     label_catalog: dict[str, Any],
     node: dict[str, Any],
     candidates: list[dict[str, Any]],
+    primary_role_config: PromptRoleConfig | None = None,
+    secondary_role_config: PromptRoleConfig | None = None,
     relation_only: bool = False,
 ) -> dict[str, Any]:
+    primary_role = primary_role_config or resolve_prompt_role(
+        None,
+        TAXONOMY_PRIMARY_ROLE,
+        default_client="genai",
+        default_model=MODEL_NAME,
+    )
+    secondary_role = secondary_role_config or resolve_prompt_role(
+        None,
+        TAXONOMY_SECONDARY_ROLE,
+        default_client="genai",
+        default_model=SECOND_STAGE_MODEL_NAME,
+    )
     primary = _classify_once(
-        client,
-        model_name=MODEL_NAME,
+        clients,
+        role_config=primary_role,
         label_catalog=label_catalog,
         node=node,
         candidates=candidates,
+        stage="primary",
         relation_only=relation_only,
     )
     needs_second_stage = _should_escalate_to_second_stage(primary, node=node, candidates=candidates)
@@ -738,11 +763,12 @@ def classify_taxonomy_action(
         }
 
     secondary = _classify_once(
-        client,
-        model_name=SECOND_STAGE_MODEL_NAME,
+        clients,
+        role_config=secondary_role,
         label_catalog=label_catalog,
         node=node,
         candidates=candidates,
+        stage="second_stage",
         relation_only=relation_only,
     )
     if secondary["status"] == "classified":
@@ -766,11 +792,45 @@ def classify_taxonomy_action(
         "target_eid": None,
         "confidence": max(primary["confidence"], secondary["confidence"]),
         "reason": secondary["reason"] or primary["reason"] or "Low confidence taxonomy decision",
+        "client_name": secondary["client_name"],
         "model_name": secondary["model_name"],
         "stage": "second_stage",
         "used_second_stage": False,
         "attempted_second_stage": True,
     }
+
+
+def _call_classify_taxonomy_action(
+    clients: dict[str, Any] | Any,
+    *,
+    label_catalog: dict[str, Any],
+    node: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    primary_role_config: PromptRoleConfig,
+    secondary_role_config: PromptRoleConfig,
+    relation_only: bool = False,
+) -> dict[str, Any]:
+    signature = inspect.signature(classify_taxonomy_action)
+    supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+    supported_names = set(signature.parameters)
+    kwargs: dict[str, Any] = {
+        "label_catalog": label_catalog,
+        "node": node,
+        "candidates": candidates,
+    }
+    if supports_kwargs or "primary_role_config" in supported_names:
+        kwargs["primary_role_config"] = primary_role_config
+    if supports_kwargs or "secondary_role_config" in supported_names:
+        kwargs["secondary_role_config"] = secondary_role_config
+    if relation_only and (supports_kwargs or "relation_only" in supported_names):
+        kwargs["relation_only"] = relation_only
+    return classify_taxonomy_action(clients, **kwargs)
+
+
+def _resolve_client(clients: dict[str, Any] | Any, client_name: str) -> Any:
+    if isinstance(clients, dict):
+        return clients[client_name]
+    return clients
 
 
 def _label_is_allowed(label: str | None, label_catalog: dict[str, Any]) -> bool:
@@ -994,10 +1054,20 @@ def run(
     prior_review_json: str | None,
     summary_json: str | None,
     decisions_jsonl: str | None,
+    llm_routing_config: str | None = None,
 ) -> dict[str, Any]:
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("Set GOOGLE_API_KEY environment variable.")
-
+    primary_role_config = resolve_prompt_role(
+        llm_routing_config,
+        TAXONOMY_PRIMARY_ROLE,
+        default_client="genai",
+        default_model=MODEL_NAME,
+    )
+    secondary_role_config = resolve_prompt_role(
+        llm_routing_config,
+        TAXONOMY_SECONDARY_ROLE,
+        default_client="genai",
+        default_model=SECOND_STAGE_MODEL_NAME,
+    )
     label_catalog = load_label_catalog(labels_json)
     tier2_decisions = _parse_jsonl(tier2_decisions_jsonl)
     prior_taxonomy_decisions = _parse_jsonl(prior_taxonomy_decisions_jsonl)
@@ -1009,7 +1079,7 @@ def run(
     if codex_queue_path is not None and codex_queue_path.exists():
         codex_queue_path.unlink()
 
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    clients = build_single_prompt_clients(primary_role_config.client, secondary_role_config.client)
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     started = time.time()
     summary: dict[str, Any]
@@ -1059,11 +1129,13 @@ def run(
                     candidate_limit=candidate_limit,
                     embedding_threshold=embedding_threshold,
                 )
-                decision = classify_taxonomy_action(
-                    client,
+                decision = _call_classify_taxonomy_action(
+                    clients,
                     label_catalog=label_catalog,
                     node=node,
                     candidates=candidates,
+                    primary_role_config=primary_role_config,
+                    secondary_role_config=secondary_role_config,
                 )
                 processed_nodes += 1
                 if decision.get("attempted_second_stage"):
@@ -1128,11 +1200,13 @@ def run(
                                 candidate_limit=candidate_limit,
                                 embedding_threshold=embedding_threshold,
                             )
-                            follow_up = classify_taxonomy_action(
-                                client,
+                            follow_up = _call_classify_taxonomy_action(
+                                clients,
                                 label_catalog=label_catalog,
                                 node=updated_node,
                                 candidates=follow_up_candidates,
+                                primary_role_config=primary_role_config,
+                                secondary_role_config=secondary_role_config,
                                 relation_only=True,
                             )
                             follow_up_action = follow_up["action"]
@@ -1238,6 +1312,7 @@ def run(
                         "target_eid": decision_target_eid,
                         "confidence": round(float(decision["confidence"]), 4),
                         "reason": decision["reason"],
+                        "client_name": decision.get("client_name", primary_role_config.client),
                         "model_name": decision["model_name"],
                         "stage": decision["stage"],
                         "used_second_stage": bool(decision.get("used_second_stage", False)),
@@ -1297,8 +1372,10 @@ def run(
             summary = {
                 "tier": "taxonomy",
                 "dry_run": dry_run,
-                "model_name": MODEL_NAME,
-                "second_stage_model_name": SECOND_STAGE_MODEL_NAME,
+                "client_name": primary_role_config.client,
+                "model_name": primary_role_config.model,
+                "second_stage_client_name": secondary_role_config.client,
+                "second_stage_model_name": secondary_role_config.model,
                 "params": {
                     "max_nodes": max_nodes,
                     "candidate_limit": candidate_limit,
@@ -1353,6 +1430,7 @@ def main() -> None:
     parser.add_argument("--neo4j-user", type=str, default=DEFAULT_NEO4J_USER)
     parser.add_argument("--neo4j-password", type=str, default=DEFAULT_NEO4J_PASSWORD)
     parser.add_argument("--neo4j-database", type=str, default=DEFAULT_NEO4J_DATABASE)
+    parser.add_argument("--llm-routing-config", type=str, default=None)
     args = parser.parse_args()
 
     if args.max_nodes <= 0:
@@ -1377,6 +1455,7 @@ def main() -> None:
         prior_review_json=args.prior_review_json,
         summary_json=args.summary_json,
         decisions_jsonl=args.decisions_jsonl,
+        llm_routing_config=args.llm_routing_config,
     )
     print(json.dumps(summary, indent=2))
 

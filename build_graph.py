@@ -9,12 +9,15 @@ filesystem and drives graph extraction in-process, without the FastAPI backend.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from pathlib import Path
 
 from graph_builder_runtime import GraphBuilderAPI
+from llm_routing import resolve_graph_build_embedding
 
 DEFAULT_TOKEN_CHUNK_SIZE = 2000
 DEFAULT_CHUNK_OVERLAP = 200
@@ -129,6 +132,8 @@ def _upload_and_extract_one(
     api: GraphBuilderAPI,
     file_path: Path,
     model: str,
+    embedding_provider: str,
+    embedding_model: str,
     poll_interval: int,
     token_chunk_size: int,
     chunk_overlap: int,
@@ -141,6 +146,8 @@ def _upload_and_extract_one(
     resp = api.extract(
         file_path.name,
         model,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
         retry_condition=retry_condition,
         token_chunk_size=token_chunk_size,
         chunk_overlap=chunk_overlap,
@@ -153,6 +160,8 @@ def _extract_existing_one(
     api: GraphBuilderAPI,
     file_name: str,
     model: str,
+    embedding_provider: str,
+    embedding_model: str,
     poll_interval: int,
     token_chunk_size: int,
     chunk_overlap: int,
@@ -162,6 +171,8 @@ def _extract_existing_one(
     resp = api.extract(
         file_name,
         model,
+        embedding_provider=embedding_provider,
+        embedding_model=embedding_model,
         retry_condition=retry_condition,
         token_chunk_size=token_chunk_size,
         chunk_overlap=chunk_overlap,
@@ -181,6 +192,22 @@ def _run_parallel(items, fn, parallel: int):
             yield future.result()
 
 
+@contextmanager
+def _temporary_embedding_dimension_override(dimension: int | None):
+    original = os.environ.get("EMBEDDING_DIMENSION_OVERRIDE")
+    try:
+        if dimension is None:
+            os.environ.pop("EMBEDDING_DIMENSION_OVERRIDE", None)
+        else:
+            os.environ["EMBEDDING_DIMENSION_OVERRIDE"] = str(dimension)
+        yield
+    finally:
+        if original is None:
+            os.environ.pop("EMBEDDING_DIMENSION_OVERRIDE", None)
+        else:
+            os.environ["EMBEDDING_DIMENSION_OVERRIDE"] = original
+
+
 def _summarize_results(results: list[tuple[str, str]], skipped: int) -> tuple[int, int, int]:
     completed = sum(1 for _, status in results if "Completed" in status)
     failed = len(results) - completed
@@ -191,6 +218,8 @@ def phase_upload_and_extract(
     api: GraphBuilderAPI,
     sources_dir: Path,
     model: str,
+    embedding_provider: str,
+    embedding_model: str,
     min_file_size: int,
     parallel: int,
     poll_interval: int,
@@ -219,6 +248,8 @@ def phase_upload_and_extract(
             api,
             file_path,
             model,
+            embedding_provider,
+            embedding_model,
             poll_interval,
             token_chunk_size,
             chunk_overlap,
@@ -239,6 +270,8 @@ def phase_extract_existing(
     api: GraphBuilderAPI,
     sources_dir: Path,
     model: str,
+    embedding_provider: str,
+    embedding_model: str,
     min_file_size: int,
     parallel: int,
     poll_interval: int,
@@ -265,6 +298,8 @@ def phase_extract_existing(
             api,
             file_name,
             model,
+            embedding_provider,
+            embedding_model,
             poll_interval,
             token_chunk_size,
             chunk_overlap,
@@ -321,8 +356,9 @@ Examples:
     parser.add_argument("--token-chunk-size", type=int, default=DEFAULT_TOKEN_CHUNK_SIZE, help=f"Token chunk size for extraction (default: {DEFAULT_TOKEN_CHUNK_SIZE})")
     parser.add_argument("--chunk-overlap", type=int, default=DEFAULT_CHUNK_OVERLAP, help=f"Chunk overlap for extraction (default: {DEFAULT_CHUNK_OVERLAP})")
     parser.add_argument("--chunks-to-combine", type=int, default=DEFAULT_CHUNKS_TO_COMBINE, help=f"Number of chunks to combine during extraction (default: {DEFAULT_CHUNKS_TO_COMBINE})")
-    parser.add_argument("--embedding-provider", default="sentence-transformer", help="Embedding provider")
-    parser.add_argument("--embedding-model", default="all-MiniLM-L6-v2", help="Embedding model")
+    parser.add_argument("--embedding-provider", default=None, help="Embedding provider override")
+    parser.add_argument("--embedding-model", default=None, help="Embedding model override")
+    parser.add_argument("--llm-routing-config", default=None, help="Optional JSON config for role-based LLM routing")
     parser.add_argument("--skip-upload", action="store_true", help="Skip source registration")
     parser.add_argument("--skip-extract", action="store_true", help="Skip extraction")
     parser.add_argument("--skip-postprocess", action="store_true", help="Skip the post-processing phase")
@@ -332,12 +368,20 @@ Examples:
 def main() -> None:
     args = parse_args()
     sources_dir = Path(args.sources_dir).resolve()
+    graph_build_embedding = resolve_graph_build_embedding(
+        config_path=args.llm_routing_config,
+        embedding_provider=args.embedding_provider,
+        embedding_model=args.embedding_model,
+        default_provider="sentence-transformer",
+        default_model="all-MiniLM-L6-v2",
+    )
 
     print(f"\n{C.BOLD}Local Graph Builder Pipeline{C.RESET}\n")
     log(f"Neo4j:       {args.neo4j_uri}")
     log(f"Model:       {args.model}")
     log(f"Sources:     {sources_dir}")
     log(f"Parallel:    {args.parallel}")
+    log(f"Embedding:   {graph_build_embedding.client}/{graph_build_embedding.model}")
     log(f"Poll every:  {args.poll_interval}s")
     log(f"Chunking:    size={args.token_chunk_size}, overlap={args.chunk_overlap}, combine={args.chunks_to_combine}")
     print()
@@ -356,57 +400,62 @@ def main() -> None:
         sys.exit(1)
     log("Local runtime is healthy", "OK")
 
-    log("Connecting to Neo4j...", "INFO")
-    resp = api.connect(args.embedding_provider, args.embedding_model)
-    if resp.get("status") != "Success":
-        log(f"Neo4j connection failed: {resp.get('message', 'unknown')}", "ERROR")
-        sys.exit(1)
-    log("Neo4j connection established", "OK")
+    with _temporary_embedding_dimension_override(graph_build_embedding.dimension):
+        log("Connecting to Neo4j...", "INFO")
+        resp = api.connect(graph_build_embedding.client, graph_build_embedding.model)
+        if resp.get("status") != "Success":
+            log(f"Neo4j connection failed: {resp.get('message', 'unknown')}", "ERROR")
+            sys.exit(1)
+        log("Neo4j connection established", "OK")
 
-    total_start = time.time()
-    results: dict[str, dict[str, int | bool]] = {}
+        total_start = time.time()
+        results: dict[str, dict[str, int | bool]] = {}
 
-    if not sources_dir.exists():
-        log(f"Sources directory not found: {sources_dir}", "ERROR")
-        sys.exit(1)
+        if not sources_dir.exists():
+            log(f"Sources directory not found: {sources_dir}", "ERROR")
+            sys.exit(1)
 
-    if not args.skip_upload and not args.skip_extract:
-        c, s, f = phase_upload_and_extract(
-            api,
-            sources_dir,
-            args.model,
-            args.min_file_size,
-            args.parallel,
-            args.poll_interval,
-            args.token_chunk_size,
-            args.chunk_overlap,
-            args.chunks_to_combine,
-        )
-        results["upload_and_extract"] = {"completed": c, "skipped": s, "failed": f}
-    elif not args.skip_upload and args.skip_extract:
-        u, s, f = phase_upload(api, sources_dir, args.model, args.min_file_size)
-        results["upload"] = {"uploaded": u, "skipped": s, "failed": f}
-    elif args.skip_upload and not args.skip_extract:
-        c, s, f = phase_extract_existing(
-            api,
-            sources_dir,
-            args.model,
-            args.min_file_size,
-            args.parallel,
-            args.poll_interval,
-            args.token_chunk_size,
-            args.chunk_overlap,
-            args.chunks_to_combine,
-        )
-        results["extract"] = {"completed": c, "skipped": s, "failed": f}
-    else:
-        log("Skipping upload and extraction phases", "SKIP")
+        if not args.skip_upload and not args.skip_extract:
+            c, s, f = phase_upload_and_extract(
+                api,
+                sources_dir,
+                args.model,
+                graph_build_embedding.client,
+                graph_build_embedding.model,
+                args.min_file_size,
+                args.parallel,
+                args.poll_interval,
+                args.token_chunk_size,
+                args.chunk_overlap,
+                args.chunks_to_combine,
+            )
+            results["upload_and_extract"] = {"completed": c, "skipped": s, "failed": f}
+        elif not args.skip_upload and args.skip_extract:
+            u, s, f = phase_upload(api, sources_dir, args.model, args.min_file_size)
+            results["upload"] = {"uploaded": u, "skipped": s, "failed": f}
+        elif args.skip_upload and not args.skip_extract:
+            c, s, f = phase_extract_existing(
+                api,
+                sources_dir,
+                args.model,
+                graph_build_embedding.client,
+                graph_build_embedding.model,
+                args.min_file_size,
+                args.parallel,
+                args.poll_interval,
+                args.token_chunk_size,
+                args.chunk_overlap,
+                args.chunks_to_combine,
+            )
+            results["extract"] = {"completed": c, "skipped": s, "failed": f}
+        else:
+            log("Skipping upload and extraction phases", "SKIP")
 
-    if not args.skip_postprocess:
-        ok = phase_postprocess(api, args.embedding_provider, args.embedding_model)
-        results["postprocess"] = {"success": ok}
-    else:
-        log("Skipping post-processing phase (--skip-postprocess)", "SKIP")
+        if not args.skip_postprocess:
+            ok = phase_postprocess(api, graph_build_embedding.client, graph_build_embedding.model)
+            results["postprocess"] = {"success": ok}
+        else:
+            log("Skipping post-processing phase (--skip-postprocess)", "SKIP")
 
     total_time = time.time() - total_start
     print(f"{C.BOLD}{'=' * 56}{C.RESET}")

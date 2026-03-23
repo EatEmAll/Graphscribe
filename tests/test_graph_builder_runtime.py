@@ -131,6 +131,8 @@ def test_phase_upload_and_extract_propagates_retry_condition(tmp_path: Path) -> 
         api,
         tmp_path,
         "google_flash",
+        "openrouter",
+        "text-embedding-3-small",
         min_file_size=1,
         parallel=1,
         poll_interval=0,
@@ -144,6 +146,8 @@ def test_phase_upload_and_extract_propagates_retry_condition(tmp_path: Path) -> 
         {
             "file_name": "paper.txt",
             "model": "google_flash",
+            "embedding_provider": "openrouter",
+            "embedding_model": "text-embedding-3-small",
             "retry_condition": sng.RETRY_CONDITION,
             "token_chunk_size": 2000,
             "chunk_overlap": 200,

@@ -7,6 +7,7 @@ This pass stays focused on alias cleanup. Taxonomy creation happens elsewhere.
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import pickle
@@ -20,7 +21,16 @@ from google.genai import types
 from neo4j import GraphDatabase
 
 from graph_text_utils import coerce_text, normalize_name, sorted_unique_texts, token_set
-from llm_json_utils import JsonDiskCache, generate_json_payload, make_cache_key
+from llm_json_utils import JsonDiskCache, build_single_prompt_clients, generate_json_payload, make_cache_key
+from llm_routing import (
+    TIER3_EMBEDDING_ROLE,
+    TIER3_JUDGE_PRIMARY_ROLE,
+    TIER3_JUDGE_SECONDARY_ROLE,
+    EmbeddingRoleConfig,
+    PromptRoleConfig,
+    resolve_embedding_role,
+    resolve_prompt_role,
+)
 
 DEFAULT_NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 DEFAULT_NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")
@@ -137,7 +147,9 @@ def _normalize_entity_pair(entity_a: dict[str, Any], entity_b: dict[str, Any]) -
 
 
 def embed_batch(
-    client: genai.Client,
+    clients: dict[str, Any],
+    *,
+    embedding_role_config: EmbeddingRoleConfig,
     texts: list[str],
     cache_file: str,
     progress_every: int = DEFAULT_EMBED_PROGRESS_EVERY,
@@ -158,23 +170,23 @@ def embed_batch(
 
     new_embeddings_computed = False
     for index, text in enumerate(texts):
-        if text in cache:
-            vec = cache[text]
+        cache_key = _embedding_cache_key(embedding_role_config, text)
+        if cache_key in cache:
+            vec = cache[cache_key]
             if embed_dim is None:
                 embed_dim = vec.shape[0]
             all_embeddings.append(vec)
             continue
         try:
-            result = client.models.embed_content(
-                model=EMBED_MODEL,
-                contents=text,
-                config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+            vec = _embed_text(
+                clients[embedding_role_config.client],
+                embedding_role_config=embedding_role_config,
+                text=text,
             )
-            vec = np.array(result.embeddings[0].values)
             if embed_dim is None:
                 embed_dim = vec.shape[0]
                 print(f"  Embedding dim detected: {embed_dim}")
-            cache[text] = vec
+            cache[cache_key] = vec
             all_embeddings.append(vec)
             new_embeddings_computed = True
         except Exception as exc:
@@ -202,6 +214,49 @@ def embed_batch(
     return all_embeddings
 
 
+def _call_embed_batch(
+    clients: dict[str, Any],
+    *,
+    embedding_role_config: EmbeddingRoleConfig,
+    texts: list[str],
+    cache_file: str,
+) -> list[np.ndarray]:
+    signature = inspect.signature(embed_batch)
+    supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+    supported_names = set(signature.parameters)
+    kwargs: dict[str, Any] = {
+        "texts": texts,
+        "cache_file": cache_file,
+    }
+    if supports_kwargs or "embedding_role_config" in supported_names:
+        kwargs["embedding_role_config"] = embedding_role_config
+    return embed_batch(clients, **kwargs)
+
+
+def _embedding_cache_key(embedding_role_config: EmbeddingRoleConfig, text: str) -> str:
+    return f"{embedding_role_config.client}:{embedding_role_config.model}:{text}"
+
+
+def _embed_text(client: Any, *, embedding_role_config: EmbeddingRoleConfig, text: str) -> np.ndarray:
+    if embedding_role_config.client == "genai":
+        result = client.models.embed_content(
+            model=embedding_role_config.model,
+            contents=text,
+            config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+        )
+        return np.array(result.embeddings[0].values)
+    if embedding_role_config.client in {"openai", "openrouter"}:
+        request_kwargs: dict[str, Any] = {
+            "model": embedding_role_config.model,
+            "input": text,
+        }
+        if embedding_role_config.dimension is not None:
+            request_kwargs["dimensions"] = embedding_role_config.dimension
+        result = client.embeddings.create(**request_kwargs)
+        return np.array(result.data[0].embedding, dtype=float)
+    raise ValueError(f"Unsupported embedding client '{embedding_role_config.client}'.")
+
+
 def _build_prompt(entity_a: dict[str, Any], entity_b: dict[str, Any]) -> str:
     return "\n".join(
         [
@@ -227,6 +282,7 @@ def _build_prompt(entity_a: dict[str, Any], entity_b: dict[str, Any]) -> str:
 
 def _build_judge_cache_key(
     *,
+    client_name: str,
     model_name: str,
     entity_a: dict[str, Any],
     entity_b: dict[str, Any],
@@ -234,6 +290,7 @@ def _build_judge_cache_key(
     return make_cache_key(
         namespace="tier3_judge_v1",
         payload={
+            "client_name": client_name,
             "model_name": model_name,
             "system_instruction": JUDGE_SYSTEM,
             "entity_a": entity_a,
@@ -245,16 +302,23 @@ def _build_judge_cache_key(
 
 
 def _judge_once(
-    client: genai.Client,
+    clients: dict[str, Any] | Any,
     *,
-    model_name: str,
+    role_config: PromptRoleConfig | None = None,
+    model_name: str | None = None,
     entity_a: dict[str, Any],
     entity_b: dict[str, Any],
+    stage: str = "primary",
     cache: JsonDiskCache | None = None,
 ) -> dict[str, Any]:
+    if role_config is None:
+        if not model_name:
+            raise ValueError("role_config or model_name is required.")
+        role_config = PromptRoleConfig(client="genai", model=model_name)
     normalized_a, normalized_b = _normalize_entity_pair(entity_a, entity_b)
     cache_key = _build_judge_cache_key(
-        model_name=model_name,
+        client_name=role_config.client,
+        model_name=role_config.model,
         entity_a=normalized_a,
         entity_b=normalized_b,
     )
@@ -264,8 +328,9 @@ def _judge_once(
             return dict(cached_result)
 
     payload, error_message = generate_json_payload(
-        client,
-        model_name=model_name,
+        _resolve_client(clients, role_config.client),
+        client_name=role_config.client,
+        model_name=role_config.model,
         prompt=_build_prompt(normalized_a, normalized_b),
         system_instruction=JUDGE_SYSTEM,
         max_output_tokens=120,
@@ -279,8 +344,9 @@ def _judge_once(
             "verdict": "DIFFERENT",
             "confidence": 0.0,
             "reason": error_message or "Invalid or empty JSON response",
-            "model_name": model_name,
-            "stage": "primary" if model_name == PRIMARY_JUDGE_MODEL else "second_stage",
+            "client_name": role_config.client,
+            "model_name": role_config.model,
+            "stage": stage,
         }
 
     verdict = _coerce_text(payload.get("verdict")).upper()
@@ -295,8 +361,9 @@ def _judge_once(
         "verdict": verdict,
         "confidence": confidence,
         "reason": _coerce_text(payload.get("reason")),
-        "model_name": model_name,
-        "stage": "primary" if model_name == PRIMARY_JUDGE_MODEL else "second_stage",
+        "client_name": role_config.client,
+        "model_name": role_config.model,
+        "stage": stage,
     }
     if cache is not None:
         cache.set(cache_key, result)
@@ -304,16 +371,31 @@ def _judge_once(
 
 
 def judge_pair(
-    client: genai.Client,
+    clients: dict[str, Any] | Any,
     entity_a: dict[str, Any],
     entity_b: dict[str, Any],
+    primary_role_config: PromptRoleConfig | None = None,
+    secondary_role_config: PromptRoleConfig | None = None,
     cache: JsonDiskCache | None = None,
 ) -> dict[str, Any]:
+    primary_role = primary_role_config or resolve_prompt_role(
+        None,
+        TIER3_JUDGE_PRIMARY_ROLE,
+        default_client="genai",
+        default_model=PRIMARY_JUDGE_MODEL,
+    )
+    secondary_role = secondary_role_config or resolve_prompt_role(
+        None,
+        TIER3_JUDGE_SECONDARY_ROLE,
+        default_client="genai",
+        default_model=SECOND_STAGE_JUDGE_MODEL,
+    )
     primary = _judge_once(
-        client,
-        model_name=PRIMARY_JUDGE_MODEL,
+        clients,
+        role_config=primary_role,
         entity_a=entity_a,
         entity_b=entity_b,
+        stage="primary",
         cache=cache,
     )
     needs_second_stage = (
@@ -328,10 +410,11 @@ def judge_pair(
         }
 
     secondary = _judge_once(
-        client,
-        model_name=SECOND_STAGE_JUDGE_MODEL,
+        clients,
+        role_config=secondary_role,
         entity_a=entity_a,
         entity_b=entity_b,
+        stage="second_stage",
         cache=cache,
     )
     if secondary["status"] == "classified":
@@ -346,6 +429,34 @@ def judge_pair(
         "used_second_stage": False,
         "attempted_second_stage": True,
     }
+
+
+def _call_judge_pair(
+    clients: dict[str, Any] | Any,
+    entity_a: dict[str, Any],
+    entity_b: dict[str, Any],
+    *,
+    primary_role_config: PromptRoleConfig,
+    secondary_role_config: PromptRoleConfig,
+    cache: JsonDiskCache | None,
+) -> dict[str, Any]:
+    signature = inspect.signature(judge_pair)
+    supports_kwargs = any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+    supported_names = set(signature.parameters)
+    kwargs: dict[str, Any] = {}
+    if supports_kwargs or "primary_role_config" in supported_names:
+        kwargs["primary_role_config"] = primary_role_config
+    if supports_kwargs or "secondary_role_config" in supported_names:
+        kwargs["secondary_role_config"] = secondary_role_config
+    if cache is not None and (supports_kwargs or "cache" in supported_names):
+        kwargs["cache"] = cache
+    return judge_pair(clients, entity_a, entity_b, **kwargs)
+
+
+def _resolve_client(clients: dict[str, Any] | Any, client_name: str) -> Any:
+    if isinstance(clients, dict):
+        return clients[client_name]
+    return clients
 
 
 def fetch_entities(session) -> list[dict[str, Any]]:
@@ -456,12 +567,32 @@ def run(
     neo4j_password: str = DEFAULT_NEO4J_PASSWORD,
     neo4j_database: str = DEFAULT_NEO4J_DATABASE,
     summary_json: str | None = None,
+    llm_routing_config: str | None = None,
 ) -> dict[str, Any]:
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("Set GOOGLE_API_KEY environment variable.")
-
     started = time.time()
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    embedding_role_config = resolve_embedding_role(
+        llm_routing_config,
+        TIER3_EMBEDDING_ROLE,
+        default_client="genai",
+        default_model=EMBED_MODEL,
+    )
+    primary_judge_role_config = resolve_prompt_role(
+        llm_routing_config,
+        TIER3_JUDGE_PRIMARY_ROLE,
+        default_client="genai",
+        default_model=PRIMARY_JUDGE_MODEL,
+    )
+    secondary_judge_role_config = resolve_prompt_role(
+        llm_routing_config,
+        TIER3_JUDGE_SECONDARY_ROLE,
+        default_client="genai",
+        default_model=SECOND_STAGE_JUDGE_MODEL,
+    )
+    clients = build_single_prompt_clients(
+        embedding_role_config.client,
+        primary_judge_role_config.client,
+        secondary_judge_role_config.client,
+    )
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     judge_cache = JsonDiskCache(judge_cache_file)
     summary: dict[str, Any]
@@ -476,9 +607,12 @@ def run(
                 summary = {
                     "tier": 3,
                     "dry_run": dry_run,
-                    "embed_model": EMBED_MODEL,
-                    "judge_model_primary": PRIMARY_JUDGE_MODEL,
-                    "judge_model_second_stage": SECOND_STAGE_JUDGE_MODEL,
+                    "embed_client_name": embedding_role_config.client,
+                    "embed_model": embedding_role_config.model,
+                    "judge_client_name_primary": primary_judge_role_config.client,
+                    "judge_model_primary": primary_judge_role_config.model,
+                    "judge_client_name_second_stage": secondary_judge_role_config.client,
+                    "judge_model_second_stage": secondary_judge_role_config.model,
                     "params": {
                         "threshold": threshold,
                         "max_candidates": max_candidates,
@@ -512,7 +646,12 @@ def run(
 
             texts = [f"{item['name'] or ''}: {item['description'] or ''}" for item in entities]
             print(f"Embedding {len(texts)} entities...")
-            embeddings = embed_batch(client, texts=texts, cache_file=cache_file)
+            embeddings = _call_embed_batch(
+                clients,
+                embedding_role_config=embedding_role_config,
+                texts=texts,
+                cache_file=cache_file,
+            )
             if not embeddings:
                 raise RuntimeError("No embeddings were returned.")
             print(f"  Done. Embedding dim: {len(embeddings[0])}")
@@ -575,7 +714,14 @@ def run(
                 if entity_a["eid"] in merged_eids or entity_b["eid"] in merged_eids:
                     continue
 
-                verdict = judge_pair(client, entity_a, entity_b, cache=judge_cache)
+                verdict = _call_judge_pair(
+                    clients,
+                    entity_a,
+                    entity_b,
+                    primary_role_config=primary_judge_role_config,
+                    secondary_role_config=secondary_judge_role_config,
+                    cache=judge_cache,
+                )
                 judged_pairs += 1
                 if verdict.get("attempted_second_stage"):
                     second_stage_attempts += 1
@@ -616,9 +762,12 @@ def run(
             summary = {
                 "tier": 3,
                 "dry_run": dry_run,
-                "embed_model": EMBED_MODEL,
-                "judge_model_primary": PRIMARY_JUDGE_MODEL,
-                "judge_model_second_stage": SECOND_STAGE_JUDGE_MODEL,
+                "embed_client_name": embedding_role_config.client,
+                "embed_model": embedding_role_config.model,
+                "judge_client_name_primary": primary_judge_role_config.client,
+                "judge_model_primary": primary_judge_role_config.model,
+                "judge_client_name_second_stage": secondary_judge_role_config.client,
+                "judge_model_second_stage": secondary_judge_role_config.model,
                 "params": {
                     "threshold": threshold,
                     "max_candidates": max_candidates,
@@ -679,6 +828,7 @@ def main() -> None:
     parser.add_argument("--neo4j-user", type=str, default=DEFAULT_NEO4J_USER)
     parser.add_argument("--neo4j-password", type=str, default=DEFAULT_NEO4J_PASSWORD)
     parser.add_argument("--neo4j-database", type=str, default=DEFAULT_NEO4J_DATABASE)
+    parser.add_argument("--llm-routing-config", type=str, default=None)
     args = parser.parse_args()
 
     if not 0.0 <= args.threshold <= 1.0:
@@ -703,6 +853,7 @@ def main() -> None:
         neo4j_password=args.neo4j_password,
         neo4j_database=args.neo4j_database,
         summary_json=args.summary_json,
+        llm_routing_config=args.llm_routing_config,
     )
 
 

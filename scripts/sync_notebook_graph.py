@@ -563,11 +563,13 @@ def build_graph_command(args: argparse.Namespace, sources_dir: Path, runtime: Ne
         str(args.chunk_overlap),
         "--chunks-to-combine",
         str(args.chunks_to_combine),
-        "--embedding-provider",
-        args.embedding_provider,
-        "--embedding-model",
-        args.embedding_model,
     ]
+    if args.embedding_provider:
+        command.extend(["--embedding-provider", args.embedding_provider])
+    if args.embedding_model:
+        command.extend(["--embedding-model", args.embedding_model])
+    if args.llm_routing_config:
+        command.extend(["--llm-routing-config", args.llm_routing_config])
     if args.skip_postprocess:
         command.append("--skip-postprocess")
     return command
@@ -663,8 +665,9 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--token-chunk-size", type=int, default=2000, help="Token chunk size")
         subparser.add_argument("--chunk-overlap", type=int, default=200, help="Chunk overlap")
         subparser.add_argument("--chunks-to-combine", type=int, default=1, help="Chunks to combine")
-        subparser.add_argument("--embedding-provider", default="sentence-transformer", help="Embedding provider")
-        subparser.add_argument("--embedding-model", default="all-MiniLM-L6-v2", help="Embedding model")
+        subparser.add_argument("--embedding-provider", default=None, help="Embedding provider override")
+        subparser.add_argument("--embedding-model", default=None, help="Embedding model override")
+        subparser.add_argument("--llm-routing-config", default=None, help="Optional JSON config for role-based LLM routing")
         subparser.add_argument("--skip-build", action="store_true", help="Do not run build_graph.py")
         subparser.add_argument("--skip-postprocess", action="store_true", help="Pass --skip-postprocess to build_graph.py")
 

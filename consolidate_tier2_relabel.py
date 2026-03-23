@@ -21,13 +21,19 @@ from google import genai
 from neo4j import GraphDatabase
 
 from graph_text_utils import coerce_text, sorted_unique_texts
-from llm_json_utils import JsonDiskCache, generate_json_payload, is_transient_model_error, make_cache_key
+from llm_json_utils import (
+    JsonDiskCache,
+    build_single_prompt_clients,
+    generate_json_payload,
+    is_transient_model_error,
+    make_cache_key,
+)
+from llm_routing import TIER2_PRIMARY_ROLE, TIER2_SECONDARY_ROLE, PromptRoleConfig, resolve_prompt_role
 
 DEFAULT_NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 DEFAULT_NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")
 DEFAULT_NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "password123")
 DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 MODEL_NAME = os.environ.get("TIER2_MODEL_NAME", "gemini-3.1-flash-lite-preview")
 SECOND_STAGE_MODEL_NAME = os.environ.get("TIER2_SECOND_STAGE_MODEL_NAME", "gemini-3-flash-preview")
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("TIER2_LOW_CONFIDENCE_THRESHOLD", "0.65"))
@@ -212,6 +218,7 @@ def _build_prompt(node: dict[str, Any]) -> str:
 
 def _build_classification_cache_key(
     *,
+    client_name: str,
     model_name: str,
     normalized_node: dict[str, Any],
     system_instruction: str,
@@ -219,6 +226,7 @@ def _build_classification_cache_key(
     return make_cache_key(
         namespace="tier2_classification_v1",
         payload={
+            "client_name": client_name,
             "model_name": model_name,
             "system_instruction": system_instruction,
             "node": normalized_node,
@@ -229,17 +237,24 @@ def _build_classification_cache_key(
 
 
 def _classify_once(
-    client: genai.Client,
+    clients: dict[str, Any] | Any,
     *,
-    model_name: str,
+    role_config: PromptRoleConfig | None = None,
+    model_name: str | None = None,
     node: dict[str, Any],
     label_catalog: dict[str, Any],
+    stage: str = "primary",
     cache: JsonDiskCache | None = None,
 ) -> dict[str, Any]:
+    if role_config is None:
+        if not model_name:
+            raise ValueError("role_config or model_name is required.")
+        role_config = PromptRoleConfig(client="genai", model=model_name)
     normalized_node = _normalize_node_for_prompt(node)
     system_instruction = build_system_prompt(label_catalog)
     cache_key = _build_classification_cache_key(
-        model_name=model_name,
+        client_name=role_config.client,
+        model_name=role_config.model,
         normalized_node=normalized_node,
         system_instruction=system_instruction,
     )
@@ -249,8 +264,9 @@ def _classify_once(
             return dict(cached_result)
 
     payload, error_message = generate_json_payload(
-        client,
-        model_name=model_name,
+        _resolve_client(clients, role_config.client),
+        client_name=role_config.client,
+        model_name=role_config.model,
         prompt=_build_prompt(normalized_node),
         system_instruction=system_instruction,
         max_output_tokens=120,
@@ -263,7 +279,9 @@ def _classify_once(
             "label": None,
             "confidence": 0.0,
             "reason": error_message or "Invalid or empty JSON response",
-            "model_name": model_name,
+            "client_name": role_config.client,
+            "model_name": role_config.model,
+            "stage": stage,
         }
 
     raw_label = str(payload.get("label", "")).strip()
@@ -280,8 +298,9 @@ def _classify_once(
         "raw_label": raw_label,
         "confidence": confidence_value,
         "reason": str(payload.get("reason", "")).strip(),
-        "model_name": model_name,
-        "stage": "primary" if model_name == MODEL_NAME else "second_stage",
+        "client_name": role_config.client,
+        "model_name": role_config.model,
+        "stage": stage,
     }
     if cache is not None and result["status"] == "classified":
         cache.set(cache_key, result)
@@ -289,15 +308,36 @@ def _classify_once(
 
 
 def classify_entity(
-    client: genai.Client,
+    clients: dict[str, Any] | Any,
     node: dict[str, Any],
     label_catalog: dict[str, Any],
+    primary_role_config: PromptRoleConfig | None = None,
+    secondary_role_config: PromptRoleConfig | None = None,
     cache: JsonDiskCache | None = None,
 ) -> dict[str, Any]:
+    primary_role = primary_role_config or resolve_prompt_role(
+        None,
+        TIER2_PRIMARY_ROLE,
+        default_client="genai",
+        default_model=MODEL_NAME,
+    )
+    secondary_role = secondary_role_config or resolve_prompt_role(
+        None,
+        TIER2_SECONDARY_ROLE,
+        default_client="genai",
+        default_model=SECOND_STAGE_MODEL_NAME,
+    )
     delay = INITIAL_RETRY_DELAY_SECONDS
     last_error: str | None = None
     for attempt in range(MAX_RETRIES):
-        primary = _classify_once(client, model_name=MODEL_NAME, node=node, label_catalog=label_catalog, cache=cache)
+        primary = _classify_once(
+            clients,
+            role_config=primary_role,
+            node=node,
+            label_catalog=label_catalog,
+            stage="primary",
+            cache=cache,
+        )
         if primary["status"] == "classified" and primary["confidence"] >= LOW_CONFIDENCE_THRESHOLD:
             return {
                 **primary,
@@ -317,10 +357,11 @@ def classify_entity(
                 break
 
         secondary = _classify_once(
-            client,
-            model_name=SECOND_STAGE_MODEL_NAME,
+            clients,
+            role_config=secondary_role,
             node=node,
             label_catalog=label_catalog,
+            stage="second_stage",
             cache=cache,
         )
         if secondary["status"] == "classified":
@@ -348,11 +389,18 @@ def classify_entity(
         "label": None,
         "confidence": 0.0,
         "reason": message,
-        "model_name": MODEL_NAME,
+        "client_name": primary_role.client,
+        "model_name": primary_role.model,
         "stage": "primary",
         "used_second_stage": False,
         "attempted_second_stage": False,
     }
+
+
+def _resolve_client(clients: dict[str, Any] | Any, client_name: str) -> Any:
+    if isinstance(clients, dict):
+        return clients[client_name]
+    return clients
 
 
 def fetch_concept_only_nodes(session, max_nodes: int | None) -> list[dict[str, Any]]:
@@ -447,11 +495,21 @@ def run(
     decisions_jsonl: str | None,
     cache_file: str = DEFAULT_CACHE_FILE,
     summary_json: str | None = None,
+    llm_routing_config: str | None = None,
 ) -> dict[str, Any]:
-    if not GOOGLE_API_KEY:
-        raise RuntimeError("Set GOOGLE_API_KEY environment variable.")
-
-    client = genai.Client(api_key=GOOGLE_API_KEY)
+    primary_role_config = resolve_prompt_role(
+        llm_routing_config,
+        TIER2_PRIMARY_ROLE,
+        default_client="genai",
+        default_model=MODEL_NAME,
+    )
+    secondary_role_config = resolve_prompt_role(
+        llm_routing_config,
+        TIER2_SECONDARY_ROLE,
+        default_client="genai",
+        default_model=SECOND_STAGE_MODEL_NAME,
+    )
+    clients = build_single_prompt_clients(primary_role_config.client, secondary_role_config.client)
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     label_catalog = load_label_catalog(labels_json)
     classification_cache = JsonDiskCache(cache_file)
@@ -479,7 +537,14 @@ def run(
                 name = _coerce_text(node["name"])
                 node["name"] = name
                 node["description"] = _coerce_text(node.get("description"))
-                result = classify_entity(client, node, label_catalog, cache=classification_cache)
+                result = classify_entity(
+                    clients,
+                    node,
+                    label_catalog,
+                    primary_role_config=primary_role_config,
+                    secondary_role_config=secondary_role_config,
+                    cache=classification_cache,
+                )
                 new_label = result["label"] or "Concept"
                 if result["status"] == "unresolved":
                     label_counts["Unresolved"] = label_counts.get("Unresolved", 0) + 1
@@ -521,6 +586,7 @@ def run(
                         "status": result["status"],
                         "confidence": round(float(result["confidence"]), 4),
                         "reason": result["reason"],
+                        "client_name": result.get("client_name", primary_role_config.client),
                         "model_name": result["model_name"],
                         "stage": result.get("stage", "primary"),
                         "used_second_stage": bool(result.get("used_second_stage", False)),
@@ -544,8 +610,10 @@ def run(
             summary = {
                 "tier": 2,
                 "dry_run": dry_run,
-                "model_name": MODEL_NAME,
-                "second_stage_model_name": SECOND_STAGE_MODEL_NAME,
+                "client_name": primary_role_config.client,
+                "model_name": primary_role_config.model,
+                "second_stage_client_name": secondary_role_config.client,
+                "second_stage_model_name": secondary_role_config.model,
                 "params": {
                     "batch_size": batch_size,
                     "sleep_seconds": sleep_seconds,
@@ -614,6 +682,7 @@ def main() -> None:
     parser.add_argument("--neo4j-user", type=str, default=DEFAULT_NEO4J_USER)
     parser.add_argument("--neo4j-password", type=str, default=DEFAULT_NEO4J_PASSWORD)
     parser.add_argument("--neo4j-database", type=str, default=DEFAULT_NEO4J_DATABASE)
+    parser.add_argument("--llm-routing-config", type=str, default=None)
     args = parser.parse_args()
 
     if args.batch_size <= 0:
@@ -636,6 +705,7 @@ def main() -> None:
         decisions_jsonl=args.decisions_jsonl,
         cache_file=args.cache_file,
         summary_json=args.summary_json,
+        llm_routing_config=args.llm_routing_config,
     )
 
 

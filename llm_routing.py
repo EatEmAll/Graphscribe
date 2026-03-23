@@ -1,0 +1,195 @@
+from __future__ import annotations
+
+import json
+import os
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Any
+
+AGENT_CLIENTS = {"codex", "claude", "opencode"}
+SINGLE_PROMPT_CLIENTS = {"genai", "openai", "openrouter"}
+EMBEDDING_CLIENTS = {"genai", "openai", "openrouter"}
+
+AGENT_REVIEW_ROLE = "agents.review"
+AGENT_TAXONOMY_TAIL_ROLE = "agents.taxonomy_tail"
+
+TIER2_PRIMARY_ROLE = "single_prompt.tier2_primary"
+TIER2_SECONDARY_ROLE = "single_prompt.tier2_secondary"
+TAXONOMY_PRIMARY_ROLE = "single_prompt.taxonomy_primary"
+TAXONOMY_SECONDARY_ROLE = "single_prompt.taxonomy_secondary"
+TIER3_JUDGE_PRIMARY_ROLE = "single_prompt.tier3_judge_primary"
+TIER3_JUDGE_SECONDARY_ROLE = "single_prompt.tier3_judge_secondary"
+
+TIER3_EMBEDDING_ROLE = "embeddings.tier3"
+GRAPH_BUILD_EMBEDDING_ROLE = "embeddings.graph_build"
+
+
+@dataclass(frozen=True)
+class AgentRoleConfig:
+    client: str
+    model: str | None = None
+    executable: str | None = None
+
+
+@dataclass(frozen=True)
+class PromptRoleConfig:
+    client: str
+    model: str
+
+
+@dataclass(frozen=True)
+class EmbeddingRoleConfig:
+    client: str
+    model: str
+    dimension: int | None = None
+
+
+def default_agent_executable(client: str) -> str:
+    return {
+        "codex": "codex",
+        "claude": "claude",
+        "opencode": "opencode",
+    }[client]
+
+
+def api_key_env_var_for_client(client: str) -> str | None:
+    return {
+        "genai": "GOOGLE_API_KEY",
+        "openai": "OPENAI_API_KEY",
+        "openrouter": "OPENROUTER_API_KEY",
+    }.get(client)
+
+
+@lru_cache(maxsize=16)
+def _load_config(path: str) -> dict[str, Any]:
+    source = Path(path)
+    payload = json.loads(source.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("LLM routing config must be a JSON object.")
+    return payload
+
+
+def load_routing_config(path: str | None) -> dict[str, Any]:
+    if not path:
+        return {}
+    return _load_config(str(Path(path).resolve()))
+
+
+def _lookup_role(config: dict[str, Any], role: str) -> dict[str, Any] | None:
+    current: Any = config
+    for part in role.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return None
+        current = current[part]
+    if current is None:
+        return None
+    if not isinstance(current, dict):
+        raise ValueError(f"Role '{role}' must be configured as a JSON object.")
+    return current
+
+
+def _normalize_client(value: Any, *, allowed: set[str], role: str) -> str:
+    client = str(value or "").strip().lower()
+    if client not in allowed:
+        raise ValueError(f"Role '{role}' has unsupported client '{value}'.")
+    return client
+
+
+def resolve_agent_role(
+    config_path: str | None,
+    role: str,
+    *,
+    default_client: str,
+    default_model: str | None = None,
+    default_executable: str | None = None,
+) -> AgentRoleConfig:
+    config = load_routing_config(config_path)
+    raw = _lookup_role(config, role) or {}
+    client = _normalize_client(raw.get("client", default_client), allowed=AGENT_CLIENTS, role=role)
+    model = raw.get("model", default_model)
+    if model is not None:
+        model = str(model).strip() or None
+    executable = raw.get("executable", default_executable or default_agent_executable(client))
+    executable = str(executable).strip() if executable is not None else None
+    return AgentRoleConfig(client=client, model=model, executable=executable or None)
+
+
+def resolve_prompt_role(
+    config_path: str | None,
+    role: str,
+    *,
+    default_client: str,
+    default_model: str,
+) -> PromptRoleConfig:
+    config = load_routing_config(config_path)
+    raw = _lookup_role(config, role) or {}
+    client = _normalize_client(raw.get("client", default_client), allowed=SINGLE_PROMPT_CLIENTS, role=role)
+    model = str(raw.get("model", default_model)).strip()
+    if not model:
+        raise ValueError(f"Role '{role}' must define a non-empty model.")
+    return PromptRoleConfig(client=client, model=model)
+
+
+def resolve_embedding_role(
+    config_path: str | None,
+    role: str,
+    *,
+    default_client: str,
+    default_model: str,
+    default_dimension: int | None = None,
+) -> EmbeddingRoleConfig:
+    config = load_routing_config(config_path)
+    raw = _lookup_role(config, role) or {}
+    client = _normalize_client(raw.get("client", default_client), allowed=EMBEDDING_CLIENTS, role=role)
+    model = str(raw.get("model", default_model)).strip()
+    if not model:
+        raise ValueError(f"Role '{role}' must define a non-empty model.")
+    dimension_raw = raw.get("dimension", default_dimension)
+    dimension = None
+    if dimension_raw is not None:
+        try:
+            dimension = int(dimension_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Role '{role}' has invalid dimension '{dimension_raw}'.") from exc
+        if dimension <= 0:
+            raise ValueError(f"Role '{role}' must define a positive dimension.")
+    return EmbeddingRoleConfig(client=client, model=model, dimension=dimension)
+
+
+def resolve_graph_build_embedding(
+    *,
+    config_path: str | None,
+    embedding_provider: str | None,
+    embedding_model: str | None,
+    default_provider: str,
+    default_model: str,
+) -> EmbeddingRoleConfig:
+    resolved = resolve_embedding_role(
+        config_path,
+        GRAPH_BUILD_EMBEDDING_ROLE,
+        default_client=default_provider,
+        default_model=default_model,
+    )
+    explicit_provider = str(embedding_provider or "").strip()
+    explicit_model = str(embedding_model or "").strip()
+    if not explicit_provider and not explicit_model:
+        return resolved
+    return EmbeddingRoleConfig(
+        client=explicit_provider or resolved.client,
+        model=explicit_model or resolved.model,
+        dimension=None,
+    )
+
+
+def missing_required_env_vars(*clients: str) -> list[str]:
+    missing: list[str] = []
+    seen: set[str] = set()
+    for client in clients:
+        env_var = api_key_env_var_for_client(client)
+        if not env_var or env_var in seen:
+            continue
+        seen.add(env_var)
+        if not os.environ.get(env_var):
+            missing.append(env_var)
+    return missing

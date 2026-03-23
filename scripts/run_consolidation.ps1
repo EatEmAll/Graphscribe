@@ -3,7 +3,8 @@ param(
     [int]$MaxIterations = 5,
     [string]$RunDir = "",
     [switch]$InstallDeps,
-    [int]$RequiredConsecutivePasses = 0
+    [int]$RequiredConsecutivePasses = 0,
+    [string]$LlmRoutingConfig = ""
 )
 
 $ErrorActionPreference = "Stop"
@@ -51,6 +52,63 @@ function Ensure-Dependencies {
     python -m pip install -r (Join-Path $vendorRepoRoot "backend\requirements.txt") -c (Join-Path $vendorRepoRoot "backend\constraints.txt")
 }
 
+function Get-RoleConfigValue {
+    param(
+        $ConfigObject,
+        [string[]]$PathParts,
+        $DefaultValue = $null
+    )
+
+    $current = $ConfigObject
+    foreach ($part in $PathParts) {
+        if ($null -eq $current) {
+            return $DefaultValue
+        }
+        if ($current -is [System.Collections.IDictionary]) {
+            if (-not $current.Contains($part)) {
+                return $DefaultValue
+            }
+            $current = $current[$part]
+            continue
+        }
+        $property = $current.PSObject.Properties[$part]
+        if ($null -eq $property) {
+            return $DefaultValue
+        }
+        $current = $property.Value
+    }
+    if ($null -eq $current -or $current -eq "") {
+        return $DefaultValue
+    }
+    return $current
+}
+
+function Get-AgentExecutableDefault {
+    param([string]$Client)
+
+    switch ($Client) {
+        "claude" { return "claude" }
+        "opencode" { return "opencode" }
+        default { return "codex" }
+    }
+}
+
+function Assert-CommandAvailable {
+    param([string]$Executable)
+
+    if (-not (Get-Command $Executable -ErrorAction SilentlyContinue)) {
+        throw "CLI '$Executable' is not available on PATH."
+    }
+}
+
+function Assert-EnvPresent {
+    param([string]$EnvVarName)
+
+    if (-not (Get-Item -Path "Env:$EnvVarName" -ErrorAction SilentlyContinue)) {
+        throw "$EnvVarName is not set."
+    }
+}
+
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $vendorRepoRoot = Join-Path $repoRoot "vendor\llm-graph-builder"
 Set-Location $repoRoot
@@ -64,13 +122,43 @@ if ($InstallDeps) {
     Ensure-Dependencies
 }
 
-if (-not $env:GOOGLE_API_KEY) {
-    throw "GOOGLE_API_KEY is not set."
+$routingConfig = $null
+if ($LlmRoutingConfig) {
+    if (-not (Test-Path $LlmRoutingConfig)) {
+        throw "LLM routing config not found: $LlmRoutingConfig"
+    }
+    $routingConfig = Get-Content $LlmRoutingConfig -Raw | ConvertFrom-Json
 }
 
-if (-not (Get-Command codex -ErrorAction SilentlyContinue)) {
-    throw "codex CLI is not available on PATH."
+$promptRoles = @(
+    @("single_prompt", "tier2_primary", "client", "genai"),
+    @("single_prompt", "tier2_secondary", "client", "genai"),
+    @("single_prompt", "taxonomy_primary", "client", "genai"),
+    @("single_prompt", "taxonomy_secondary", "client", "genai"),
+    @("single_prompt", "tier3_judge_primary", "client", "genai"),
+    @("single_prompt", "tier3_judge_secondary", "client", "genai"),
+    @("embeddings", "tier3", "client", "genai")
+)
+
+$requiredEnvVars = New-Object System.Collections.Generic.HashSet[string]
+foreach ($role in $promptRoles) {
+    $client = [string](Get-RoleConfigValue $routingConfig @($role[0], $role[1], $role[2]) $role[3]).ToLowerInvariant()
+    switch ($client) {
+        "genai" { [void]$requiredEnvVars.Add("GOOGLE_API_KEY") }
+        "openai" { [void]$requiredEnvVars.Add("OPENAI_API_KEY") }
+        "openrouter" { [void]$requiredEnvVars.Add("OPENROUTER_API_KEY") }
+    }
 }
+foreach ($envVar in $requiredEnvVars) {
+    Assert-EnvPresent $envVar
+}
+
+$reviewClient = [string](Get-RoleConfigValue $routingConfig @("agents", "review", "client") "codex").ToLowerInvariant()
+$reviewExecutable = [string](Get-RoleConfigValue $routingConfig @("agents", "review", "executable") (Get-AgentExecutableDefault $reviewClient))
+$tailClient = [string](Get-RoleConfigValue $routingConfig @("agents", "taxonomy_tail", "client") "codex").ToLowerInvariant()
+$tailExecutable = [string](Get-RoleConfigValue $routingConfig @("agents", "taxonomy_tail", "executable") (Get-AgentExecutableDefault $tailClient))
+Assert-CommandAvailable $reviewExecutable
+Assert-CommandAvailable $tailExecutable
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
 if (-not $RunDir) {
@@ -97,6 +185,10 @@ $args = @(
     "--taxonomy-plateau-min-delta", "0.002",
     "--run-dir", $RunDir
 )
+
+if ($LlmRoutingConfig) {
+    $args += @("--llm-routing-config", $LlmRoutingConfig)
+}
 
 if ($DryRun) {
     $args += "--dry-run"

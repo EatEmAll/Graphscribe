@@ -169,3 +169,46 @@ def test_preflight_consolidation_requires_google_api_key(monkeypatch) -> None:
 
     with pytest.raises(ppg.WorkflowError, match="GOOGLE_API_KEY is not set"):
         ppg.preflight_consolidation(config)
+
+
+def test_preflight_consolidation_uses_routed_agent_executables(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "llm-routing.json"
+    config_path.write_text(
+        """
+        {
+          "agents": {
+            "review": {"client": "claude", "model": "claude-sonnet-4", "executable": "claude-custom"},
+            "taxonomy_tail": {"client": "opencode", "model": "gpt-5.4-mini", "executable": "opencode-custom"}
+          },
+          "single_prompt": {
+            "tier2_primary": {"client": "openai", "model": "gpt-5.4-mini"},
+            "tier2_secondary": {"client": "openai", "model": "gpt-5.4"},
+            "taxonomy_primary": {"client": "openai", "model": "gpt-5.4-mini"},
+            "taxonomy_secondary": {"client": "openai", "model": "gpt-5.4"},
+            "tier3_judge_primary": {"client": "openai", "model": "gpt-5.4-mini"},
+            "tier3_judge_secondary": {"client": "openai", "model": "gpt-5.4"}
+          },
+          "embeddings": {
+            "tier3": {"client": "openai", "model": "text-embedding-3-small"}
+          }
+        }
+        """,
+        encoding="utf-8",
+    )
+    config = ppg.ConsolidationConfig(
+        max_iterations=5,
+        run_dir=None,
+        codex_bin="codex",
+        dry_run=False,
+        resume=False,
+        required_consecutive_passes=0,
+        llm_routing_config=str(config_path),
+    )
+    calls: list[str] = []
+    monkeypatch.setenv("OPENAI_API_KEY", "secret")
+    monkeypatch.setattr(ppg, "resolve_cli_executable", lambda executable: calls.append(executable) or executable)
+
+    codex_executable = ppg.preflight_consolidation(config)
+
+    assert codex_executable is None
+    assert calls == ["claude-custom", "opencode-custom"]

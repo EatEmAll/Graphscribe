@@ -376,6 +376,68 @@ def test_run_codex_taxonomy_tail_retries_invalid_payload(monkeypatch: pytest.Mon
     assert "TAIL_PARSE_ATTEMPT_1_ERROR" in (tmp_path / "codex_taxonomy_tail_exec.log").read_text(encoding="utf-8")
 
 
+def test_build_agent_command_for_codex_uses_exec_and_output_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(csi, "_resolve_cli_executable", lambda executable: executable)
+    command, stdin_text = csi._build_agent_command(
+        role_config=csi.AgentRoleConfig(client="codex", model="gpt-5.4", executable="codex"),
+        raw_output_file=tmp_path / "raw.txt",
+        schema_file=None,
+        prompt="review prompt",
+    )
+
+    assert command == [
+        "codex",
+        "exec",
+        "--ephemeral",
+        "-m",
+        "gpt-5.4",
+        "-o",
+        str(tmp_path / "raw.txt"),
+        "-",
+    ]
+    assert stdin_text == "review prompt"
+
+
+def test_build_agent_command_for_claude_uses_json_schema_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(csi, "_resolve_cli_executable", lambda executable: executable)
+    command, stdin_text = csi._build_agent_command(
+        role_config=csi.AgentRoleConfig(client="claude", model="claude-sonnet-4", executable="claude"),
+        raw_output_file=tmp_path / "raw.txt",
+        schema_file=tmp_path / "schema.json",
+        prompt="review prompt",
+    )
+
+    assert command == [
+        "claude",
+        "-p",
+        "--model",
+        "claude-sonnet-4",
+        "--json-schema",
+        str(tmp_path / "schema.json"),
+        "review prompt",
+    ]
+    assert stdin_text is None
+
+
+def test_build_agent_command_for_opencode_uses_run_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(csi, "_resolve_cli_executable", lambda executable: executable)
+    command, stdin_text = csi._build_agent_command(
+        role_config=csi.AgentRoleConfig(client="opencode", model="gpt-5.4-mini", executable="opencode"),
+        raw_output_file=tmp_path / "raw.txt",
+        schema_file=None,
+        prompt="review prompt",
+    )
+
+    assert command == [
+        "opencode",
+        "run",
+        "--model",
+        "gpt-5.4-mini",
+        "review prompt",
+    ]
+    assert stdin_text is None
+
+
 def test_apply_codex_taxonomy_tail_applies_valid_actions_and_skips_invalid(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

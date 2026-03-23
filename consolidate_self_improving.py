@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -24,6 +25,12 @@ from typing import Any
 from neo4j import GraphDatabase
 
 from graph_text_utils import normalize_name, token_set
+from llm_routing import (
+    AGENT_REVIEW_ROLE,
+    AGENT_TAXONOMY_TAIL_ROLE,
+    AgentRoleConfig,
+    resolve_agent_role,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent
 
@@ -145,6 +152,7 @@ class OrchestratorConfig:
     taxonomy_plateau_min_delta: float = 0.002
     run_dir: str | None = None
     codex_bin: str = "codex"
+    llm_routing_config: str | None = None
     dry_run: bool = False
     resume: bool = False
 
@@ -922,6 +930,42 @@ def _run_command_with_input(command: list[str], log_file: Path, stdin_text: str)
         )
 
 
+def _run_agent_command(
+    command: list[str],
+    log_file: Path,
+    raw_output_file: Path,
+    *,
+    stdin_text: str | None = None,
+) -> None:
+    result = subprocess.run(
+        command,
+        text=True,
+        input=stdin_text,
+        capture_output=True,
+        cwd=REPO_ROOT,
+        check=False,
+    )
+    log_file.write_text(
+        f"COMMAND: {' '.join(command)}\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}",
+        encoding="utf-8",
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Command failed ({result.returncode}): {' '.join(command)}. "
+            f"See log: {log_file}"
+        )
+    if stdin_text is None:
+        raw_output_file.write_text(result.stdout, encoding="utf-8")
+
+
+def _resolve_cli_executable(executable: str) -> str:
+    candidate = Path(executable)
+    if candidate.exists():
+        return str(candidate.resolve())
+    resolved = shutil.which(executable)
+    return resolved or executable
+
+
 def _resolve_codex_executable(codex_bin: str) -> str:
     if os.name != "nt":
         return codex_bin
@@ -949,6 +993,84 @@ def _resolve_codex_executable(codex_bin: str) -> str:
         return codex_bin
 
 
+def _review_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": [
+            "is_consolidated",
+            "diagnosis",
+            "kpis",
+            "taxonomy_kpis",
+            "focus_examples",
+            "proposed_tier2",
+            "proposed_tier3",
+            "proposed_tier2_catalog",
+            "rationale",
+            "confidence",
+        ],
+    }
+
+
+def _taxonomy_tail_json_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "required": ["summary", "decisions"],
+    }
+
+
+def _build_agent_command(
+    *,
+    role_config: AgentRoleConfig,
+    raw_output_file: Path,
+    schema_file: Path | None,
+    prompt: str,
+) -> tuple[list[str], str | None]:
+    executable = _resolve_cli_executable(role_config.executable or "codex")
+    model_args = ["--model", role_config.model] if role_config.model else []
+    if role_config.client == "codex":
+        if role_config.model:
+            model_args = ["-m", role_config.model]
+        command = [executable, "exec", "--ephemeral", *model_args, "-o", str(raw_output_file), "-"]
+        if os.name == "nt" and executable.lower().endswith(".cmd"):
+            command = ["cmd", "/c", *command]
+        return command, prompt
+    if role_config.client == "claude":
+        command = [executable, "-p", *model_args]
+        if schema_file is not None:
+            command.extend(["--json-schema", str(schema_file)])
+        command.append(prompt)
+        return command, None
+    if role_config.client == "opencode":
+        command = [executable, "run", *model_args, prompt]
+        return command, None
+    raise ValueError(f"Unsupported agent client '{role_config.client}'.")
+
+
+def _run_agent_prompt(
+    *,
+    role_config: AgentRoleConfig,
+    prompt: str,
+    raw_output_file: Path,
+    stdout_log_file: Path,
+    schema_payload: dict[str, Any] | None = None,
+) -> str:
+    schema_file = None
+    if schema_payload is not None and role_config.client == "claude":
+        schema_file = raw_output_file.with_suffix(".schema.json")
+        schema_file.write_text(json.dumps(schema_payload, indent=2), encoding="utf-8")
+    command, stdin_text = _build_agent_command(
+        role_config=role_config,
+        raw_output_file=raw_output_file,
+        schema_file=schema_file,
+        prompt=prompt,
+    )
+    if role_config.client == "codex":
+        _run_command_with_input(command, stdout_log_file, stdin_text or "")
+    else:
+        _run_agent_command(command, stdout_log_file, raw_output_file, stdin_text=stdin_text)
+    return raw_output_file.read_text(encoding="utf-8")
+
+
 def run_tier1(*, params: Tier2Params, dry_run: bool, iteration_dir: Path) -> None:
     command = [
         sys.executable,
@@ -973,6 +1095,7 @@ def run_tier2(
     catalog: Tier2LabelCatalog,
     dry_run: bool,
     iteration_dir: Path,
+    llm_routing_config: str | None = None,
 ) -> dict[str, Any]:
     summary_path = iteration_dir / "tier2_summary.json"
     catalog_path = iteration_dir / "tier2_catalog.json"
@@ -1004,6 +1127,8 @@ def run_tier2(
         "--summary-json",
         str(summary_path),
     ]
+    if llm_routing_config:
+        command.extend(["--llm-routing-config", llm_routing_config])
     if dry_run:
         command.append("--dry-run")
     _run_command(command, iteration_dir / "tier2.log")
@@ -1018,6 +1143,7 @@ def run_taxonomy(
     iteration_dir: Path,
     prior_taxonomy_decisions_jsonl: str | None = None,
     prior_review_json: str | None = None,
+    llm_routing_config: str | None = None,
 ) -> dict[str, Any]:
     summary_path = iteration_dir / "taxonomy_summary.json"
     decisions_path = iteration_dir / "taxonomy_decisions.jsonl"
@@ -1051,6 +1177,8 @@ def run_taxonomy(
         "--summary-json",
         str(summary_path),
     ]
+    if llm_routing_config:
+        command.extend(["--llm-routing-config", llm_routing_config])
     if prior_taxonomy_decisions_jsonl:
         command.extend(["--prior-taxonomy-decisions-jsonl", prior_taxonomy_decisions_jsonl])
     if prior_review_json:
@@ -1258,6 +1386,7 @@ No markdown, no prose outside JSON.
 def run_codex_taxonomy_tail(
     *,
     codex_bin: str,
+    llm_routing_config: str | None = None,
     current_catalog: Tier2LabelCatalog,
     target_concept_without_taxonomy_ratio: float,
     iteration_dir: Path,
@@ -1273,15 +1402,22 @@ def run_codex_taxonomy_tail(
         iteration_dir=iteration_dir,
         prior_review_path=prior_review_path,
     )
-    if os.name == "nt":
-        command = ["cmd", "/c", codex_bin, "exec", "--ephemeral", "-o", str(raw_output_file), "-"]
-    else:
-        resolved_codex = _resolve_codex_executable(codex_bin)
-        command = [resolved_codex, "exec", "--ephemeral", "-o", str(raw_output_file), "-"]
+    agent_role = resolve_agent_role(
+        llm_routing_config,
+        AGENT_TAXONOMY_TAIL_ROLE,
+        default_client="codex",
+        default_model=None,
+        default_executable=codex_bin,
+    )
     last_error: Exception | None = None
     for attempt in range(1, max(CODEX_REVIEW_MAX_ATTEMPTS, 1) + 1):
-        _run_command_with_input(command, stdout_log_file, stdin_text=prompt)
-        raw_text = raw_output_file.read_text(encoding="utf-8")
+        raw_text = _run_agent_prompt(
+            role_config=agent_role,
+            prompt=prompt,
+            raw_output_file=raw_output_file,
+            stdout_log_file=stdout_log_file,
+            schema_payload=_taxonomy_tail_json_schema(),
+        )
         try:
             parsed = parse_codex_taxonomy_tail_output(raw_text)
             validated = validate_codex_taxonomy_tail_payload(parsed)
@@ -1471,13 +1607,16 @@ def _maybe_run_codex_taxonomy_tail(
         else:
             state["active_step"] = f"iteration_{iteration_index}_codex_taxonomy_tail"
             _write_json(state_path, state)
-            tail_review = run_codex_taxonomy_tail(
-                codex_bin=config.codex_bin,
-                current_catalog=current_catalog,
-                target_concept_without_taxonomy_ratio=config.target_concept_without_taxonomy_ratio,
-                iteration_dir=iteration_dir,
-                prior_review_path=prior_review_path,
-            )
+            tail_kwargs = {
+                "codex_bin": config.codex_bin,
+                "current_catalog": current_catalog,
+                "target_concept_without_taxonomy_ratio": config.target_concept_without_taxonomy_ratio,
+                "iteration_dir": iteration_dir,
+                "prior_review_path": prior_review_path,
+            }
+            if config.llm_routing_config:
+                tail_kwargs["llm_routing_config"] = config.llm_routing_config
+            tail_review = run_codex_taxonomy_tail(**tail_kwargs)
         if tail_applied_path.exists():
             tail_applied = _read_json(tail_applied_path)
         else:
@@ -1509,7 +1648,13 @@ def _maybe_run_codex_taxonomy_tail(
     _write_json(state_path, state)
 
 
-def run_tier3(*, params: Tier3Params, dry_run: bool, iteration_dir: Path) -> dict[str, Any]:
+def run_tier3(
+    *,
+    params: Tier3Params,
+    dry_run: bool,
+    iteration_dir: Path,
+    llm_routing_config: str | None = None,
+) -> dict[str, Any]:
     summary_path = iteration_dir / "tier3_summary.json"
     command = [
         sys.executable,
@@ -1537,6 +1682,8 @@ def run_tier3(*, params: Tier3Params, dry_run: bool, iteration_dir: Path) -> dic
         "--summary-json",
         str(summary_path),
     ]
+    if llm_routing_config:
+        command.extend(["--llm-routing-config", llm_routing_config])
     if dry_run:
         command.append("--dry-run")
     _run_command(command, iteration_dir / "tier3.log")
@@ -1775,6 +1922,7 @@ Do not include markdown fences or any extra text.
 def run_codex_review(
     *,
     codex_bin: str,
+    llm_routing_config: str | None = None,
     target_concept_ratio: float,
     target_duplicate_rate: float,
     target_concept_without_taxonomy_ratio: float,
@@ -1793,15 +1941,22 @@ def run_codex_review(
         current_tier3=current_tier3,
         current_catalog=current_catalog,
     )
-    if os.name == "nt":
-        command = ["cmd", "/c", codex_bin, "exec", "--ephemeral", "-o", str(raw_output_file), "-"]
-    else:
-        resolved_codex = _resolve_codex_executable(codex_bin)
-        command = [resolved_codex, "exec", "--ephemeral", "-o", str(raw_output_file), "-"]
+    agent_role = resolve_agent_role(
+        llm_routing_config,
+        AGENT_REVIEW_ROLE,
+        default_client="codex",
+        default_model=None,
+        default_executable=codex_bin,
+    )
     last_error: Exception | None = None
     for attempt in range(1, max(CODEX_REVIEW_MAX_ATTEMPTS, 1) + 1):
-        _run_command_with_input(command, stdout_log_file, stdin_text=prompt)
-        raw_text = raw_output_file.read_text(encoding="utf-8")
+        raw_text = _run_agent_prompt(
+            role_config=agent_role,
+            prompt=prompt,
+            raw_output_file=raw_output_file,
+            stdout_log_file=stdout_log_file,
+            schema_payload=_review_json_schema(),
+        )
         try:
             parsed = parse_codex_review_output(raw_text)
             validated = validate_review_payload(parsed)
@@ -1986,26 +2141,32 @@ def _run_initial_iteration(
     if "tier2_summary" not in iter0:
         state["active_step"] = "iteration_0_tier2"
         _write_json(state_path, state)
-        iter0["tier2_summary"] = run_tier2(
-            params=tier2,
-            catalog=tier2_catalog,
-            dry_run=config.dry_run,
-            iteration_dir=iteration_dir,
-        )
+        tier2_kwargs = {
+            "params": tier2,
+            "catalog": tier2_catalog,
+            "dry_run": config.dry_run,
+            "iteration_dir": iteration_dir,
+        }
+        if config.llm_routing_config:
+            tier2_kwargs["llm_routing_config"] = config.llm_routing_config
+        iter0["tier2_summary"] = run_tier2(**tier2_kwargs)
         iter0["tier2_catalog"] = _serialize_catalog(tier2_catalog)
         _write_json(state_path, state)
 
     if "taxonomy_summary" not in iter0:
         state["active_step"] = "iteration_0_taxonomy"
         _write_json(state_path, state)
-        iter0["taxonomy_summary"] = run_taxonomy(
-            params=taxonomy,
-            catalog=tier2_catalog,
-            dry_run=config.dry_run,
-            iteration_dir=iteration_dir,
-            prior_taxonomy_decisions_jsonl=None,
-            prior_review_json=None,
-        )
+        taxonomy_kwargs = {
+            "params": taxonomy,
+            "catalog": tier2_catalog,
+            "dry_run": config.dry_run,
+            "iteration_dir": iteration_dir,
+            "prior_taxonomy_decisions_jsonl": None,
+            "prior_review_json": None,
+        }
+        if config.llm_routing_config:
+            taxonomy_kwargs["llm_routing_config"] = config.llm_routing_config
+        iter0["taxonomy_summary"] = run_taxonomy(**taxonomy_kwargs)
         _write_json(state_path, state)
 
     _maybe_run_codex_taxonomy_tail(
@@ -2023,7 +2184,14 @@ def _run_initial_iteration(
     if "tier3_summary" not in iter0:
         state["active_step"] = "iteration_0_tier3"
         _write_json(state_path, state)
-        iter0["tier3_summary"] = run_tier3(params=tier3, dry_run=config.dry_run, iteration_dir=iteration_dir)
+        tier3_kwargs = {
+            "params": tier3,
+            "dry_run": config.dry_run,
+            "iteration_dir": iteration_dir,
+        }
+        if config.llm_routing_config:
+            tier3_kwargs["llm_routing_config"] = config.llm_routing_config
+        iter0["tier3_summary"] = run_tier3(**tier3_kwargs)
         _write_json(state_path, state)
 
     iter0["applied_params"] = {"tier2": asdict(tier2), "taxonomy": asdict(taxonomy), "tier3": asdict(tier3)}
@@ -2093,16 +2261,19 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
             if "review" not in iteration_record:
                 state["active_step"] = f"iteration_{next_iteration}_review"
                 _write_json(state_path, state)
-                iteration_record["review"] = run_codex_review(
-                    codex_bin=config.codex_bin,
-                    target_concept_ratio=config.target_concept_ratio,
-                    target_duplicate_rate=config.target_duplicate_rate,
-                    target_concept_without_taxonomy_ratio=config.target_concept_without_taxonomy_ratio,
-                    current_tier2=tier2,
-                    current_tier3=tier3,
-                    current_catalog=tier2_catalog,
-                    iteration_dir=iteration_dir,
-                )
+                review_kwargs = {
+                    "codex_bin": config.codex_bin,
+                    "target_concept_ratio": config.target_concept_ratio,
+                    "target_duplicate_rate": config.target_duplicate_rate,
+                    "target_concept_without_taxonomy_ratio": config.target_concept_without_taxonomy_ratio,
+                    "current_tier2": tier2,
+                    "current_tier3": tier3,
+                    "current_catalog": tier2_catalog,
+                    "iteration_dir": iteration_dir,
+                }
+                if config.llm_routing_config:
+                    review_kwargs["llm_routing_config"] = config.llm_routing_config
+                iteration_record["review"] = run_codex_review(**review_kwargs)
                 _write_json(state_path, state)
 
             review = iteration_record["review"]
@@ -2267,12 +2438,15 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
                     state["last_tier2_catalog_proposal"] = iteration_record.get("tier2_catalog_proposal")
                     state["active_step"] = f"iteration_{next_iteration}_tier2"
                     _write_json(state_path, state)
-                    iteration_record["tier2_summary"] = run_tier2(
-                        params=next_tier2,
-                        catalog=next_catalog,
-                        dry_run=config.dry_run,
-                        iteration_dir=iteration_dir,
-                    )
+                    tier2_kwargs = {
+                        "params": next_tier2,
+                        "catalog": next_catalog,
+                        "dry_run": config.dry_run,
+                        "iteration_dir": iteration_dir,
+                    }
+                    if config.llm_routing_config:
+                        tier2_kwargs["llm_routing_config"] = config.llm_routing_config
+                    iteration_record["tier2_summary"] = run_tier2(**tier2_kwargs)
                     iteration_record["tier2_catalog"] = _serialize_catalog(next_catalog)
                     _write_json(state_path, state)
                 else:
@@ -2292,18 +2466,21 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
                     iteration_record.pop("taxonomy_skip_reason", None)
                     state["active_step"] = f"iteration_{next_iteration}_taxonomy"
                     _write_json(state_path, state)
-                    iteration_record["taxonomy_summary"] = run_taxonomy(
-                        params=next_taxonomy,
-                        catalog=next_catalog,
-                        dry_run=config.dry_run,
-                        iteration_dir=iteration_dir,
-                        prior_taxonomy_decisions_jsonl=str(run_dir / f"iteration_{next_iteration - 1}" / "taxonomy_decisions.jsonl")
+                    taxonomy_kwargs = {
+                        "params": next_taxonomy,
+                        "catalog": next_catalog,
+                        "dry_run": config.dry_run,
+                        "iteration_dir": iteration_dir,
+                        "prior_taxonomy_decisions_jsonl": str(run_dir / f"iteration_{next_iteration - 1}" / "taxonomy_decisions.jsonl")
                         if (run_dir / f"iteration_{next_iteration - 1}" / "taxonomy_decisions.jsonl").exists()
                         else None,
-                        prior_review_json=str(run_dir / f"iteration_{next_iteration - 1}" / "codex_review.json")
+                        "prior_review_json": str(run_dir / f"iteration_{next_iteration - 1}" / "codex_review.json")
                         if (run_dir / f"iteration_{next_iteration - 1}" / "codex_review.json").exists()
                         else None,
-                    )
+                    }
+                    if config.llm_routing_config:
+                        taxonomy_kwargs["llm_routing_config"] = config.llm_routing_config
+                    iteration_record["taxonomy_summary"] = run_taxonomy(**taxonomy_kwargs)
                     _write_json(state_path, state)
                 else:
                     iteration_record["taxonomy_skipped"] = True
@@ -2335,11 +2512,14 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
                     iteration_record.pop("tier3_skip_reason", None)
                     state["active_step"] = f"iteration_{next_iteration}_tier3"
                     _write_json(state_path, state)
-                    iteration_record["tier3_summary"] = run_tier3(
-                        params=next_tier3,
-                        dry_run=config.dry_run,
-                        iteration_dir=iteration_dir,
-                    )
+                    tier3_kwargs = {
+                        "params": next_tier3,
+                        "dry_run": config.dry_run,
+                        "iteration_dir": iteration_dir,
+                    }
+                    if config.llm_routing_config:
+                        tier3_kwargs["llm_routing_config"] = config.llm_routing_config
+                    iteration_record["tier3_summary"] = run_tier3(**tier3_kwargs)
                     _write_json(state_path, state)
                 else:
                     iteration_record["tier3_skipped"] = True
@@ -2411,6 +2591,7 @@ def parse_args() -> OrchestratorConfig:
     parser.add_argument("--taxonomy-plateau-min-delta", type=float, default=0.002)
     parser.add_argument("--run-dir", type=str, default=None)
     parser.add_argument("--codex-bin", type=str, default="codex")
+    parser.add_argument("--llm-routing-config", type=str, default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
@@ -2440,6 +2621,7 @@ def parse_args() -> OrchestratorConfig:
         taxonomy_plateau_min_delta=args.taxonomy_plateau_min_delta,
         run_dir=args.run_dir,
         codex_bin=args.codex_bin,
+        llm_routing_config=args.llm_routing_config,
         dry_run=args.dry_run,
         resume=args.resume,
     )

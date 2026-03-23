@@ -172,7 +172,10 @@ def create_graph_database_connection(credentials):
     return graph
 
 
-def load_embedding_model(embedding_provider: str, embedding_model_name: str):
+def load_embedding_model(
+        embedding_provider: str,
+        embedding_model_name: str,
+        embedding_dimension_override: int | None = None):
     """
     Load the appropriate embedding model and return its instance and dimension.
 
@@ -186,36 +189,35 @@ def load_embedding_model(embedding_provider: str, embedding_model_name: str):
     Raises:
         ValueError: If provider or model is not supported.
     """
-    # Mapping of model dimensions for each provider
-    model_dimensions = {
-        "openai": {
-            "text-embedding-3-large": 3072,
-            "text-embedding-3-small": 1536,
-            "text-embedding-ada-002": 1536,
-        },
-        "gemini": {
-            "gemini-embedding-001": 3072,
-            "text-embedding-005": 768,
-        },
-        "titan": {
-            "amazon.titan-embed-text-v2:0": 1024,
-            "amazon.titan-embed-text-v1": 1536,
-        },
-        "sentence-transformer": {
-            "all-MiniLM-L6-v2": 384,
-        },
-    }
-
     provider = embedding_provider.lower()
+    if provider == "genai":
+        provider = "gemini"
     model = embedding_model_name
-
-    if provider not in model_dimensions or model not in model_dimensions[provider]:
-        raise ValueError(f"Unsupported provider/model: {provider}/{model}")
-
-    dimension = model_dimensions[provider][model]
+    dimension_override = embedding_dimension_override
+    if dimension_override is None:
+        raw_dimension_override = os.environ.get("EMBEDDING_DIMENSION_OVERRIDE", "").strip()
+        if raw_dimension_override:
+            try:
+                dimension_override = int(raw_dimension_override)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Environment variable 'EMBEDDING_DIMENSION_OVERRIDE' must be an integer, got '{raw_dimension_override}'."
+                ) from exc
+            if dimension_override <= 0:
+                raise ValueError("Environment variable 'EMBEDDING_DIMENSION_OVERRIDE' must be > 0.")
 
     if provider == "openai":
-        embeddings = OpenAIEmbeddings(model=model)
+        embeddings = OpenAIEmbeddings(model=model, dimensions=dimension_override)
+    elif provider == "openrouter":
+        openrouter_api_key = get_value_from_env("OPENROUTER_API_KEY")
+        if not openrouter_api_key:
+            raise ValueError("Environment variable 'OPENROUTER_API_KEY' is not set.")
+        embeddings = OpenAIEmbeddings(
+            model=model,
+            dimensions=dimension_override,
+            api_key=openrouter_api_key,
+            base_url="https://openrouter.ai/api/v1",
+        )
     elif provider == "gemini":
         embeddings = VertexAIEmbeddings(model=model)
     elif provider == "titan":
@@ -226,9 +228,18 @@ def load_embedding_model(embedding_provider: str, embedding_model_name: str):
     else:
         raise ValueError(f"Unknown embedding provider: {provider}")
 
+    dimension = dimension_override if dimension_override is not None else _detect_embedding_dimension(embeddings)
+
     logging.info(
         f"Embedding: Using {provider} - {model}, Dimension: {dimension}")
     return embeddings, dimension
+
+
+def _detect_embedding_dimension(embeddings) -> int:
+    probe_vector = embeddings.embed_query("dimension probe")
+    if not isinstance(probe_vector, list) or not probe_vector:
+        raise ValueError("Embedding model did not return a valid probe vector.")
+    return len(probe_vector)
 
 
 def save_graphDocuments_in_neo4j(graph: Neo4jGraph, graph_document_list: List[GraphDocument], max_retries=3, delay=1):
