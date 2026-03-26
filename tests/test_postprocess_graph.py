@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+import dataset_registry as dr
 import scripts.postprocess_graph as ppg
 
 
@@ -212,3 +213,35 @@ def test_preflight_consolidation_uses_routed_agent_executables(monkeypatch, tmp_
 
     assert codex_executable is None
     assert calls == ["claude-custom", "opencode-custom"]
+
+
+def test_parse_args_accepts_dataset_registry_defaults(monkeypatch) -> None:
+    entry = dr.DatasetRegistryEntry(
+        key="bench-openalex-rag",
+        notebook=dr.RegistryNotebook(id="nb-1", title="bench-openalex-rag"),
+        neo4j=dr.RegistryNeo4j(
+            uri="bolt://127.0.0.1:17687",
+            username="neo4j",
+            password="pw-123",
+            database="neo4j",
+        ),
+    )
+    class FakeNow:
+        def strftime(self, fmt: str) -> str:
+            return "20260325_1015"
+
+    monkeypatch.setattr(ppg, "load_dataset_entry", lambda dataset_key, registry_path=None: entry)
+    monkeypatch.setattr(ppg, "datetime", type("FakeDateTime", (), {"now": staticmethod(lambda: FakeNow())}))
+    monkeypatch.setattr(
+        ppg.sys,
+        "argv",
+        ["postprocess_graph.py", "--dataset-key", "bench-openalex-rag"],
+    )
+
+    args = ppg.parse_args()
+
+    assert args.neo4j_uri == "bolt://127.0.0.1:17687"
+    assert args.neo4j_user == "neo4j"
+    assert args.neo4j_password == "pw-123"
+    assert args.neo4j_database == "neo4j"
+    assert args.run_dir.endswith("runs\\bench-openalex-rag\\postprocess_20260325_1015")

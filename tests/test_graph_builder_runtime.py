@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import build_graph as bg
+import dataset_registry as dr
 import graph_builder_runtime as runtime
 import scripts.sync_notebook_graph as sng
 
@@ -73,6 +74,41 @@ def test_post_processing_calls_index_creation(monkeypatch) -> None:
 
     assert result["status"] == "Success"
     assert calls == [("sentence-transformer", "all-MiniLM-L6-v2")]
+
+
+def test_extract_passes_embedding_provider_and_model_to_processing(monkeypatch, tmp_path: Path) -> None:
+    source_path = tmp_path / "paper.txt"
+    source_path.write_text("content", encoding="utf-8")
+    captured: dict[str, object] = {}
+
+    async def fake_processing_source(credentials, params, pages, merged_file_path=None, is_uploaded_from_local=None):
+        captured["params"] = params
+        captured["pages"] = pages
+        return None, {"status": "Completed", "nodeCount": 1, "relationshipCount": 2}
+
+    monkeypatch.setattr(runtime, "get_documents_from_file_by_path", lambda file_path, file_name: (file_name, ["page"], None))
+    monkeypatch.setattr(runtime, "processing_source", fake_processing_source)
+    monkeypatch.setattr(runtime, "create_graph_database_connection", lambda credentials: object())
+    monkeypatch.setattr(runtime, "close_db_connection", lambda graph, api_name: None)
+
+    api = runtime.GraphBuilderAPI(
+        neo4j_uri="bolt://host.docker.internal:17687",
+        neo4j_user="neo4j",
+        neo4j_password="pw-123",
+        neo4j_database="neo4j",
+        sources_dir=tmp_path,
+    )
+    result = api.extract(
+        "paper.txt",
+        "google_flash",
+        embedding_provider="openrouter",
+        embedding_model="text-embedding-3-small",
+    )
+
+    assert result["status"] == "Success"
+    params = captured["params"]
+    assert params.embedding_provider == "openrouter"
+    assert params.embedding_model == "text-embedding-3-small"
 
 
 def test_build_graph_command_omits_backend_url(tmp_path: Path) -> None:
@@ -154,3 +190,27 @@ def test_phase_upload_and_extract_propagates_retry_condition(tmp_path: Path) -> 
             "chunks_to_combine": 1,
         }
     ]
+
+
+def test_build_graph_parse_args_accepts_dataset_registry_defaults(monkeypatch) -> None:
+    entry = dr.DatasetRegistryEntry(
+        key="bench-imdb-scifi",
+        notebook=dr.RegistryNotebook(id="nb-1", title="bench-imdb-scifi"),
+        neo4j=dr.RegistryNeo4j(
+            uri="bolt://127.0.0.1:61706",
+            username="neo4j",
+            password="pw-123",
+            database="neo4j",
+        ),
+    )
+    monkeypatch.setattr(bg, "load_dataset_entry", lambda dataset_key, registry_path=None: entry)
+    monkeypatch.setattr(bg, "default_sources_dir", lambda dataset_key: Path("C:/tmp/bench-imdb-scifi/sources"))
+    monkeypatch.setattr(bg.sys, "argv", ["build_graph.py", "--dataset-key", "bench-imdb-scifi"])
+
+    args = bg.parse_args()
+
+    assert args.neo4j_uri == "bolt://127.0.0.1:61706"
+    assert args.neo4j_user == "neo4j"
+    assert args.neo4j_password == "pw-123"
+    assert args.neo4j_database == "neo4j"
+    assert args.sources_dir == "C:\\tmp\\bench-imdb-scifi\\sources"

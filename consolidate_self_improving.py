@@ -47,6 +47,8 @@ TIER3_BOUNDS = {
 MAX_TIER2_LABELS = 40
 VALID_DIAGNOSES = {"balanced", "duplicate_debt", "taxonomy_debt", "mixed_debt"}
 CODEX_REVIEW_MAX_ATTEMPTS = int(os.environ.get("CODEX_REVIEW_MAX_ATTEMPTS", "3"))
+AGENT_COMMAND_TIMEOUT_SECONDS = int(os.environ.get("AGENT_COMMAND_TIMEOUT_SECONDS", "300"))
+WINDOWS_ARGV_PROMPT_SOFT_LIMIT = 7800
 WITHOUT_TAXONOMY_PLATEAU_MIN_DELTA = 0.05
 COMBINED_STOP_REASON = "combined_stop_gate_met_consecutively"
 TIER2_SKIP_REASON = "concept_ratio_within_target"
@@ -362,11 +364,22 @@ def parse_codex_review_output(raw_text: str) -> dict[str, Any]:
 
     if not isinstance(payload, dict):
         raise ValueError("Codex output must be a JSON object.")
-    return payload
+    return _normalize_json_object_keys(payload)
 
 
 def parse_codex_taxonomy_tail_output(raw_text: str) -> dict[str, Any]:
     return parse_codex_review_output(raw_text)
+
+
+def _normalize_json_object_keys(value: Any) -> Any:
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            normalized[str(key).strip()] = _normalize_json_object_keys(item)
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_json_object_keys(item) for item in value]
+    return value
 
 
 def validate_review_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -936,15 +949,31 @@ def _run_agent_command(
     raw_output_file: Path,
     *,
     stdin_text: str | None = None,
+    env_overrides: dict[str, str] | None = None,
 ) -> None:
-    result = subprocess.run(
-        command,
-        text=True,
-        input=stdin_text,
-        capture_output=True,
-        cwd=REPO_ROOT,
-        check=False,
-    )
+    timeout_seconds = AGENT_COMMAND_TIMEOUT_SECONDS if AGENT_COMMAND_TIMEOUT_SECONDS > 0 else None
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            input=stdin_text,
+            capture_output=True,
+            cwd=REPO_ROOT,
+            env={**os.environ, **(env_overrides or {})},
+            check=False,
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout or ""
+        stderr = exc.stderr or ""
+        log_file.write_text(
+            f"COMMAND: {' '.join(command)}\n\nTIMEOUT_SECONDS: {timeout_seconds}\n\nSTDOUT:\n{stdout}\n\nSTDERR:\n{stderr}",
+            encoding="utf-8",
+        )
+        raise RuntimeError(
+            f"Command timed out after {timeout_seconds}s: {' '.join(command)}. "
+            f"See log: {log_file}"
+        ) from exc
     log_file.write_text(
         f"COMMAND: {' '.join(command)}\n\nSTDOUT:\n{result.stdout}\n\nSTDERR:\n{result.stderr}",
         encoding="utf-8",
@@ -954,43 +983,39 @@ def _run_agent_command(
             f"Command failed ({result.returncode}): {' '.join(command)}. "
             f"See log: {log_file}"
         )
-    if stdin_text is None:
-        raw_output_file.write_text(result.stdout, encoding="utf-8")
+    raw_output_file.write_text(result.stdout, encoding="utf-8")
 
 
 def _resolve_cli_executable(executable: str) -> str:
     candidate = Path(executable)
     if candidate.exists():
         return str(candidate.resolve())
+    if os.name == "nt" and candidate.parent == Path("."):
+        lookup = candidate.stem or executable
+        try:
+            result = subprocess.run(
+                ["where.exe", lookup],
+                text=True,
+                capture_output=True,
+                check=False,
+                cwd=REPO_ROOT,
+            )
+        except Exception:
+            result = None
+        if result and result.returncode == 0:
+            candidates = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+            preferred_suffixes = (
+                f"\\{lookup.lower()}.exe",
+                f"\\{lookup.lower()}.cmd",
+                f"\\{lookup.lower()}.bat",
+                f"\\{lookup.lower()}",
+            )
+            for suffix in preferred_suffixes:
+                for match in candidates:
+                    if match.lower().endswith(suffix):
+                        return match
     resolved = shutil.which(executable)
     return resolved or executable
-
-
-def _resolve_codex_executable(codex_bin: str) -> str:
-    if os.name != "nt":
-        return codex_bin
-    if codex_bin.lower() not in {"codex", "codex.exe", "codex.cmd"}:
-        return codex_bin
-    try:
-        result = subprocess.run(
-            ["where.exe", "codex"],
-            text=True,
-            capture_output=True,
-            check=False,
-            cwd=REPO_ROOT,
-        )
-        if result.returncode != 0:
-            return codex_bin
-        candidates = [line.strip() for line in result.stdout.splitlines() if line.strip()]
-        for candidate in candidates:
-            if candidate.lower().endswith("\\codex.exe"):
-                return candidate
-        for candidate in candidates:
-            if candidate.lower().endswith("\\codex"):
-                return candidate
-        return candidates[0] if candidates else codex_bin
-    except Exception:
-        return codex_bin
 
 
 def _review_json_schema() -> dict[str, Any]:
@@ -1030,18 +1055,16 @@ def _build_agent_command(
     if role_config.client == "codex":
         if role_config.model:
             model_args = ["-m", role_config.model]
-        command = [executable, "exec", "--ephemeral", *model_args, "-o", str(raw_output_file), "-"]
+        command = [executable, "exec", *role_config.args, "--ephemeral", *model_args, "-o", str(raw_output_file), "-"]
         if os.name == "nt" and executable.lower().endswith(".cmd"):
             command = ["cmd", "/c", *command]
         return command, prompt
     if role_config.client == "claude":
-        command = [executable, "-p", *model_args]
-        if schema_file is not None:
-            command.extend(["--json-schema", str(schema_file)])
-        command.append(prompt)
-        return command, None
+        command = [executable, *role_config.args, "-p", "--permission-mode", "bypassPermissions", *model_args]
+        command.extend(["--output-format", "json"])
+        return command, prompt
     if role_config.client == "opencode":
-        command = [executable, "run", *model_args, prompt]
+        command = [executable, "run", *role_config.args, *model_args, prompt]
         return command, None
     raise ValueError(f"Unsupported agent client '{role_config.client}'.")
 
@@ -1055,7 +1078,7 @@ def _run_agent_prompt(
     schema_payload: dict[str, Any] | None = None,
 ) -> str:
     schema_file = None
-    if schema_payload is not None and role_config.client == "claude":
+    if schema_payload is not None and role_config.client not in {"claude"}:
         schema_file = raw_output_file.with_suffix(".schema.json")
         schema_file.write_text(json.dumps(schema_payload, indent=2), encoding="utf-8")
     command, stdin_text = _build_agent_command(
@@ -1067,8 +1090,60 @@ def _run_agent_prompt(
     if role_config.client == "codex":
         _run_command_with_input(command, stdout_log_file, stdin_text or "")
     else:
-        _run_agent_command(command, stdout_log_file, raw_output_file, stdin_text=stdin_text)
-    return raw_output_file.read_text(encoding="utf-8")
+        _run_agent_command(
+            command,
+            stdout_log_file,
+            raw_output_file,
+            stdin_text=stdin_text,
+            env_overrides=role_config.env,
+        )
+    raw_text = raw_output_file.read_text(encoding="utf-8")
+    if role_config.client == "claude":
+        normalized = _extract_claude_text(raw_text)
+        raw_output_file.write_text(normalized, encoding="utf-8")
+        return normalized
+    if role_config.client == "opencode":
+        normalized = _extract_opencode_text(raw_text)
+        raw_output_file.write_text(normalized, encoding="utf-8")
+        return normalized
+    return raw_text
+
+
+def _extract_claude_text(raw_text: str) -> str:
+    try:
+        payload = json.loads(raw_text)
+    except json.JSONDecodeError:
+        return raw_text
+    if not isinstance(payload, dict):
+        return raw_text
+    result = payload.get("result")
+    if not isinstance(result, str):
+        return raw_text
+    stripped = result.strip()
+    if stripped.startswith("```"):
+        fence_lines = stripped.splitlines()
+        if len(fence_lines) >= 3 and fence_lines[0].startswith("```") and fence_lines[-1] == "```":
+            return "\n".join(fence_lines[1:-1]).strip()
+    return stripped
+
+
+def _extract_opencode_text(raw_text: str) -> str:
+    text_parts: list[str] = []
+    for line in raw_text.splitlines():
+        candidate = line.strip()
+        if not candidate:
+            continue
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            return raw_text
+        if payload.get("type") != "text":
+            continue
+        part = payload.get("part") or {}
+        text = part.get("text")
+        if isinstance(text, str):
+            text_parts.append(text)
+    return "\n".join(text_parts) if text_parts else raw_text
 
 
 def run_tier1(*, params: Tier2Params, dry_run: bool, iteration_dir: Path) -> None:
@@ -1768,6 +1843,7 @@ def _write_review_diagnostics(
 
 def _build_codex_prompt(
     *,
+    review_client: str | None,
     target_concept_ratio: float,
     target_duplicate_rate: float,
     target_concept_without_taxonomy_ratio: float,
@@ -1775,15 +1851,32 @@ def _build_codex_prompt(
     current_tier3: Tier3Params,
     current_catalog: Tier2LabelCatalog,
 ) -> str:
+    output_contract = [
+        "Structured-output contract:",
+        "- Machine-consumed response: output exactly one JSON object.",
+        '- First character must be "{" and last character must be "}".',
+        "- No markdown fences, headings, bullets, prose, or lead-in/outro text.",
+        "- Include every required key from the schema below exactly once; use 0, [], or {} when needed.",
+        "- If no catalog changes are proposed, keep the full labels list and use add/remove=[], rename_map/guidance={}.",
+        "- Before sending, internally verify that json.loads(final_response) would succeed.",
+    ]
+    if review_client == "opencode":
+        output_contract.extend(
+            [
+                "- You are not writing a human-readable report. You are filling an API response object.",
+                '- Do not say "I\'ll analyze", "Here is", or similar lead-in text.',
+            ]
+        )
     return f"""
-Use the Neo4j MCP tool in read-only mode to review graph consolidation quality.
-The execution pipeline now includes a precision-first taxonomy cleanup pass between Tier 2 and Tier 3.
-Prioritize semantic cleanliness under the current label set before recommending structural label catalog changes.
-Run Cypher queries to compute these KPIs:
-1) entity_count: MATCH (n:__Entity__) RETURN count(n) AS entity_count
-2) concept_only_count:
-   MATCH (n:__Entity__:Concept)
-   WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+  Use the Neo4j MCP tool in read-only mode to review graph consolidation quality.
+  The execution pipeline now includes a precision-first taxonomy cleanup pass between Tier 2 and Tier 3.
+  Prioritize semantic cleanliness under the current label set before recommending structural label catalog changes.
+  {"\n  ".join(output_contract)}
+  Run Cypher queries to compute these KPIs:
+  1) entity_count: MATCH (n:__Entity__) RETURN count(n) AS entity_count
+  2) concept_only_count:
+     MATCH (n:__Entity__:Concept)
+     WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
    RETURN count(n) AS concept_only_count
 3) subclass_rel_count: MATCH ()-[r:SUBCLASS_OF]->() RETURN count(r) AS subclass_rel_count
 4) duplicate_anchor_count using this duplicate-anchor logic:
@@ -1933,14 +2026,6 @@ def run_codex_review(
 ) -> dict[str, Any]:
     raw_output_file = iteration_dir / "codex_review_raw.txt"
     stdout_log_file = iteration_dir / "codex_review_exec.log"
-    prompt = _build_codex_prompt(
-        target_concept_ratio=target_concept_ratio,
-        target_duplicate_rate=target_duplicate_rate,
-        target_concept_without_taxonomy_ratio=target_concept_without_taxonomy_ratio,
-        current_tier2=current_tier2,
-        current_tier3=current_tier3,
-        current_catalog=current_catalog,
-    )
     agent_role = resolve_agent_role(
         llm_routing_config,
         AGENT_REVIEW_ROLE,
@@ -1948,8 +2033,24 @@ def run_codex_review(
         default_model=None,
         default_executable=codex_bin,
     )
+    base_prompt = _build_codex_prompt(
+        review_client=agent_role.client,
+        target_concept_ratio=target_concept_ratio,
+        target_duplicate_rate=target_duplicate_rate,
+        target_concept_without_taxonomy_ratio=target_concept_without_taxonomy_ratio,
+        current_tier2=current_tier2,
+        current_tier3=current_tier3,
+        current_catalog=current_catalog,
+    )
     last_error: Exception | None = None
     for attempt in range(1, max(CODEX_REVIEW_MAX_ATTEMPTS, 1) + 1):
+        prompt = base_prompt
+        if last_error is not None:
+            retry_suffix = '\n\nIMPORTANT: Previous reply was invalid. Retry with JSON only. Begin with "{" and end with "}".'
+            if agent_role.client == "opencode" and len(base_prompt) + len(retry_suffix) > WINDOWS_ARGV_PROMPT_SOFT_LIMIT:
+                prompt = base_prompt
+            else:
+                prompt = f"{base_prompt}{retry_suffix}"
         raw_text = _run_agent_prompt(
             role_config=agent_role,
             prompt=prompt,

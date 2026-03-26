@@ -30,6 +30,8 @@ class AgentRoleConfig:
     client: str
     model: str | None = None
     executable: str | None = None
+    args: tuple[str, ...] = ()
+    env: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -112,7 +114,21 @@ def resolve_agent_role(
         model = str(model).strip() or None
     executable = raw.get("executable", default_executable or default_agent_executable(client))
     executable = str(executable).strip() if executable is not None else None
-    return AgentRoleConfig(client=client, model=model, executable=executable or None)
+    raw_args = raw.get("args") or []
+    if not isinstance(raw_args, list) or not all(isinstance(item, (str, int, float)) for item in raw_args):
+        raise ValueError(f"Role '{role}' args must be a JSON array of scalars.")
+    args = tuple(str(item).strip() for item in raw_args if str(item).strip())
+    raw_env = raw.get("env") or {}
+    if not isinstance(raw_env, dict) or not all(isinstance(key, str) for key in raw_env):
+        raise ValueError(f"Role '{role}' env must be a JSON object.")
+    env = {key: str(value) for key, value in raw_env.items()}
+    return AgentRoleConfig(
+        client=client,
+        model=model,
+        executable=executable or None,
+        args=args,
+        env=env or None,
+    )
 
 
 def resolve_prompt_role(
@@ -165,20 +181,31 @@ def resolve_graph_build_embedding(
     default_provider: str,
     default_model: str,
 ) -> EmbeddingRoleConfig:
-    resolved = resolve_embedding_role(
-        config_path,
-        GRAPH_BUILD_EMBEDDING_ROLE,
-        default_client=default_provider,
-        default_model=default_model,
-    )
+    config = load_routing_config(config_path)
+    raw = _lookup_role(config, GRAPH_BUILD_EMBEDDING_ROLE) or {}
     explicit_provider = str(embedding_provider or "").strip()
     explicit_model = str(embedding_model or "").strip()
-    if not explicit_provider and not explicit_model:
-        return resolved
+    client = explicit_provider or str(raw.get("client", default_provider)).strip()
+    model = explicit_model or str(raw.get("model", default_model)).strip()
+    if not client:
+        raise ValueError(f"Role '{GRAPH_BUILD_EMBEDDING_ROLE}' must define a non-empty client.")
+    if not model:
+        raise ValueError(f"Role '{GRAPH_BUILD_EMBEDDING_ROLE}' must define a non-empty model.")
+    if explicit_provider or explicit_model:
+        return EmbeddingRoleConfig(client=client, model=model, dimension=None)
+    dimension_raw = raw.get("dimension")
+    dimension = None
+    if dimension_raw is not None:
+        try:
+            dimension = int(dimension_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"Role '{GRAPH_BUILD_EMBEDDING_ROLE}' has invalid dimension '{dimension_raw}'.") from exc
+        if dimension <= 0:
+            raise ValueError(f"Role '{GRAPH_BUILD_EMBEDDING_ROLE}' must define a positive dimension.")
     return EmbeddingRoleConfig(
-        client=explicit_provider or resolved.client,
-        model=explicit_model or resolved.model,
-        dimension=None,
+        client=client,
+        model=model,
+        dimension=dimension,
     )
 
 

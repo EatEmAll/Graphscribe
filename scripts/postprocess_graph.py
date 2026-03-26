@@ -8,6 +8,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -16,6 +17,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from build_graph import GraphBuilderAPI
+from dataset_registry import load_dataset_entry
 from llm_routing import (
     AGENT_REVIEW_ROLE,
     AGENT_TAXONOMY_TAIL_ROLE,
@@ -240,6 +242,8 @@ def run_consolidation(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run graph indexes followed by self-improving consolidation.")
+    parser.add_argument("--dataset-key", help="Dataset key from benchmark_dataset_registry.json")
+    parser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
     parser.add_argument("--neo4j-uri", default=DEFAULT_NEO4J_URI, help="Neo4j Bolt URI")
     parser.add_argument("--neo4j-user", default=DEFAULT_NEO4J_USER, help="Neo4j username")
     parser.add_argument("--neo4j-password", default=DEFAULT_NEO4J_PASSWORD, help="Neo4j password")
@@ -266,6 +270,22 @@ def parse_args() -> argparse.Namespace:
         parser.error("--required-consecutive-passes must be >= 0")
     if args.resume and not args.run_dir:
         parser.error("--resume requires --run-dir")
+    if args.dataset_key:
+        try:
+            entry = load_dataset_entry(args.dataset_key, args.registry_path)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.neo4j_uri == DEFAULT_NEO4J_URI:
+            args.neo4j_uri = entry.neo4j.uri
+        if args.neo4j_user == DEFAULT_NEO4J_USER:
+            args.neo4j_user = entry.neo4j.username
+        if args.neo4j_password == DEFAULT_NEO4J_PASSWORD:
+            args.neo4j_password = entry.neo4j.password
+        if args.neo4j_database == DEFAULT_NEO4J_DATABASE:
+            args.neo4j_database = entry.neo4j.database
+        if not args.run_dir:
+            stamp = datetime.now().strftime("%Y%m%d_%H%M")
+            args.run_dir = str(REPO_ROOT / "runs" / args.dataset_key / f"postprocess_{stamp}")
     return args
 
 

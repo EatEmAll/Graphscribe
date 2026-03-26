@@ -69,6 +69,34 @@ def test_resolve_graph_build_embedding_merges_partial_cli_override_and_clears_di
     assert resolved.dimension is None
 
 
+def test_resolve_graph_build_embedding_accepts_legacy_default_provider_without_config() -> None:
+    resolved = routing.resolve_graph_build_embedding(
+        config_path=None,
+        embedding_provider=None,
+        embedding_model=None,
+        default_provider="sentence-transformer",
+        default_model="all-MiniLM-L6-v2",
+    )
+
+    assert resolved.client == "sentence-transformer"
+    assert resolved.model == "all-MiniLM-L6-v2"
+    assert resolved.dimension is None
+
+
+def test_resolve_graph_build_embedding_applies_cli_override_without_validating_legacy_default() -> None:
+    resolved = routing.resolve_graph_build_embedding(
+        config_path=None,
+        embedding_provider="openai",
+        embedding_model="text-embedding-3-small",
+        default_provider="sentence-transformer",
+        default_model="all-MiniLM-L6-v2",
+    )
+
+    assert resolved.client == "openai"
+    assert resolved.model == "text-embedding-3-small"
+    assert resolved.dimension is None
+
+
 def test_resolve_prompt_role_rejects_unknown_client(tmp_path: Path) -> None:
     config_path = _write_config(
         tmp_path,
@@ -113,3 +141,34 @@ def test_load_embedding_model_openrouter_honors_dimension_override(monkeypatch: 
     assert captured["dimensions"] == 1024
     assert captured["base_url"] == "https://openrouter.ai/api/v1"
     assert dimension == 1024
+
+
+def test_resolve_agent_role_accepts_args_and_env(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        {
+            "agents": {
+                "review": {
+                    "client": "claude",
+                    "model": "claude-haiku-4-5",
+                    "executable": "claude",
+                    "args": ["--mcp-config", "C:\\temp\\mcp.json", "--strict-mcp-config"],
+                    "env": {"XDG_CONFIG_HOME": "C:\\temp\\xdg"},
+                }
+            }
+        },
+    )
+
+    resolved = routing.resolve_agent_role(
+        config_path,
+        routing.AGENT_REVIEW_ROLE,
+        default_client="codex",
+        default_model=None,
+        default_executable="codex",
+    )
+
+    assert resolved.client == "claude"
+    assert resolved.model == "claude-haiku-4-5"
+    assert resolved.executable == "claude"
+    assert resolved.args == ("--mcp-config", "C:\\temp\\mcp.json", "--strict-mcp-config")
+    assert resolved.env == {"XDG_CONFIG_HOME": "C:\\temp\\xdg"}

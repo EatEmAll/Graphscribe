@@ -1,4 +1,5 @@
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -240,6 +241,12 @@ def test_parse_and_validate_codex_payload_round_trip() -> None:
     assert validated["proposed_tier3"]["threshold"] == pytest.approx(0.88)
 
 
+def test_parse_codex_review_output_strips_whitespace_from_keys() -> None:
+    payload = csi.parse_codex_review_output('{" diagnosis":"balanced"," kpis":{" entity_count":1}}')
+    assert payload["diagnosis"] == "balanced"
+    assert payload["kpis"]["entity_count"] == 1
+
+
 def test_run_codex_review_retries_invalid_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     outputs = iter(
         [
@@ -401,7 +408,12 @@ def test_build_agent_command_for_codex_uses_exec_and_output_file(monkeypatch: py
 def test_build_agent_command_for_claude_uses_json_schema_file(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(csi, "_resolve_cli_executable", lambda executable: executable)
     command, stdin_text = csi._build_agent_command(
-        role_config=csi.AgentRoleConfig(client="claude", model="claude-sonnet-4", executable="claude"),
+        role_config=csi.AgentRoleConfig(
+            client="claude",
+            model="claude-sonnet-4",
+            executable="claude",
+            args=("--mcp-config", "C:\\temp\\claude-mcp.json"),
+        ),
         raw_output_file=tmp_path / "raw.txt",
         schema_file=tmp_path / "schema.json",
         prompt="review prompt",
@@ -409,20 +421,28 @@ def test_build_agent_command_for_claude_uses_json_schema_file(monkeypatch: pytes
 
     assert command == [
         "claude",
+        "--mcp-config",
+        "C:\\temp\\claude-mcp.json",
         "-p",
+        "--permission-mode",
+        "bypassPermissions",
         "--model",
         "claude-sonnet-4",
-        "--json-schema",
-        str(tmp_path / "schema.json"),
-        "review prompt",
+        "--output-format",
+        "json",
     ]
-    assert stdin_text is None
+    assert stdin_text == "review prompt"
 
 
 def test_build_agent_command_for_opencode_uses_run_mode(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(csi, "_resolve_cli_executable", lambda executable: executable)
     command, stdin_text = csi._build_agent_command(
-        role_config=csi.AgentRoleConfig(client="opencode", model="gpt-5.4-mini", executable="opencode"),
+        role_config=csi.AgentRoleConfig(
+            client="opencode",
+            model="gpt-5.4-mini",
+            executable="opencode",
+            args=("--format", "json"),
+        ),
         raw_output_file=tmp_path / "raw.txt",
         schema_file=None,
         prompt="review prompt",
@@ -431,11 +451,90 @@ def test_build_agent_command_for_opencode_uses_run_mode(monkeypatch: pytest.Monk
     assert command == [
         "opencode",
         "run",
+        "--format",
+        "json",
         "--model",
         "gpt-5.4-mini",
         "review prompt",
     ]
     assert stdin_text is None
+
+
+def test_resolve_cli_executable_prefers_cmd_over_bare_shim_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeCompletedProcess:
+        def __init__(self, stdout: str) -> None:
+            self.returncode = 0
+            self.stdout = stdout
+
+    monkeypatch.setattr(csi.os, "name", "nt")
+    monkeypatch.setattr(csi.shutil, "which", lambda executable: f"C:\\tools\\{executable}.cmd")
+    monkeypatch.setattr(
+        csi.subprocess,
+        "run",
+        lambda *args, **kwargs: FakeCompletedProcess("C:\\tools\\opencode\nC:\\tools\\opencode.cmd\n"),
+    )
+
+    assert csi._resolve_cli_executable("opencode") == "C:\\tools\\opencode.cmd"
+
+
+def test_extract_opencode_text_prefers_text_events() -> None:
+    raw = "\n".join(
+        [
+            json.dumps({"type": "step_start", "part": {"type": "step-start"}}),
+            json.dumps({"type": "text", "part": {"text": '{" count": 91}'}}),
+            json.dumps({"type": "step_finish", "part": {"type": "step-finish"}}),
+        ]
+    )
+
+    assert csi._extract_opencode_text(raw) == '{" count": 91}'
+
+
+def test_extract_claude_text_prefers_result_payload_and_strips_fence() -> None:
+    raw = json.dumps(
+        {
+            "type": "result",
+            "result": "```json\n{\"diagnosis\": \"balanced\"}\n```",
+        }
+    )
+
+    assert csi._extract_claude_text(raw) == '{"diagnosis": "balanced"}'
+
+
+def test_build_codex_prompt_includes_machine_output_contract_for_opencode() -> None:
+    prompt = csi._build_codex_prompt(
+        review_client="opencode",
+        target_concept_ratio=0.05,
+        target_duplicate_rate=0.015,
+        target_concept_without_taxonomy_ratio=0.6,
+        current_tier2=csi.Tier2Params(),
+        current_tier3=csi.Tier3Params(),
+        current_catalog=csi._default_tier2_catalog(),
+    )
+
+    assert 'First character must be "{" and last character must be "}"' in prompt
+    assert "Machine-consumed response: output exactly one JSON object." in prompt
+    assert "You are not writing a human-readable report." in prompt
+
+
+def test_run_agent_command_raises_timeout_and_logs_partial_output(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(csi, "AGENT_COMMAND_TIMEOUT_SECONDS", 7)
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=kwargs.get("args", args[0]), timeout=7, output="partial", stderr="boom")
+
+    monkeypatch.setattr(csi.subprocess, "run", fake_run)
+
+    log_file = tmp_path / "agent.log"
+    raw_output_file = tmp_path / "raw.txt"
+    with pytest.raises(RuntimeError, match="timed out after 7s"):
+        csi._run_agent_command(["claude", "-p"], log_file, raw_output_file, stdin_text="review")
+
+    logged = log_file.read_text(encoding="utf-8")
+    assert "TIMEOUT_SECONDS: 7" in logged
+    assert "partial" in logged
+    assert "boom" in logged
 
 
 def test_apply_codex_taxonomy_tail_applies_valid_actions_and_skips_invalid(
