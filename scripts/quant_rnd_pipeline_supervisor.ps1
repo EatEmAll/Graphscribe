@@ -24,7 +24,7 @@ function Get-GraphStatus {
     Set-Location $repoRoot
     $pythonScript = @"
 import json
-from graph_builder_runtime import GraphBuilderAPI
+from notebooklm_graph_pipe.runtime.graph_builder_runtime import GraphBuilderAPI
 
 api = GraphBuilderAPI(
     neo4j_uri="bolt://host.docker.internal:7687",
@@ -36,7 +36,7 @@ print(json.dumps(api.sources_list()))
 "@
     $responseJson = $pythonScript | python -
     if ($LASTEXITCODE -ne 0) {
-        throw "Failed to query graph status through graph_builder_runtime.py"
+        throw "Failed to query graph status through notebooklm_graph_pipe.runtime.graph_builder_runtime"
     }
     $response = @()
     if ($responseJson) {
@@ -81,7 +81,7 @@ function Invoke-BuildPass {
     $passLog = Join-Path $runsDir "$Label.log"
     $args = @(
         "-u",
-        "build_graph.py",
+        "-m", "notebooklm_graph_pipe.cli.build_graph",
         "--neo4j-uri", "bolt://host.docker.internal:7687",
         "--neo4j-user", "neo4j",
         "--neo4j-password", "password123",

@@ -3,7 +3,7 @@ import json
 import numpy as np
 import pytest
 
-import consolidate_tier3_semantic as t3
+import notebooklm_graph_pipe.consolidation.tier3_semantic as t3
 
 
 class _DummyResponse:

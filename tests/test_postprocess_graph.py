@@ -5,7 +5,7 @@ from pathlib import Path
 
 import pytest
 
-import dataset_registry as dr
+import notebooklm_graph_pipe.runtime.dataset_registry as dr
 import scripts.postprocess_graph as ppg
 
 
@@ -100,7 +100,8 @@ def test_build_consolidation_command_uses_dry_run_defaults() -> None:
 
     assert command == [
         ppg.sys.executable,
-        str(ppg.REPO_ROOT / "consolidate_self_improving.py"),
+        "-m",
+        "notebooklm_graph_pipe.consolidation.self_improving",
         "--max-iterations",
         "7",
         "--required-consecutive-passes",
@@ -139,7 +140,8 @@ def test_run_consolidation_passes_runtime_env() -> None:
     assert cwd == ppg.REPO_ROOT
     assert command == [
         ppg.sys.executable,
-        str(ppg.REPO_ROOT / "consolidate_self_improving.py"),
+        "-m",
+        "notebooklm_graph_pipe.consolidation.self_improving",
         "--max-iterations",
         "5",
         "--required-consecutive-passes",

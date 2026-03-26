@@ -20,10 +20,10 @@ import numpy as np
 from google import genai
 from neo4j import GraphDatabase
 
-from consolidate_tier2_relabel import load_label_catalog
-from graph_text_utils import coerce_text, normalize_name, token_set
-from llm_json_utils import build_single_prompt_clients, generate_json_payload
-from llm_routing import TAXONOMY_PRIMARY_ROLE, TAXONOMY_SECONDARY_ROLE, PromptRoleConfig, resolve_prompt_role
+from notebooklm_graph_pipe.consolidation.tier2_relabel import load_label_catalog
+from notebooklm_graph_pipe.runtime.graph_text_utils import coerce_text, normalize_name, token_set
+from notebooklm_graph_pipe.runtime.llm_json_utils import build_single_prompt_clients, generate_json_payload
+from notebooklm_graph_pipe.runtime.llm_routing import TAXONOMY_PRIMARY_ROLE, TAXONOMY_SECONDARY_ROLE, PromptRoleConfig, resolve_prompt_role
 
 DEFAULT_NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 DEFAULT_NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")

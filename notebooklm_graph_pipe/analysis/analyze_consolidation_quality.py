@@ -14,10 +14,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
+from notebooklm_graph_pipe.paths import CONSOLIDATION_REPORT_DIR, REPO_ROOT
+
 
 class ConsolidationQualityAnalyzer:
     def __init__(self, repo_root: str = None):
-        self.repo_root = Path(repo_root) if repo_root else Path.cwd()
+        self.repo_root = Path(repo_root).resolve() if repo_root else REPO_ROOT
         self.runs_dir = self.repo_root / "runs"
         self.consolidation_logs = []
 
@@ -159,9 +161,9 @@ class ConsolidationQualityAnalyzer:
                 "status": "no_runs_found",
                 "message": "No consolidation runs found. Run consolidation first.",
                 "suggested_commands": [
-                    "python consolidate_self_improving.py",
-                    "python consolidate_tier1_lemmatize.py --dry-run",
-                    "python consolidate_tier2_relabel.py --dry-run",
+                    "python scripts/consolidation/consolidate_self_improving.py",
+                    "python scripts/consolidation/consolidate_tier1_lemmatize.py --dry-run",
+                    "python scripts/consolidation/consolidate_tier2_relabel.py --dry-run",
                 ],
             }
 
@@ -286,8 +288,9 @@ class ConsolidationQualityAnalyzer:
         }
 
         # Save report
-        report_file = f"consolidation_quality_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-        with open(self.repo_root / report_file, "w", encoding="utf-8") as f:
+        report_file = CONSOLIDATION_REPORT_DIR / f"consolidation_quality_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        report_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(report_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 
         return report
@@ -342,9 +345,9 @@ class ConsolidationQualityAnalyzer:
         # Immediate steps
         if analysis.get("status") == "no_runs_found":
             steps["immediate"] = [
-                "python consolidate_tier1_lemmatize.py --dry-run",
+                "python scripts/consolidation/consolidate_tier1_lemmatize.py --dry-run",
                 "Review dry-run output",
-                "python consolidate_tier1_lemmatize.py",
+                "python scripts/consolidation/consolidate_tier1_lemmatize.py",
             ]
         else:
             steps["immediate"] = [
@@ -355,7 +358,7 @@ class ConsolidationQualityAnalyzer:
 
         # Short-term steps
         steps["short_term"] = [
-            "Run full consolidation pipeline: python consolidate_self_improving.py",
+            "Run full consolidation pipeline: python scripts/consolidation/consolidate_self_improving.py",
             "Monitor consolidation metrics during execution",
             "Review generated taxonomy decisions",
             "Validate consolidation results in Neo4j browser",
@@ -395,9 +398,9 @@ def main():
 
     print("\nRECOMMENDATIONS:")
     for rec in report["recommendations"]:
-        print(f"  • {rec}")
+        print(f"  â€¢ {rec}")
 
-    print(f"\nReport saved to: consolidation_quality_report_[timestamp].json")
+    print(f"\nReport saved to: {CONSOLIDATION_REPORT_DIR}\\consolidation_quality_report_[timestamp].json")
 
     return report
 

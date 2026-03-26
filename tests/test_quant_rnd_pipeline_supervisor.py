@@ -9,4 +9,5 @@ def test_quant_rnd_supervisor_uses_local_runtime_contract() -> None:
 
     assert "Invoke-RestMethod" not in script_text
     assert "--backend-url" not in script_text
-    assert "graph_builder_runtime import GraphBuilderAPI" in script_text
+    assert "notebooklm_graph_pipe.runtime.graph_builder_runtime import GraphBuilderAPI" in script_text
+    assert "\"-m\", \"notebooklm_graph_pipe.cli.build_graph\"" in script_text

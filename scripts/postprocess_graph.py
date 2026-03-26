@@ -16,9 +16,10 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from build_graph import GraphBuilderAPI
-from dataset_registry import load_dataset_entry
-from llm_routing import (
+from notebooklm_graph_pipe.paths import RUNS_DIR
+from notebooklm_graph_pipe.runtime.graph_builder_runtime import GraphBuilderAPI
+from notebooklm_graph_pipe.runtime.dataset_registry import load_dataset_entry
+from notebooklm_graph_pipe.runtime.llm_routing import (
     AGENT_REVIEW_ROLE,
     AGENT_TAXONOMY_TAIL_ROLE,
     GRAPH_BUILD_EMBEDDING_ROLE,
@@ -177,7 +178,8 @@ def run_backend_postprocess(
 def build_consolidation_command(config: ConsolidationConfig, codex_executable: str | None = None) -> list[str]:
     command = [
         sys.executable,
-        str(REPO_ROOT / "consolidate_self_improving.py"),
+        "-m",
+        "notebooklm_graph_pipe.consolidation.self_improving",
         "--max-iterations",
         str(config.max_iterations),
         "--required-consecutive-passes",
@@ -237,12 +239,12 @@ def run_consolidation(
     log(f"Running consolidation: {' '.join(command)}")
     result = (runner or CommandRunner()).run(command, cwd=REPO_ROOT, env=env)
     if result.returncode != 0:
-        raise WorkflowError(f"consolidate_self_improving.py failed with exit code {result.returncode}")
+        raise WorkflowError(f"notebooklm_graph_pipe.consolidation.self_improving failed with exit code {result.returncode}")
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run graph indexes followed by self-improving consolidation.")
-    parser.add_argument("--dataset-key", help="Dataset key from benchmark_dataset_registry.json")
+    parser.add_argument("--dataset-key", help="Dataset key from config/benchmark_dataset_registry.json")
     parser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
     parser.add_argument("--neo4j-uri", default=DEFAULT_NEO4J_URI, help="Neo4j Bolt URI")
     parser.add_argument("--neo4j-user", default=DEFAULT_NEO4J_USER, help="Neo4j username")
@@ -285,7 +287,7 @@ def parse_args() -> argparse.Namespace:
             args.neo4j_database = entry.neo4j.database
         if not args.run_dir:
             stamp = datetime.now().strftime("%Y%m%d_%H%M")
-            args.run_dir = str(REPO_ROOT / "runs" / args.dataset_key / f"postprocess_{stamp}")
+            args.run_dir = str(RUNS_DIR / args.dataset_key / f"postprocess_{stamp}")
     return args
 
 

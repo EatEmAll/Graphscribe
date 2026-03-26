@@ -4,7 +4,7 @@ import json
 import subprocess
 from pathlib import Path
 
-import dataset_registry as dr
+import notebooklm_graph_pipe.runtime.dataset_registry as dr
 import scripts.sync_notebook_graph as sng
 
 
@@ -275,7 +275,7 @@ def test_notebooklm_cli_adapter_supports_current_cli_shapes(tmp_path: Path) -> N
             ),
             ("nlm", "notebook", "create", "Alpha"): make_completed(
                 ["nlm", "notebook", "create", "Alpha"],
-                "✓ Created notebook: Alpha\n  ID: nb-1\n",
+                "âœ“ Created notebook: Alpha\n  ID: nb-1\n",
             ),
             ("nlm", "source", "list", "nb-1", "--json"): make_completed(
                 ["nlm", "source", "list", "nb-1", "--json"],
@@ -299,7 +299,7 @@ def test_notebooklm_cli_adapter_supports_current_cli_shapes(tmp_path: Path) -> N
                     str(file_path),
                     "--wait",
                 ],
-                "Uploading paper.pdf and waiting for processing...\n✓ Added source: paper.pdf (ready)\nSource ID: src-2\n",
+                "Uploading paper.pdf and waiting for processing...\nâœ“ Added source: paper.pdf (ready)\nSource ID: src-2\n",
             ),
             ("nlm", "source", "content", "src-2", "--json"): make_completed(
                 ["nlm", "source", "content", "src-2", "--json"],
@@ -307,7 +307,7 @@ def test_notebooklm_cli_adapter_supports_current_cli_shapes(tmp_path: Path) -> N
             ),
             ("nlm", "source", "delete", "src-2", "--confirm"): make_completed(
                 ["nlm", "source", "delete", "src-2", "--confirm"],
-                "✓ Deleted source: src-2\n",
+                "âœ“ Deleted source: src-2\n",
             ),
         }
     )

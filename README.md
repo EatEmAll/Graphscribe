@@ -76,10 +76,10 @@ Without those MCP servers, the bundled `.claude`, `.opencode`, and `.codex` deep
   - Currently pinned to commit `61121df4c15716f67636a4fac2c96e909d374ada`
 - `src/`
   - Overlay package for backend modules that differ from upstream
-- `build_graph.py`
+- `scripts/build_graph.py`
   - Local register/extract/post-process entrypoint
-- `graph_builder_runtime.py`
-  - Compatibility wrapper exposing the old orchestration surface
+- `notebooklm_graph_pipe/runtime/graph_builder_runtime.py`
+  - Local runtime wrapper exposing the orchestration surface used by repo workflows
 - `scripts/`
   - Workflow entrypoints for NotebookLM sync, post-processing, A/B evaluation, and consolidation
 - `tests/`
@@ -125,7 +125,7 @@ Graph build and post-processing use one embedding provider and model combination
 - Default local graph-build embedding:
   - client or provider: `sentence-transformer`
   - model: `all-MiniLM-L6-v2`
-- Routing-config embedding clients supported by `llm_routing.py`:
+- Routing-config embedding clients supported by `notebooklm_graph_pipe/runtime/llm_routing.py`:
   - `genai`
   - `openai`
   - `openrouter`
@@ -182,7 +182,7 @@ Do not patch files under `vendor/llm-graph-builder/` for local behavior changes.
 
 ## Main Entry Points
 
-- `python build_graph.py --help`
+- `python scripts/build_graph.py --help`
 - `python scripts/sync_notebook_graph.py --help`
 - `python scripts/postprocess_graph.py --help`
 - `python scripts/run_ab_evaluation.py --help`
@@ -190,7 +190,7 @@ Do not patch files under `vendor/llm-graph-builder/` for local behavior changes.
 
 ## Benchmark Datasets
 
-Benchmark dataset connection details live in `benchmark_dataset_registry.json`.
+Benchmark dataset connection details live in `config/benchmark_dataset_registry.json`.
 
 This file is local runtime state, not a sanitized sample manifest. In the current implementation it may contain:
 
@@ -212,7 +212,7 @@ The main entrypoints accept `--dataset-key` and resolve stored Neo4j runtime det
 Examples:
 
 ```powershell
-python build_graph.py --dataset-key bench-openalex-rag
+python scripts/build_graph.py --dataset-key bench-openalex-rag
 
 python scripts\sync_notebook_graph.py update `
   --dataset-dir C:\Users\Roman\repos\misc_notebooks\benchmark-datasets\openalex-rag\sources `
@@ -240,12 +240,14 @@ pytest -q
 Useful smoke checks:
 
 ```powershell
-python -m py_compile build_graph.py graph_builder_runtime.py `
+python -m py_compile scripts/build_graph.py notebooklm_graph_pipe\runtime\graph_builder_runtime.py `
+  notebooklm_graph_pipe\runtime\dataset_registry.py notebooklm_graph_pipe\runtime\llm_routing.py `
+  notebooklm_graph_pipe\consolidation\self_improving.py `
   src\__init__.py src\main.py src\llm.py src\adaptive_retry.py `
   src\shared\__init__.py src\shared\common_fn.py `
   scripts\sync_notebook_graph.py scripts\postprocess_graph.py scripts\run_ab_evaluation.py
 
-python build_graph.py --help
+python scripts/build_graph.py --help
 python scripts\sync_notebook_graph.py --help
 python scripts\postprocess_graph.py --help
 python scripts\run_ab_evaluation.py --help

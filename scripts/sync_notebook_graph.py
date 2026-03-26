@@ -18,10 +18,9 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
-VENDORED_REPO_ROOT = REPO_ROOT / "vendor" / "llm-graph-builder"
 
-from dataset_registry import default_export_dir, load_dataset_entry
-from build_graph import GraphBuilderAPI
+from notebooklm_graph_pipe.runtime.dataset_registry import default_export_dir, load_dataset_entry
+from notebooklm_graph_pipe.runtime.graph_builder_runtime import GraphBuilderAPI
 
 DEFAULT_NEO4J_IMAGE = "neo4j:5.23"
 DEFAULT_DIRECT_NEO4J_URI = "bolt://127.0.0.1:7687"
@@ -539,7 +538,8 @@ def explicit_runtime_from_args(args: argparse.Namespace) -> Neo4jRuntime | None:
 def build_graph_command(args: argparse.Namespace, sources_dir: Path, runtime: Neo4jRuntime) -> list[str]:
     command = [
         sys.executable,
-        str(REPO_ROOT / "build_graph.py"),
+        "-m",
+        "notebooklm_graph_pipe.cli.build_graph",
         "--neo4j-uri",
         runtime.uri,
         "--neo4j-user",
@@ -581,7 +581,7 @@ def run_build_graph(args: argparse.Namespace, sources_dir: Path, runtime: Neo4jR
     log(f"Running graph build: {' '.join(command)}")
     result = subprocess.run(command, text=True, check=False)
     if result.returncode != 0:
-        raise SyncError(f"build_graph.py failed with exit code {result.returncode}")
+        raise SyncError(f"notebooklm_graph_pipe.cli.build_graph failed with exit code {result.returncode}")
 
 
 def resolve_export_dir(args: argparse.Namespace, project_slug: str) -> Path:
@@ -672,7 +672,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(subparser: argparse.ArgumentParser, *, require_title: bool) -> None:
         subparser.add_argument("--dataset-dir", required=True, help="Directory containing the source dataset")
-        subparser.add_argument("--dataset-key", help="Dataset key from benchmark_dataset_registry.json")
+        subparser.add_argument("--dataset-key", help="Dataset key from config/benchmark_dataset_registry.json")
         subparser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
         subparser.add_argument("--notebook-title", required=False, help="NotebookLM notebook title")
         subparser.add_argument("--notebook-id", help="NotebookLM notebook id override")
@@ -691,8 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--embedding-provider", default=None, help="Embedding provider override")
         subparser.add_argument("--embedding-model", default=None, help="Embedding model override")
         subparser.add_argument("--llm-routing-config", default=None, help="Optional JSON config for role-based LLM routing")
-        subparser.add_argument("--skip-build", action="store_true", help="Do not run build_graph.py")
-        subparser.add_argument("--skip-postprocess", action="store_true", help="Pass --skip-postprocess to build_graph.py")
+        subparser.add_argument("--skip-build", action="store_true", help="Do not run scripts/build_graph.py")
+        subparser.add_argument("--skip-postprocess", action="store_true", help="Pass --skip-postprocess to scripts/build_graph.py")
 
     add_common(subparsers.add_parser("create", help="Create or reuse notebook/runtime and sync files"), require_title=True)
     add_common(subparsers.add_parser("update", help="Update an existing notebook/runtime and sync files"), require_title=False)

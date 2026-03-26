@@ -5,7 +5,7 @@ Reclassifies nodes labelled only as `Concept` into more specific types
 (Metric, Strategy, Algorithm, Method, Model, etc.) using Gemini.
 
 Usage:
-    python consolidate_tier2_relabel.py [--dry-run] [--batch-size 50]
+    python scripts/consolidation/consolidate_tier2_relabel.py [--dry-run] [--batch-size 50]
 """
 
 from __future__ import annotations
@@ -20,15 +20,16 @@ from typing import Any
 from google import genai
 from neo4j import GraphDatabase
 
-from graph_text_utils import coerce_text, sorted_unique_texts
-from llm_json_utils import (
+from notebooklm_graph_pipe.paths import CONSOLIDATION_CACHE_DIR
+from notebooklm_graph_pipe.runtime.graph_text_utils import coerce_text, sorted_unique_texts
+from notebooklm_graph_pipe.runtime.llm_json_utils import (
     JsonDiskCache,
     build_single_prompt_clients,
     generate_json_payload,
     is_transient_model_error,
     make_cache_key,
 )
-from llm_routing import TIER2_PRIMARY_ROLE, TIER2_SECONDARY_ROLE, PromptRoleConfig, resolve_prompt_role
+from notebooklm_graph_pipe.runtime.llm_routing import TIER2_PRIMARY_ROLE, TIER2_SECONDARY_ROLE, PromptRoleConfig, resolve_prompt_role
 
 DEFAULT_NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 DEFAULT_NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")
@@ -39,7 +40,10 @@ SECOND_STAGE_MODEL_NAME = os.environ.get("TIER2_SECOND_STAGE_MODEL_NAME", "gemin
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("TIER2_LOW_CONFIDENCE_THRESHOLD", "0.65"))
 MAX_RETRIES = int(os.environ.get("TIER2_MAX_RETRIES", "3"))
 INITIAL_RETRY_DELAY_SECONDS = float(os.environ.get("TIER2_INITIAL_RETRY_DELAY_SECONDS", "1.0"))
-DEFAULT_CACHE_FILE = os.environ.get("TIER2_CACHE_FILE", "tier2_classification_cache.json")
+DEFAULT_CACHE_FILE = os.environ.get(
+    "TIER2_CACHE_FILE",
+    str(CONSOLIDATION_CACHE_DIR / "tier2_classification_cache.json"),
+)
 DEFAULT_LABELS = [
     "Concept",
     "Metric",

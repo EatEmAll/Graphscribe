@@ -5,7 +5,8 @@ from pathlib import Path
 
 import pytest
 
-import llm_routing as routing
+from notebooklm_graph_pipe.paths import LOCAL_MODEL_DIR
+import notebooklm_graph_pipe.runtime.llm_routing as routing
 from src.shared import common_fn
 
 
@@ -141,6 +142,24 @@ def test_load_embedding_model_openrouter_honors_dimension_override(monkeypatch: 
     assert captured["dimensions"] == 1024
     assert captured["base_url"] == "https://openrouter.ai/api/v1"
     assert dimension == 1024
+
+
+def test_sentence_transformer_model_path_is_repo_anchored(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        common_fn,
+        "_ensure_sentence_transformer_model_downloaded",
+        lambda model_name, model_path: captured.update({"model_name": model_name, "model_path": model_path}),
+    )
+    monkeypatch.setattr(common_fn, "HuggingFaceEmbeddings", lambda model_name: {"model_name": model_name})
+    common_fn._embedding_instances.clear()
+    common_fn._embedding_locks.clear()
+
+    embeddings = common_fn._get_sentence_transformer_embedding("all-MiniLM-L6-v2")
+
+    assert embeddings == {"model_name": str(LOCAL_MODEL_DIR)}
+    assert captured["model_path"] == str(LOCAL_MODEL_DIR)
 
 
 def test_resolve_agent_role_accepts_args_and_env(tmp_path: Path) -> None:

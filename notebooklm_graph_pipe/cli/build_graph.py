@@ -16,9 +16,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 
-from dataset_registry import default_sources_dir, load_dataset_entry
-from graph_builder_runtime import GraphBuilderAPI
-from llm_routing import resolve_graph_build_embedding
+from notebooklm_graph_pipe.paths import REPO_ROOT
+from notebooklm_graph_pipe.runtime.dataset_registry import default_sources_dir, load_dataset_entry
+from notebooklm_graph_pipe.runtime.graph_builder_runtime import GraphBuilderAPI
+from notebooklm_graph_pipe.runtime.llm_routing import resolve_graph_build_embedding
 
 DEFAULT_TOKEN_CHUNK_SIZE = 2000
 DEFAULT_CHUNK_OVERLAP = 200
@@ -28,7 +29,7 @@ DEFAULT_NEO4J_URI = "bolt://127.0.0.1:7687"
 DEFAULT_NEO4J_USER = "neo4j"
 DEFAULT_NEO4J_PASSWORD = "password123"
 DEFAULT_NEO4J_DATABASE = "neo4j"
-DEFAULT_SOURCES_DIR = "data/notebooklm_exports/default/sources"
+DEFAULT_SOURCES_DIR = str(REPO_ROOT / "data" / "notebooklm_exports" / "default" / "sources")
 
 
 class C:
@@ -344,13 +345,13 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python build_graph.py                           # run all phases
-  python build_graph.py --parallel 3              # 3 concurrent extractions
-  python build_graph.py --skip-upload             # extract + post-process only
-  python build_graph.py --skip-upload --skip-extract  # post-process only
+  python scripts/build_graph.py                           # run all phases
+  python scripts/build_graph.py --parallel 3              # 3 concurrent extractions
+  python scripts/build_graph.py --skip-upload             # extract + post-process only
+  python scripts/build_graph.py --skip-upload --skip-extract  # post-process only
         """,
     )
-    parser.add_argument("--dataset-key", help="Dataset key from benchmark_dataset_registry.json")
+    parser.add_argument("--dataset-key", help="Dataset key from config/benchmark_dataset_registry.json")
     parser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
     parser.add_argument("--neo4j-uri", default=DEFAULT_NEO4J_URI, help="Neo4j Bolt URI")
     parser.add_argument("--neo4j-user", default=DEFAULT_NEO4J_USER, help="Neo4j username")

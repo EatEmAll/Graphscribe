@@ -175,7 +175,7 @@ if ($effectiveRequiredConsecutivePasses -le 0) {
 }
 
 $args = @(
-    "consolidate_self_improving.py",
+    "-m", "notebooklm_graph_pipe.consolidation.self_improving",
     "--max-iterations", $MaxIterations,
     "--target-concept-ratio", "0.05",
     "--target-duplicate-rate", "0.015",

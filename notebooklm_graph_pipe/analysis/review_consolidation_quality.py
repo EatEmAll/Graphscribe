@@ -11,6 +11,8 @@ import os
 from datetime import datetime
 from typing import Dict, List, Any
 
+from notebooklm_graph_pipe.paths import CONSOLIDATION_REPORT_DIR
+
 try:
     from neo4j import GraphDatabase
 except ImportError:
@@ -271,7 +273,8 @@ def main():
         report = reviewer.generate_consolidation_report()
 
         # Save report to file
-        report_file = f"graph_consolidation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        report_file = CONSOLIDATION_REPORT_DIR / f"graph_consolidation_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+        report_file.parent.mkdir(parents=True, exist_ok=True)
         with open(report_file, "w", encoding="utf-8") as f:
             json.dump(report, f, indent=2, ensure_ascii=False)
 

@@ -5,7 +5,7 @@ Finds entity nodes that differ only by plural/suffix form (e.g. Trade/Trades,
 Model/Models) and merges them into a single canonical node using APOC refactor.
 
 Usage:
-    python consolidate_tier1_lemmatize.py [--dry-run]
+    python scripts/consolidation/consolidate_tier1_lemmatize.py [--dry-run]
 """
 
 from __future__ import annotations

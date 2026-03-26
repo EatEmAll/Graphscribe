@@ -5,8 +5,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-REPO_ROOT = Path(__file__).resolve().parent
-DEFAULT_REGISTRY_PATH = REPO_ROOT / "benchmark_dataset_registry.json"
+from notebooklm_graph_pipe.paths import CONFIG_DIR, REPO_ROOT
+
+DEFAULT_REGISTRY_PATH = CONFIG_DIR / "benchmark_dataset_registry.json"
 
 
 @dataclass(frozen=True)

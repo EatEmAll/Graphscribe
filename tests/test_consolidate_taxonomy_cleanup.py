@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-import consolidate_taxonomy_cleanup as taxonomy
+import notebooklm_graph_pipe.consolidation.taxonomy_cleanup as taxonomy
 
 
 class _DummyResponse:

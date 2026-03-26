@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import build_graph as bg
-import dataset_registry as dr
-import graph_builder_runtime as runtime
+import notebooklm_graph_pipe.cli.build_graph as bg
+import notebooklm_graph_pipe.runtime.dataset_registry as dr
+import notebooklm_graph_pipe.runtime.graph_builder_runtime as runtime
 import scripts.sync_notebook_graph as sng
 
 
@@ -133,7 +133,7 @@ def test_build_graph_command_omits_backend_url(tmp_path: Path) -> None:
     command = sng.build_graph_command(args, tmp_path / "sources", runtime_info)
 
     assert "--backend-url" not in command
-    assert command[:2] == [sng.sys.executable, str(sng.REPO_ROOT / "build_graph.py")]
+    assert command[:3] == [sng.sys.executable, "-m", "notebooklm_graph_pipe.cli.build_graph"]
 
 
 class FakeBuildAPI:
@@ -214,3 +214,7 @@ def test_build_graph_parse_args_accepts_dataset_registry_defaults(monkeypatch) -
     assert args.neo4j_password == "pw-123"
     assert args.neo4j_database == "neo4j"
     assert args.sources_dir == "C:\\tmp\\bench-imdb-scifi\\sources"
+
+
+def test_dataset_registry_defaults_use_config_dir() -> None:
+    assert dr.default_registry_path() == dr.CONFIG_DIR / "benchmark_dataset_registry.json"

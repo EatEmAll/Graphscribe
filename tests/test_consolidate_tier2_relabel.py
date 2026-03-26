@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-import consolidate_tier2_relabel as t2
+import notebooklm_graph_pipe.consolidation.tier2_relabel as t2
 
 
 class _DummyResponse:

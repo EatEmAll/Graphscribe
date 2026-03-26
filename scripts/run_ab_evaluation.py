@@ -19,7 +19,8 @@ REPO_ROOT = SCRIPT_DIR.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from dataset_registry import DatasetRegistryEntry, load_dataset_entry
+from notebooklm_graph_pipe.paths import RUNS_DIR
+from notebooklm_graph_pipe.runtime.dataset_registry import DatasetRegistryEntry, load_dataset_entry
 
 MODEL_NAME = "gpt-5.4"
 BENCHMARK_RUN_PREFIX = "ab_eval_"
@@ -189,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--registry-path", help="Optional benchmark dataset registry path.")
     parser.add_argument("--model", default=MODEL_NAME, help="Codex model name.")
-    parser.add_argument("--runs-root", default=str(REPO_ROOT / "runs"), help="Benchmark run root.")
+    parser.add_argument("--runs-root", default=str(RUNS_DIR), help="Benchmark run root.")
     parser.add_argument("--run-dir", help="Existing benchmark run dir to resume.")
     parser.add_argument("--temp-root", default=str(Path(tempfile.gettempdir()) / "codex_ab_eval"), help="Temp Codex working root.")
     return parser

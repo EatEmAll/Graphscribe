@@ -20,9 +20,10 @@ from google import genai
 from google.genai import types
 from neo4j import GraphDatabase
 
-from graph_text_utils import coerce_text, normalize_name, sorted_unique_texts, token_set
-from llm_json_utils import JsonDiskCache, build_single_prompt_clients, generate_json_payload, make_cache_key
-from llm_routing import (
+from notebooklm_graph_pipe.paths import CONSOLIDATION_CACHE_DIR
+from notebooklm_graph_pipe.runtime.graph_text_utils import coerce_text, normalize_name, sorted_unique_texts, token_set
+from notebooklm_graph_pipe.runtime.llm_json_utils import JsonDiskCache, build_single_prompt_clients, generate_json_payload, make_cache_key
+from notebooklm_graph_pipe.runtime.llm_routing import (
     TIER3_EMBEDDING_ROLE,
     TIER3_JUDGE_PRIMARY_ROLE,
     TIER3_JUDGE_SECONDARY_ROLE,
@@ -54,8 +55,11 @@ DEFAULT_EMBED_PROGRESS_EVERY = 100
 DEFAULT_MAX_CANDIDATES = 600
 DEFAULT_MAX_MERGES = 200
 DEFAULT_SLEEP_SECONDS = 0.0
-DEFAULT_CACHE_FILE = "embeddings_cache.pkl"
-DEFAULT_JUDGE_CACHE_FILE = os.environ.get("TIER3_JUDGE_CACHE_FILE", "tier3_judge_cache.json")
+DEFAULT_CACHE_FILE = str(CONSOLIDATION_CACHE_DIR / "embeddings_cache.pkl")
+DEFAULT_JUDGE_CACHE_FILE = os.environ.get(
+    "TIER3_JUDGE_CACHE_FILE",
+    str(CONSOLIDATION_CACHE_DIR / "tier3_judge_cache.json"),
+)
 LABEL_COMPATIBILITY_GROUPS = [
     {"Metric", "Financial Metric"},
     {"Strategy", "Trading System", "Trading Concept"},

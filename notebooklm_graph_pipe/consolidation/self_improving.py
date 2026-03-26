@@ -24,15 +24,14 @@ from typing import Any
 
 from neo4j import GraphDatabase
 
-from graph_text_utils import normalize_name, token_set
-from llm_routing import (
+from notebooklm_graph_pipe.paths import CONSOLIDATION_CACHE_DIR, REPO_ROOT, RUNS_DIR
+from notebooklm_graph_pipe.runtime.graph_text_utils import normalize_name, token_set
+from notebooklm_graph_pipe.runtime.llm_routing import (
     AGENT_REVIEW_ROLE,
     AGENT_TAXONOMY_TAIL_ROLE,
     AgentRoleConfig,
     resolve_agent_role,
 )
-
-REPO_ROOT = Path(__file__).resolve().parent
 
 TIER2_BOUNDS = {
     "batch_size": (10, 200),
@@ -63,6 +62,10 @@ STRUCTURAL_RELATION_SKIP_REASONS = {
     "Existing INSTANCE_OF target already present",
     "Existing TYPE_OF target already present",
 }
+TIER1_MODULE = "notebooklm_graph_pipe.consolidation.tier1_lemmatize"
+TIER2_MODULE = "notebooklm_graph_pipe.consolidation.tier2_relabel"
+TAXONOMY_MODULE = "notebooklm_graph_pipe.consolidation.taxonomy_cleanup"
+TIER3_MODULE = "notebooklm_graph_pipe.consolidation.tier3_semantic"
 
 DEFAULT_TIER2_LABELS = [
     "Concept",
@@ -111,7 +114,7 @@ class Tier2Params:
     batch_size: int = 50
     sleep_seconds: float = 1.0
     max_nodes: int = 1000
-    cache_file: str = "tier2_classification_cache.json"
+    cache_file: str = str(CONSOLIDATION_CACHE_DIR / "tier2_classification_cache.json")
     neo4j_uri: str = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
     neo4j_user: str = os.environ.get("NEO4J_USERNAME", "neo4j")
     neo4j_password: str = os.environ.get("NEO4J_PASSWORD", "password123")
@@ -124,8 +127,8 @@ class Tier3Params:
     max_candidates: int = 600
     max_merges: int = 200
     sleep_seconds: float = 0.0
-    cache_file: str = "embeddings_cache.pkl"
-    judge_cache_file: str = "tier3_judge_cache.json"
+    cache_file: str = str(CONSOLIDATION_CACHE_DIR / "embeddings_cache.pkl")
+    judge_cache_file: str = str(CONSOLIDATION_CACHE_DIR / "tier3_judge_cache.json")
     neo4j_uri: str = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
     neo4j_user: str = os.environ.get("NEO4J_USERNAME", "neo4j")
     neo4j_password: str = os.environ.get("NEO4J_PASSWORD", "password123")
@@ -1149,7 +1152,8 @@ def _extract_opencode_text(raw_text: str) -> str:
 def run_tier1(*, params: Tier2Params, dry_run: bool, iteration_dir: Path) -> None:
     command = [
         sys.executable,
-        "consolidate_tier1_lemmatize.py",
+        "-m",
+        TIER1_MODULE,
         "--neo4j-uri",
         params.neo4j_uri,
         "--neo4j-user",
@@ -1178,7 +1182,8 @@ def run_tier2(
     _write_json(catalog_path, _serialize_catalog(catalog))
     command = [
         sys.executable,
-        "consolidate_tier2_relabel.py",
+        "-m",
+        TIER2_MODULE,
         "--batch-size",
         str(params.batch_size),
         "--sleep-seconds",
@@ -1228,7 +1233,8 @@ def run_taxonomy(
         _write_json(catalog_path, _serialize_catalog(catalog))
     command = [
         sys.executable,
-        "consolidate_taxonomy_cleanup.py",
+        "-m",
+        TAXONOMY_MODULE,
         "--max-nodes",
         str(params.max_nodes),
         "--candidate-limit",
@@ -1733,7 +1739,8 @@ def run_tier3(
     summary_path = iteration_dir / "tier3_summary.json"
     command = [
         sys.executable,
-        "consolidate_tier3_semantic.py",
+        "-m",
+        TIER3_MODULE,
         "--threshold",
         str(params.threshold),
         "--max-candidates",
@@ -2312,7 +2319,7 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
     run_dir = (
         Path(config.run_dir).expanduser().resolve()
         if config.run_dir
-        else (REPO_ROOT / "runs" / f"consolidate_{_timestamp()}").resolve()
+        else (RUNS_DIR / f"consolidate_{_timestamp()}").resolve()
     )
     run_dir.mkdir(parents=True, exist_ok=True)
     state_path = run_dir / "run_state.json"

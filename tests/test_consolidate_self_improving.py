@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-import consolidate_self_improving as csi
+import notebooklm_graph_pipe.consolidation.self_improving as csi
 
 
 @pytest.fixture(autouse=True)

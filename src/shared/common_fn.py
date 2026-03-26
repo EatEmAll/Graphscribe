@@ -25,6 +25,8 @@ import boto3
 from langchain_community.embeddings import BedrockEmbeddings
 from langchain_core.callbacks import BaseCallbackHandler
 
+from notebooklm_graph_pipe.paths import LOCAL_MODEL_DIR
+
 
 # --- Embedding Model Helpers ---
 _embedding_instances = {}
@@ -46,7 +48,7 @@ def _ensure_sentence_transformer_model_downloaded(model_name: str, model_path: s
     logging.info("Model downloaded and saved.")
 
 
-def _get_sentence_transformer_embedding(model_name: str, model_path: str = "./local_model"):
+def _get_sentence_transformer_embedding(model_name: str, model_path: str = str(LOCAL_MODEL_DIR)):
     """
     Threadsafe singleton for HuggingFaceEmbeddings for any sentence-transformer model.
     """
@@ -223,7 +225,7 @@ def load_embedding_model(
     elif provider == "titan":
         embeddings = _get_bedrock_embeddings(model)
     elif provider == "sentence-transformer":
-        model_path = "./local_model"
+        model_path = str(LOCAL_MODEL_DIR)
         embeddings = _get_sentence_transformer_embedding(model, model_path)
     else:
         raise ValueError(f"Unknown embedding provider: {provider}")
