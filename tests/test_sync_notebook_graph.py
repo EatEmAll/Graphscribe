@@ -4,6 +4,7 @@ import json
 import subprocess
 from pathlib import Path
 
+import dataset_registry as dr
 import scripts.sync_notebook_graph as sng
 
 
@@ -1171,3 +1172,57 @@ def test_update_rejects_export_dir_from_different_notebook(monkeypatch, tmp_path
     else:
         raise AssertionError("Expected SyncError")
 
+
+def test_sync_dataset_uses_dataset_registry_defaults(monkeypatch, tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    source_path = dataset_dir / "paper.pdf"
+    source_path.write_bytes(b"pdf")
+    export_dir = tmp_path / "registry-export"
+    runtime = default_runtime()
+    entry = dr.DatasetRegistryEntry(
+        key="bench-imdb-scifi",
+        notebook=dr.RegistryNotebook(id="nb-1", title="bench-imdb-scifi"),
+        neo4j=dr.RegistryNeo4j(
+            uri=runtime.uri,
+            username=runtime.username,
+            password=runtime.password,
+            database=runtime.database,
+        ),
+    )
+
+    fake_cli = FakeNotebookCLI(sng.NotebookRef("nb-1", "bench-imdb-scifi"), known_notebooks=[sng.NotebookRef("nb-1", "bench-imdb-scifi")])
+    fake_graph = FakeGraphAPI()
+    build_calls: list[tuple[Path, sng.Neo4jRuntime]] = []
+
+    class FailProvisioner:
+        def ensure_available(self) -> None:
+            raise AssertionError("docker should not be checked when registry fills explicit runtime")
+
+        def ensure_runtime(self, *args, **kwargs):
+            raise AssertionError("docker runtime should not be resolved")
+
+    monkeypatch.setattr(sng, "load_dataset_entry", lambda dataset_key, registry_path=None: entry)
+    monkeypatch.setattr(sng, "default_export_dir", lambda dataset_key: export_dir)
+    monkeypatch.setattr(sng, "NotebookLMCliAdapter", lambda: fake_cli)
+    monkeypatch.setattr(sng, "DockerNeo4jProvisioner", lambda: FailProvisioner())
+    monkeypatch.setattr(sng, "GraphBuilderAPI", lambda *args, **kwargs: fake_graph)
+    monkeypatch.setattr(sng, "run_build_graph", lambda args, sources_dir, runtime: build_calls.append((sources_dir, runtime)))
+
+    args = sng.build_parser().parse_args(
+        [
+            "create",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--dataset-key",
+            "bench-imdb-scifi",
+        ]
+    )
+
+    assert sng.sync_dataset(args) == 0
+    manifest = sng.load_manifest_state(export_dir / "manifest.json")
+    assert manifest.notebook_id == "nb-1"
+    assert manifest.notebook_title == "bench-imdb-scifi"
+    assert manifest.neo4j is not None
+    assert manifest.neo4j.uri == runtime.uri
+    assert build_calls == [(export_dir / "sources", manifest.neo4j)]

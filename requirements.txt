@@ -1,0 +1,5 @@
+-r vendor/llm-graph-builder/backend/requirements.txt
+google-genai
+inflect
+numpy
+pytest

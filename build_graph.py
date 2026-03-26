@@ -16,6 +16,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 
+from dataset_registry import default_sources_dir, load_dataset_entry
 from graph_builder_runtime import GraphBuilderAPI
 from llm_routing import resolve_graph_build_embedding
 
@@ -23,6 +24,11 @@ DEFAULT_TOKEN_CHUNK_SIZE = 2000
 DEFAULT_CHUNK_OVERLAP = 200
 DEFAULT_CHUNKS_TO_COMBINE = 1
 TERMINAL_STATUSES = {"Completed", "Failed", "Cancelled"}
+DEFAULT_NEO4J_URI = "bolt://127.0.0.1:7687"
+DEFAULT_NEO4J_USER = "neo4j"
+DEFAULT_NEO4J_PASSWORD = "password123"
+DEFAULT_NEO4J_DATABASE = "neo4j"
+DEFAULT_SOURCES_DIR = "data/notebooklm_exports/default/sources"
 
 
 class C:
@@ -344,12 +350,14 @@ Examples:
   python build_graph.py --skip-upload --skip-extract  # post-process only
         """,
     )
-    parser.add_argument("--neo4j-uri", default="bolt://127.0.0.1:7687", help="Neo4j Bolt URI")
-    parser.add_argument("--neo4j-user", default="neo4j", help="Neo4j username")
-    parser.add_argument("--neo4j-password", default="password123", help="Neo4j password")
-    parser.add_argument("--neo4j-database", default="neo4j", help="Neo4j database name")
+    parser.add_argument("--dataset-key", help="Dataset key from benchmark_dataset_registry.json")
+    parser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
+    parser.add_argument("--neo4j-uri", default=DEFAULT_NEO4J_URI, help="Neo4j Bolt URI")
+    parser.add_argument("--neo4j-user", default=DEFAULT_NEO4J_USER, help="Neo4j username")
+    parser.add_argument("--neo4j-password", default=DEFAULT_NEO4J_PASSWORD, help="Neo4j password")
+    parser.add_argument("--neo4j-database", default=DEFAULT_NEO4J_DATABASE, help="Neo4j database name")
     parser.add_argument("--model", default="google_flash", help="LLM model name for extraction")
-    parser.add_argument("--sources-dir", default="data/notebooklm_exports/default/sources", help="Directory containing exported .txt source files")
+    parser.add_argument("--sources-dir", default=DEFAULT_SOURCES_DIR, help="Directory containing exported .txt source files")
     parser.add_argument("--parallel", type=int, default=1, help="Concurrent extractions")
     parser.add_argument("--poll-interval", type=int, default=15, help="Seconds between extraction status polls")
     parser.add_argument("--min-file-size", type=int, default=10, help="Skip files smaller than N bytes")
@@ -362,7 +370,23 @@ Examples:
     parser.add_argument("--skip-upload", action="store_true", help="Skip source registration")
     parser.add_argument("--skip-extract", action="store_true", help="Skip extraction")
     parser.add_argument("--skip-postprocess", action="store_true", help="Skip the post-processing phase")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.dataset_key:
+        try:
+            entry = load_dataset_entry(args.dataset_key, args.registry_path)
+        except ValueError as exc:
+            parser.error(str(exc))
+        if args.neo4j_uri == DEFAULT_NEO4J_URI:
+            args.neo4j_uri = entry.neo4j.uri
+        if args.neo4j_user == DEFAULT_NEO4J_USER:
+            args.neo4j_user = entry.neo4j.username
+        if args.neo4j_password == DEFAULT_NEO4J_PASSWORD:
+            args.neo4j_password = entry.neo4j.password
+        if args.neo4j_database == DEFAULT_NEO4J_DATABASE:
+            args.neo4j_database = entry.neo4j.database
+        if args.sources_dir == DEFAULT_SOURCES_DIR:
+            args.sources_dir = str(default_sources_dir(args.dataset_key))
+    return args
 
 
 def main() -> None:

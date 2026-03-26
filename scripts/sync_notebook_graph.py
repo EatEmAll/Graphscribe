@@ -20,6 +20,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 VENDORED_REPO_ROOT = REPO_ROOT / "vendor" / "llm-graph-builder"
 
+from dataset_registry import default_export_dir, load_dataset_entry
 from build_graph import GraphBuilderAPI
 
 DEFAULT_NEO4J_IMAGE = "neo4j:5.23"
@@ -589,6 +590,26 @@ def resolve_export_dir(args: argparse.Namespace, project_slug: str) -> Path:
     return (REPO_ROOT / "data" / "notebooklm_exports" / project_slug).resolve()
 
 
+def apply_dataset_registry_defaults(args: argparse.Namespace) -> None:
+    if not getattr(args, "dataset_key", None):
+        return
+    entry = load_dataset_entry(args.dataset_key, getattr(args, "registry_path", None))
+    if not args.notebook_id:
+        args.notebook_id = entry.notebook.id
+    if not args.notebook_title:
+        args.notebook_title = entry.notebook.title
+    if not args.export_dir:
+        args.export_dir = str(default_export_dir(args.dataset_key))
+    if not args.neo4j_uri:
+        args.neo4j_uri = entry.neo4j.uri
+    if not args.neo4j_user:
+        args.neo4j_user = entry.neo4j.username
+    if not args.neo4j_password:
+        args.neo4j_password = entry.neo4j.password
+    if not args.neo4j_database:
+        args.neo4j_database = entry.neo4j.database
+
+
 def resolve_notebook(cli: NotebookLMCliAdapter, args: argparse.Namespace, manifest_state: ManifestState) -> NotebookRef:
     notebooks = cli.ensure_authenticated()
     if args.notebook_id:
@@ -651,7 +672,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(subparser: argparse.ArgumentParser, *, require_title: bool) -> None:
         subparser.add_argument("--dataset-dir", required=True, help="Directory containing the source dataset")
-        subparser.add_argument("--notebook-title", required=require_title, help="NotebookLM notebook title")
+        subparser.add_argument("--dataset-key", help="Dataset key from benchmark_dataset_registry.json")
+        subparser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
+        subparser.add_argument("--notebook-title", required=False, help="NotebookLM notebook title")
         subparser.add_argument("--notebook-id", help="NotebookLM notebook id override")
         subparser.add_argument("--export-dir", help="Export directory for manifest and staged sources")
         subparser.add_argument("--neo4j-uri", help="Explicit Neo4j Bolt URI")
@@ -677,6 +700,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def sync_dataset(args: argparse.Namespace) -> int:
+    apply_dataset_registry_defaults(args)
     dataset_dir = Path(args.dataset_dir).resolve()
     if not dataset_dir.exists():
         raise SyncError(f"Dataset directory not found: {dataset_dir}")
