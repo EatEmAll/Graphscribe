@@ -244,8 +244,8 @@ def run_consolidation(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run graph indexes followed by self-improving consolidation.")
-    parser.add_argument("--dataset-key", help="Dataset key from config/benchmark_dataset_registry.json")
-    parser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
+    parser.add_argument("--dataset-key", help="Optional dataset key from a local registry JSON")
+    parser.add_argument("--registry-path", help="Path to an optional local dataset registry JSON")
     parser.add_argument("--neo4j-uri", default=DEFAULT_NEO4J_URI, help="Neo4j Bolt URI")
     parser.add_argument("--neo4j-user", default=DEFAULT_NEO4J_USER, help="Neo4j username")
     parser.add_argument("--neo4j-password", default=DEFAULT_NEO4J_PASSWORD, help="Neo4j password")

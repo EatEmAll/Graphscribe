@@ -4,15 +4,19 @@ import os
 from langchain_openai import ChatOpenAI, AzureChatOpenAI
 from langchain_google_vertexai import ChatVertexAI
 from langchain_groq import ChatGroq
+import logging
+from langchain_core.documents import Document
+import os
+from langchain_openai import ChatOpenAI, AzureChatOpenAI
+from langchain_google_vertexai import ChatVertexAI
+from langchain_groq import ChatGroq
 from langchain_google_vertexai import HarmBlockThreshold, HarmCategory
 from langchain_experimental.graph_transformers.diffbot import DiffbotGraphTransformer
 from langchain_experimental.graph_transformers import LLMGraphTransformer
 from langchain_experimental.graph_transformers.llm import _Graph
 from langchain_anthropic import ChatAnthropic
 from langchain_fireworks import ChatFireworks
-from langchain_aws import ChatBedrock
 from langchain_community.chat_models import ChatOllama
-import boto3
 import google.auth
 from src.adaptive_retry import resolve_graph_transformer_settings
 from src.shared.constants import ADDITIONAL_INSTRUCTIONS
@@ -24,102 +28,6 @@ from src.shared.common_fn import UniversalTokenUsageHandler, get_value_from_env
 
 
 def get_llm(model: str):
-    """Retrieve the specified language model based on the model name."""
-    model = model.upper().replace('.', '_').strip()
-    env_key = f"LLM_MODEL_CONFIG_{model}"
-    env_value = get_value_from_env(env_key)
-
-    if not env_value:
-        err = f"Environment variable '{env_key}' is not defined as per format or missing"
-        logging.error(err)
-        raise Exception(err)
-
-    logging.info("Model: {}".format(env_key))
-    callback_handler = UniversalTokenUsageHandler()
-    callback_manager = CallbackManager([callback_handler])
-    try:
-        if "GEMINI" in model:
-            model_name = env_value
-            credentials, project_id = google.auth.default()
-            llm = ChatVertexAI(
-                model_name=model_name,
-                credentials=credentials,
-                project=project_id,
-                temperature=0,
-                callbacks=callback_manager,
-                safety_settings={
-                    HarmCategory.HARM_CATEGORY_UNSPECIFIED: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-                    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-                },
-
-            )
-        elif "OPENAI" in model:
-            model_name, api_key = env_value.split(",")
-            if "MINI" in model:
-                llm = ChatOpenAI(
-                    api_key=api_key,
-                    model=model_name,
-                    callbacks=callback_manager,
-                )
-            else:
-                llm = ChatOpenAI(
-                    api_key=api_key,
-                    model=model_name,
-                    temperature=0,
-                    callbacks=callback_manager,
-                )
-
-        elif "AZURE" in model:
-            model_name, api_endpoint, api_key, api_version = env_value.split(
-                ",")
-            llm = AzureChatOpenAI(
-                api_key=api_key,
-                azure_endpoint=api_endpoint,
-                azure_deployment=model_name,  # takes precedence over model parameter
-                api_version=api_version,
-                temperature=0,
-                max_tokens=None,
-                timeout=None,
-                callbacks=callback_manager,
-            )
-
-        elif "ANTHROPIC" in model:
-            model_name, api_key = env_value.split(",")
-            llm = ChatAnthropic(
-                api_key=api_key, model=model_name, temperature=0, timeout=None, callbacks=callback_manager,
-            )
-
-        elif "FIREWORKS" in model:
-            model_name, api_key = env_value.split(",")
-            llm = ChatFireworks(
-                api_key=api_key, model=model_name, callbacks=callback_manager)
-
-        elif "GROQ" in model:
-            model_name, base_url, api_key = env_value.split(",")
-            llm = ChatGroq(api_key=api_key, model_name=model_name,
-                           temperature=0, callbacks=callback_manager)
-
-        elif "BEDROCK" in model:
-            model_name, aws_access_key, aws_secret_key, region_name = env_value.split(
-                ",")
-            bedrock_client = boto3.client(
-                service_name="bedrock-runtime",
-                region_name=region_name,
-                aws_access_key_id=aws_access_key,
-                aws_secret_access_key=aws_secret_key,
-            )
-
-            llm = ChatBedrock(
-                client=bedrock_client, region_name=region_name, model_id=model_name, model_kwargs=dict(temperature=0), callbacks=callback_manager,
-            )
-
-        elif "OLLAMA" in model:
-            model_name, base_url = env_value.split(",")
-            llm = ChatOllama(base_url=base_url, model=model_name,
-                             callbacks=callback_manager)
 
         elif "GOOGLE" in model:
             # Google Gemini via OpenAI-compatible endpoint using GOOGLE_API_KEY env var

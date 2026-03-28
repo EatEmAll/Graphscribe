@@ -820,6 +820,70 @@ def test_update_uses_manifest_runtime_and_retries_changed_sources(monkeypatch, t
     assert build_calls == [(export_dir / "sources", runtime)]
 
 
+def test_update_explicit_runtime_overrides_manifest_managed_runtime(monkeypatch, tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    source_path = dataset_dir / "paper.pdf"
+    source_path.write_bytes(b"new pdf")
+
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+    manifest_runtime = default_runtime()
+    notebook = sng.NotebookRef("nb-1", "demo")
+    staged_name = sng.staged_txt_name_for(Path("paper.pdf"))
+    old_entry = sng.ManifestEntry("paper.pdf", "old-hash", "src-old", staged_name, "exported")
+    sng.save_manifest(export_dir / "manifest.json", "demo", notebook, manifest_runtime, {"paper.pdf": old_entry}, [])
+
+    explicit_runtime = sng.Neo4jRuntime(
+        uri="bolt://127.0.0.1:27687",
+        username="neo4j",
+        password="pw-explicit",
+        database="neo4j",
+    )
+
+    fake_cli = FakeNotebookCLI(notebook, known_notebooks=[notebook], sources=[sng.NotebookSource("src-old", "paper.pdf")])
+    fake_provisioner = FakeProvisioner(manifest_runtime)
+    fake_graph = FakeGraphAPI()
+    fake_graph.source_rows = [{"fileName": staged_name}]
+    build_calls: list[tuple[Path, sng.Neo4jRuntime]] = []
+
+    monkeypatch.setattr(sng, "NotebookLMCliAdapter", lambda: fake_cli)
+    monkeypatch.setattr(sng, "DockerNeo4jProvisioner", lambda: fake_provisioner)
+    monkeypatch.setattr(sng, "GraphBuilderAPI", lambda *args, **kwargs: fake_graph)
+    monkeypatch.setattr(sng, "run_build_graph", lambda args, sources_dir, runtime: build_calls.append((sources_dir, runtime)))
+
+    args = sng.build_parser().parse_args(
+        [
+            "update",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--notebook-title",
+            "demo",
+            "--export-dir",
+            str(export_dir),
+            "--neo4j-uri",
+            explicit_runtime.uri,
+            "--neo4j-user",
+            explicit_runtime.username,
+            "--neo4j-password",
+            explicit_runtime.password,
+            "--neo4j-database",
+            explicit_runtime.database,
+        ]
+    )
+
+    assert sng.sync_dataset(args) == 0
+    assert fake_provisioner.ensure_available_calls == 0
+    assert fake_provisioner.ensure_runtime_calls == []
+    assert build_calls == [(export_dir / "sources", explicit_runtime)]
+
+    manifest = sng.load_manifest_state(export_dir / "manifest.json")
+    assert manifest.neo4j is not None
+    assert manifest.neo4j.uri == explicit_runtime.uri
+    assert manifest.neo4j.password == explicit_runtime.password
+    assert manifest.neo4j.container_name is None
+
+
 def test_update_is_idempotent_for_unchanged_dataset(monkeypatch, tmp_path: Path) -> None:
     dataset_dir = tmp_path / "dataset"
     dataset_dir.mkdir()
@@ -866,6 +930,63 @@ def test_update_is_idempotent_for_unchanged_dataset(monkeypatch, tmp_path: Path)
     assert fake_cli.added == []
     assert fake_graph.retry_calls == []
     assert build_calls == [(export_dir / "sources", runtime)]
+
+
+def test_update_adds_new_sources_to_notebook_and_staged_exports(monkeypatch, tmp_path: Path) -> None:
+    dataset_dir = tmp_path / "dataset"
+    dataset_dir.mkdir()
+    existing_path = dataset_dir / "paper.pdf"
+    new_path = dataset_dir / "appendix.pdf"
+    existing_path.write_bytes(b"paper")
+    new_path.write_bytes(b"appendix")
+    export_dir = tmp_path / "export"
+    export_dir.mkdir()
+
+    runtime = default_runtime()
+    notebook = sng.NotebookRef("nb-1", "demo")
+    existing_staged_name = sng.staged_txt_name_for(Path("paper.pdf"))
+    old_entry = sng.ManifestEntry("paper.pdf", sng.file_sha256(existing_path), "src-1", existing_staged_name, "exported")
+    sng.save_manifest(export_dir / "manifest.json", "demo", notebook, runtime, {"paper.pdf": old_entry}, [])
+    (export_dir / "sources").mkdir()
+    (export_dir / "sources" / existing_staged_name).write_text("already exported", encoding="utf-8")
+
+    fake_cli = FakeNotebookCLI(notebook, known_notebooks=[notebook], sources=[sng.NotebookSource("src-1", "paper.pdf")])
+    fake_provisioner = FakeProvisioner(runtime)
+    fake_graph = FakeGraphAPI()
+    build_calls: list[tuple[Path, sng.Neo4jRuntime]] = []
+
+    monkeypatch.setattr(sng, "NotebookLMCliAdapter", lambda: fake_cli)
+    monkeypatch.setattr(sng, "DockerNeo4jProvisioner", lambda: fake_provisioner)
+    monkeypatch.setattr(sng, "GraphBuilderAPI", lambda *args, **kwargs: fake_graph)
+    monkeypatch.setattr(sng, "run_build_graph", lambda args, sources_dir, runtime: build_calls.append((sources_dir, runtime)))
+
+    args = sng.build_parser().parse_args(
+        [
+            "update",
+            "--dataset-dir",
+            str(dataset_dir),
+            "--notebook-title",
+            "demo",
+            "--export-dir",
+            str(export_dir),
+        ]
+    )
+
+    exit_code = sng.sync_dataset(args)
+
+    assert exit_code == 0
+    assert fake_provisioner.ensure_runtime_calls == [("demo", sng.notebook_title_hash("demo"), runtime)]
+    assert fake_cli.deleted == []
+    assert fake_cli.added == [new_path]
+    assert fake_graph.retry_calls == []
+    assert build_calls == [(export_dir / "sources", runtime)]
+
+    manifest = sng.load_manifest_state(export_dir / "manifest.json")
+    assert set(manifest.entries) == {"appendix.pdf", "paper.pdf"}
+    new_entry = manifest.entries["appendix.pdf"]
+    assert new_entry.source_id == "src-1"
+    assert new_entry.status == "exported"
+    assert (export_dir / "sources" / new_entry.staged_txt_name).read_text(encoding="utf-8") == "content for src-1"
 
 
 def test_update_aborts_if_existing_source_cannot_be_deleted(monkeypatch, tmp_path: Path) -> None:

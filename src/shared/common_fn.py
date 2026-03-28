@@ -21,8 +21,6 @@ import os
 import time
 from pathlib import Path
 from urllib.parse import urlparse
-import boto3
-from langchain_community.embeddings import BedrockEmbeddings
 from langchain_core.callbacks import BaseCallbackHandler
 
 from notebooklm_graph_pipe.paths import LOCAL_MODEL_DIR
@@ -69,42 +67,6 @@ def _get_sentence_transformer_embedding(model_name: str, model_path: str = str(L
             model_name=model_path)
         logging.info(f"Embedding model {hf_model_name} initialized.")
         return _embedding_instances[hf_model_name]
-
-
-def _get_bedrock_embeddings(model_name: str):
-    """
-    Creates and returns a BedrockEmbeddings object using the specified model name.
-    Args:
-        model_name (str): The name of the model to use for embeddings.
-    Returns:
-        BedrockEmbeddings: An instance of the BedrockEmbeddings class.
-    """
-    try:
-        env_value = get_value_from_env("BEDROCK_EMBEDDING_MODEL_KEY")
-        if not env_value:
-            raise ValueError(
-                "Environment variable 'BEDROCK_EMBEDDING_MODEL' is not set.")
-        try:
-            aws_access_key, aws_secret_key, region_name = env_value.split(",")
-        except ValueError:
-            raise ValueError(
-                "Environment variable 'BEDROCK_EMBEDDING_MODEL_KEY' is improperly formatted. "
-                "Expected format: 'aws_access_key,aws_secret_key,region_name'."
-            )
-        bedrock_client = boto3.client(
-            service_name="bedrock-runtime",
-            region_name=region_name.strip(),
-            aws_access_key_id=aws_access_key.strip(),
-            aws_secret_access_key=aws_secret_key.strip(),
-        )
-        bedrock_embeddings = BedrockEmbeddings(
-            model_id=model_name.strip(),
-            client=bedrock_client
-        )
-        return bedrock_embeddings
-    except Exception as e:
-        logging.error(f"An unexpected error occurred: {e}")
-        raise
 
 
 def create_youtube_url(url):
@@ -182,7 +144,7 @@ def load_embedding_model(
     Load the appropriate embedding model and return its instance and dimension.
 
     Args:
-        embedding_provider (str): The provider name (e.g., "openai", "gemini", "titan", "sentence-transformer").
+        embedding_provider (str): The provider name (e.g., "openai", "gemini", "sentence-transformer").
         embedding_model_name (str): The specific model name.
 
     Returns:
@@ -222,8 +184,6 @@ def load_embedding_model(
         )
     elif provider == "gemini":
         embeddings = VertexAIEmbeddings(model=model)
-    elif provider == "titan":
-        embeddings = _get_bedrock_embeddings(model)
     elif provider == "sentence-transformer":
         model_path = str(LOCAL_MODEL_DIR)
         embeddings = _get_sentence_transformer_embedding(model, model_path)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -20,17 +21,23 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from notebooklm_graph_pipe.paths import RUNS_DIR
-from notebooklm_graph_pipe.runtime.dataset_registry import DatasetRegistryEntry, load_dataset_entry
+from notebooklm_graph_pipe.runtime.dataset_registry import DatasetRegistryEntry, RegistryNeo4j, RegistryNotebook, load_dataset_entry
 
 MODEL_NAME = "gpt-5.4"
 BENCHMARK_RUN_PREFIX = "ab_eval_"
 NOTEBOOK_ONLY = "notebook_only"
 HYBRID = "hybrid"
+BENCHMARK_MODE = "benchmark"
+GENERIC_MODE = "generic"
 MAX_RUN_ATTEMPTS = 2
 MAX_RESERVE_SWAPS = 2
+DEFAULT_PRIMARY_QUESTION_COUNT = 8
+DEFAULT_RESERVE_QUESTION_COUNT = 2
+DEFAULT_QUESTION_COUNT = DEFAULT_PRIMARY_QUESTION_COUNT + DEFAULT_RESERVE_QUESTION_COUNT
 ANSWER_TIMEOUT_SECONDS = 2400
 JUDGE_TIMEOUT_SECONDS = 900
 SMOKE_TIMEOUT_SECONDS = 180
+QUESTION_GENERATION_TIMEOUT_SECONDS = 900
 
 
 class BenchmarkError(RuntimeError):
@@ -98,6 +105,11 @@ class ComparisonScore:
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", value.lower()).strip("-")
+    return slug or "dataset"
 
 
 def dataset_specs() -> dict[str, DatasetSpec]:
@@ -181,17 +193,20 @@ def dataset_specs() -> dict[str, DatasetSpec]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run the benchmark A/B evaluation blog workflow.")
+    parser = argparse.ArgumentParser(description="Run an A/B evaluation comparing NotebookLM-only vs NotebookLM + Neo4j.")
     parser.add_argument(
         "--datasets",
         nargs="*",
         default=["bench-openalex-rag", "bench-imdb-scifi", "bench-opentargets-alzheimers"],
-        help="Dataset keys to benchmark in order.",
+        help="Benchmark dataset keys to evaluate in order.",
     )
+    parser.add_argument("--manifest-path", help="Path to a sync manifest.json for generic evaluation mode.")
+    parser.add_argument("--questions-file", help="Optional JSON file overriding the generic question set.")
+    parser.add_argument("--dataset-label", help="Optional generic dataset label override. Defaults to manifest project_slug.")
     parser.add_argument("--registry-path", help="Optional benchmark dataset registry path.")
     parser.add_argument("--model", default=MODEL_NAME, help="Codex model name.")
-    parser.add_argument("--runs-root", default=str(RUNS_DIR), help="Benchmark run root.")
-    parser.add_argument("--run-dir", help="Existing benchmark run dir to resume.")
+    parser.add_argument("--runs-root", default=str(RUNS_DIR), help="Evaluation run root.")
+    parser.add_argument("--run-dir", help="Existing evaluation run dir to resume.")
     parser.add_argument("--temp-root", default=str(Path(tempfile.gettempdir()) / "codex_ab_eval"), help="Temp Codex working root.")
     return parser
 
@@ -227,6 +242,14 @@ def preflight_notebooks(dataset_entries: list[DatasetRegistryEntry]) -> None:
     missing = [entry.notebook.id for entry in dataset_entries if entry.notebook.id not in ids]
     if missing:
         raise BenchmarkError(f"Notebook ids missing from NotebookLM: {', '.join(missing)}")
+
+
+def docker_available() -> bool:
+    try:
+        result = subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"], text=True, capture_output=True, check=False)
+    except FileNotFoundError:
+        return False
+    return result.returncode == 0
 
 
 def ensure_container_exists(container_name: str) -> None:
@@ -273,6 +296,10 @@ def stop_container(container_name: str) -> None:
         raise BenchmarkError(detail)
 
 
+def should_manage_container(entry: DatasetRegistryEntry, *, docker_is_available: bool) -> bool:
+    return docker_is_available and bool(entry.neo4j.container_name)
+
+
 def resolve_codex_launcher() -> list[str]:
     if os.name == "nt":
         return ["cmd", "/c", "codex"]
@@ -302,7 +329,7 @@ def parse_jsonl_events(raw_output: str) -> tuple[list[dict[str, Any]], list[str]
 
 def build_question_prompt(dataset: DatasetSpec, condition: str, question: QuestionSpec) -> str:
     lines = [
-        "You are running an isolated benchmark through codex exec.",
+        "You are running an isolated A/B evaluation through codex exec.",
         "Use only existing NotebookLM sources.",
         "Do not add sources.",
         "Do not do web research.",
@@ -345,9 +372,35 @@ def build_question_prompt(dataset: DatasetSpec, condition: str, question: Questi
     return "\n".join(lines) + "\n"
 
 
+def build_question_generation_prompt(dataset: DatasetSpec) -> str:
+    return "\n".join(
+        [
+            "You are designing an A/B evaluation question set for a corpus that already exists in NotebookLM and Neo4j.",
+            "Use only notebooklm-mcp and neo4j.",
+            "Do not add sources.",
+            "Do not do web research.",
+            "Do not use shell commands.",
+            "Do not read local files.",
+            f"Notebook title: {dataset.title}",
+            f"Notebook id: {dataset.notebook_id}",
+            f"Dataset label: {dataset.key}",
+            "Goal: produce a corpus-grounded question set that can reveal when graph-backed analysis adds material value beyond NotebookLM-only reading.",
+            "Favor questions that are answerable from the corpus and especially sensitive to multi-hop structure, bridge nodes, clusters, neighborhoods, connectivity vs attribute importance, coverage limits, and alias or taxonomy gaps.",
+            "Avoid questions that require external knowledge or unsupported facts.",
+            "Keep tool use efficient. Use at most 3 NotebookLM queries and 3 Neo4j queries.",
+            "Return JSON only with keys: background, rationale, questions.",
+            f"questions must contain exactly {DEFAULT_QUESTION_COUNT} items.",
+            f"The first {DEFAULT_PRIMARY_QUESTION_COUNT} questions must be primary with reserve=false.",
+            f"The last {DEFAULT_RESERVE_QUESTION_COUNT} questions must be reserve with reserve=true.",
+            "Each question item must contain keys: question_id, text, reserve.",
+            "question_id values can be placeholders and will be normalized downstream.",
+        ]
+    ) + "\n"
+
+
 def build_scoring_prompt(dataset: DatasetSpec, condition: str, question: QuestionSpec, answer_text: str) -> str:
     return (
-        "You are a strict benchmark judge.\n"
+        "You are a strict evaluation judge.\n"
         "Do not use any tools.\n"
         "Score the answer on a fixed 4-factor rubric from 1 to 5 each: correctness, completeness, evidence_quality, cross_document_synthesis.\n"
         "Compute total_score as the sum of those four integers.\n"
@@ -367,7 +420,7 @@ def build_comparison_prompt(dataset: DatasetSpec, question: QuestionSpec, notebo
     score_diff = abs(notebook_score.total_score - hybrid_score.total_score)
     forced_winner = "tie" if score_diff <= 1 else (HYBRID if hybrid_score.total_score > notebook_score.total_score else NOTEBOOK_ONLY)
     return (
-        "You are a strict comparative benchmark judge.\n"
+        "You are a strict comparative evaluation judge.\n"
         "Do not use any tools.\n"
         "Winner rule: if the totals differ by 1 or less, winner must be tie. Otherwise higher total wins.\n"
         "Return JSON only with keys: dataset, question_id, winner, material_value_of_graph, rationale.\n"
@@ -376,7 +429,7 @@ def build_comparison_prompt(dataset: DatasetSpec, question: QuestionSpec, notebo
         f"Question: {question.text}\n"
         f"Notebook-only total score: {notebook_score.total_score}\n"
         f"Hybrid total score: {hybrid_score.total_score}\n"
-        f"Forced winner by benchmark rule: {forced_winner}\n"
+        f"Forced winner by evaluation rule: {forced_winner}\n"
         "Notebook-only answer:\n-----\n"
         f"{notebook_answer.answer_text}\n"
         "-----\n"
@@ -497,6 +550,161 @@ def score_artifact_path(run_dir: Path, dataset_key: str, condition: str, questio
 
 def comparison_artifact_path(run_dir: Path, dataset_key: str, question_id: str) -> Path:
     return run_dir / dataset_key / "comparisons" / f"{question_id}.json"
+
+
+def question_plan_artifact_paths(run_dir: Path, dataset_key: str) -> tuple[Path, Path, Path, Path]:
+    base = run_dir / dataset_key / "question_plan"
+    return base / "prompt.txt", base / "generated.json", base / "generated.txt", base / "events.jsonl"
+
+
+def default_generic_background(dataset: DatasetSpec) -> str:
+    return f"A synced NotebookLM corpus named '{dataset.title}' with a matching Neo4j graph already available for retrieval and structural analysis."
+
+
+def default_generic_rationale(dataset: DatasetSpec) -> str:
+    return f"This corpus is being evaluated to determine whether graph-backed analysis adds material value beyond NotebookLM-only reading for '{dataset.title}'."
+
+
+def question_plan_to_payload(background: str, rationale: str, questions: list[QuestionSpec]) -> dict[str, Any]:
+    return {
+        "background": background,
+        "rationale": rationale,
+        "questions": [
+            {"question_id": question.question_id, "text": question.text, "reserve": question.reserve}
+            for question in questions
+        ],
+    }
+
+
+def normalize_questions(raw_questions: Any) -> list[QuestionSpec]:
+    if not isinstance(raw_questions, list):
+        raise BenchmarkError("Question plan must contain a 'questions' list.")
+    if len(raw_questions) != DEFAULT_QUESTION_COUNT:
+        raise BenchmarkError(f"Question plan must contain exactly {DEFAULT_QUESTION_COUNT} questions.")
+    reserve_presence = [isinstance(item, dict) and "reserve" in item for item in raw_questions]
+    explicit_reserve = all(reserve_presence)
+    if any(reserve_presence) and not explicit_reserve:
+        raise BenchmarkError("Question plan must either include 'reserve' for every question or omit it for every question.")
+    questions: list[QuestionSpec] = []
+    for index, item in enumerate(raw_questions, 1):
+        if not isinstance(item, dict):
+            raise BenchmarkError(f"Question plan item {index} must be an object.")
+        text = str(item.get("text") or "").strip()
+        if not text:
+            raise BenchmarkError(f"Question plan item {index} is missing text.")
+        reserve = bool(item.get("reserve")) if explicit_reserve else index > DEFAULT_PRIMARY_QUESTION_COUNT
+        questions.append(QuestionSpec(question_id=f"Q{index:02d}", text=text, reserve=reserve))
+    reserve_count = sum(int(question.reserve) for question in questions)
+    if reserve_count != DEFAULT_RESERVE_QUESTION_COUNT:
+        raise BenchmarkError(f"Question plan must contain exactly {DEFAULT_RESERVE_QUESTION_COUNT} reserve questions.")
+    primary_count = len(questions) - reserve_count
+    if primary_count != DEFAULT_PRIMARY_QUESTION_COUNT:
+        raise BenchmarkError(f"Question plan must contain exactly {DEFAULT_PRIMARY_QUESTION_COUNT} primary questions.")
+    for index, question in enumerate(questions, 1):
+        should_be_reserve = index > DEFAULT_PRIMARY_QUESTION_COUNT
+        if question.reserve != should_be_reserve:
+            raise BenchmarkError("Question plan must list primary questions first and reserve questions last.")
+    return questions
+
+
+def normalize_question_plan_payload(payload: Any, *, fallback_background: str, fallback_rationale: str) -> tuple[str, str, list[QuestionSpec]]:
+    if isinstance(payload, list):
+        raw_questions = payload
+        background = fallback_background
+        rationale = fallback_rationale
+    elif isinstance(payload, dict):
+        raw_questions = payload.get("questions")
+        background = str(payload.get("background") or fallback_background).strip()
+        rationale = str(payload.get("rationale") or fallback_rationale).strip()
+    else:
+        raise BenchmarkError("Question plan payload must be a JSON object or list.")
+    questions = normalize_questions(raw_questions)
+    return background, rationale, questions
+
+
+def load_question_plan_file(path: str | Path, dataset: DatasetSpec) -> tuple[str, str, list[QuestionSpec]]:
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
+    return normalize_question_plan_payload(
+        payload,
+        fallback_background=default_generic_background(dataset),
+        fallback_rationale=default_generic_rationale(dataset),
+    )
+
+
+def load_manifest_dataset(manifest_path: str | Path, dataset_label: str | None = None) -> tuple[DatasetSpec, DatasetRegistryEntry]:
+    path = Path(manifest_path).resolve()
+    if not path.exists():
+        raise BenchmarkError(f"Manifest not found: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    notebook = payload.get("notebook") or {}
+    neo4j = payload.get("neo4j") or {}
+    notebook_id = str(notebook.get("id") or "").strip()
+    notebook_title = str(notebook.get("title") or "").strip()
+    if not notebook_id or not notebook_title:
+        raise BenchmarkError("Manifest is missing notebook.id or notebook.title.")
+    uri = str(neo4j.get("uri") or "").strip()
+    username = str(neo4j.get("username") or neo4j.get("user") or "").strip()
+    password = str(neo4j.get("password") or "").strip()
+    database = str(neo4j.get("database") or "").strip()
+    if not uri or not username or not password or not database:
+        raise BenchmarkError("Manifest is missing required neo4j runtime fields.")
+    key = str(dataset_label or payload.get("project_slug") or slugify(notebook_title)).strip()
+    if not key:
+        raise BenchmarkError("Could not derive dataset label from manifest.")
+    base_dataset = DatasetSpec(key=key, title=notebook_title, notebook_id=notebook_id, background="", rationale="", questions=[])
+    dataset = DatasetSpec(
+        key=key,
+        title=notebook_title,
+        notebook_id=notebook_id,
+        background=default_generic_background(base_dataset),
+        rationale=default_generic_rationale(base_dataset),
+        questions=[],
+    )
+    entry = DatasetRegistryEntry(
+        key=key,
+        notebook=RegistryNotebook(id=notebook_id, title=notebook_title),
+        neo4j=RegistryNeo4j(
+            uri=uri,
+            username=username,
+            password=password,
+            database=database,
+            container_name=str(neo4j.get("container_name") or "").strip() or None,
+        ),
+    )
+    return dataset, entry
+
+
+def generate_question_plan(run_dir: Path, temp_root: Path, dataset: DatasetSpec, entry: DatasetRegistryEntry, model: str) -> tuple[str, str, list[QuestionSpec]]:
+    prompt_path, output_path, raw_output_path, events_path = question_plan_artifact_paths(run_dir, dataset.key)
+    if output_path.exists():
+        payload = json.loads(output_path.read_text(encoding="utf-8"))
+        return normalize_question_plan_payload(
+            payload,
+            fallback_background=default_generic_background(dataset),
+            fallback_rationale=default_generic_rationale(dataset),
+        )
+    prompt_text = build_question_generation_prompt(dataset)
+    write_text(prompt_path, prompt_text)
+    output_text, tools_used, _ = run_codex_exec(
+        prompt_text=prompt_text,
+        temp_root=temp_root / dataset.key / "question_generation",
+        answer_path=raw_output_path,
+        events_path=events_path,
+        model=model,
+        config_overrides=build_hybrid_overrides(entry),
+        dataset_entry=entry,
+        timeout_seconds=QUESTION_GENERATION_TIMEOUT_SECONDS,
+    )
+    if not validate_tools(HYBRID, tools_used):
+        raise BenchmarkError(f"Question generation did not use the expected notebook and neo4j tools for {dataset.key}.")
+    payload = extract_first_json_object(output_text)
+    background, rationale, questions = normalize_question_plan_payload(
+        payload,
+        fallback_background=default_generic_background(dataset),
+        fallback_rationale=default_generic_rationale(dataset),
+    )
+    write_json(output_path, question_plan_to_payload(background, rationale, questions))
+    return background, rationale, questions
 
 
 def load_existing_answer_artifact(run_dir: Path, dataset: DatasetSpec, question: QuestionSpec, condition: str) -> AnswerArtifact | None:
@@ -753,11 +961,19 @@ def dataset_level_summary(*, dataset: DatasetSpec, final_question_ids: list[str]
     }
 
 
-def render_technical_blog(run_dir: Path, dataset_summaries: list[dict[str, Any]], aggregate: dict[str, Any], datasets: list[DatasetSpec]) -> str:
-    lines = ["# NotebookLM + Neo4j vs NotebookLM Only Across 3 Benchmark Corpora", "", "## Why These Datasets"]
+def render_technical_blog(run_dir: Path, dataset_summaries: list[dict[str, Any]], aggregate: dict[str, Any], datasets: list[DatasetSpec], report_mode: str = BENCHMARK_MODE) -> str:
+    if report_mode == BENCHMARK_MODE:
+        lines = ["# NotebookLM + Neo4j vs NotebookLM Only Across 3 Benchmark Corpora", "", "## Why These Datasets"]
+        results_heading = "## Results by Dataset"
+        retention_line = "We then ran a comparative judge per question and kept a final scored set of 8 questions per dataset, allowing up to 2 reserve-question substitutions when the initial question under-tested graph value."
+    else:
+        corpus_title = datasets[0].title if datasets else "This Corpus"
+        lines = [f"# NotebookLM + Neo4j vs NotebookLM Only for {corpus_title}", "", "## Why This Corpus"]
+        results_heading = "## Results for This Corpus"
+        retention_line = "We then ran a comparative judge per question and kept a final scored set of 8 primary questions for this corpus, allowing up to 2 reserve-question substitutions when the initial questions under-tested graph value."
     for dataset in datasets:
         lines.extend([f"### {dataset.key}", dataset.background, "", dataset.rationale, ""])
-    lines.extend(["## Methodology", "We ran isolated `codex exec` A/B evaluations from `%TEMP%` with `--skip-git-repo-check --ephemeral --sandbox read-only`.", "Each question was answered twice: once with NotebookLM only, and once with a NotebookLM + Neo4j workflow that forced notebook-first exploration, graph expansion, and notebook re-validation.", "Each answer was scored independently on four 1-5 factors: correctness, completeness, evidence quality, and cross-document synthesis.", "We then ran a comparative judge per question and kept a final scored set of 8 questions per dataset, allowing up to 2 reserve-question substitutions when the initial question under-tested graph value.", "", "## Results by Dataset"])
+    lines.extend(["## Methodology", "We ran isolated `codex exec` A/B evaluations from `%TEMP%` with `--skip-git-repo-check --ephemeral --sandbox read-only`.", "Each question was answered twice: once with NotebookLM only, and once with a NotebookLM + Neo4j workflow that forced notebook-first exploration, graph expansion, and notebook re-validation.", "Each answer was scored independently on four 1-5 factors: correctness, completeness, evidence quality, and cross-document synthesis.", retention_line, "", results_heading])
     for summary in dataset_summaries:
         lines.extend([f"### {summary['dataset']}", f"- NotebookLM only mean: `{summary['notebook_only_mean_total']}` / 20 (`{summary['notebook_only_rating_10']}` / 10)", f"- NotebookLM + Neo4j mean: `{summary['hybrid_mean_total']}` / 20 (`{summary['hybrid_rating_10']}` / 10)", f"- Hybrid wins / losses / ties: `{summary['wins']} / {summary['losses']} / {summary['ties']}`", "", "| Question | NotebookLM only | Hybrid | Winner | Why |", "| --- | ---: | ---: | --- | --- |"])
         for row in summary["rows"]:
@@ -768,7 +984,7 @@ def render_technical_blog(run_dir: Path, dataset_summaries: list[dict[str, Any]]
 
 
 def render_appendix(*, run_dir: Path, datasets: list[DatasetSpec], question_orders: dict[str, list[str]], replacements: dict[str, list[dict[str, str]]], answer_artifacts: dict[str, dict[str, dict[str, AnswerArtifact]]], notebook_scores: dict[str, dict[str, AnswerScore]], hybrid_scores: dict[str, dict[str, AnswerScore]], comparisons: dict[str, dict[str, ComparisonScore]]) -> str:
-    lines = ["# Appendix: A/B Evaluation Artifacts", "", "## Command Shape", "All answer-generation runs used this shape from a temp working root, with prompts provided through stdin:", "", "```powershell", "codex exec -C <temp-root> --skip-git-repo-check --ephemeral --sandbox read-only --model gpt-5.4 --json -o <answer-file> -", "```", "", "Hybrid runs additionally overrode the Neo4j MCP env with `-c mcp_servers.neo4j.env.*=...` per dataset. Passwords are redacted here and were not written into this appendix.", "", "## Dataset Question Sets"]
+    lines = ["# Appendix: A/B Evaluation Artifacts", "", "## Command Shape", "All answer-generation runs used this shape from a temp working root, with prompts provided through stdin:", "", "```powershell", "codex exec -C <temp-root> --skip-git-repo-check --ephemeral --sandbox read-only --model gpt-5.4 --json -o <answer-file> -", "```", "", "Hybrid runs additionally overrode the Neo4j MCP env with `-c mcp_servers.neo4j.env.*=...` per corpus. Passwords are redacted here and were not written into this appendix.", "", "## Corpus Question Sets"]
     for dataset in datasets:
         lines.append(f"### {dataset.key}")
         for question in dataset.questions:
@@ -792,7 +1008,7 @@ def render_appendix(*, run_dir: Path, datasets: list[DatasetSpec], question_orde
     return "\n".join(lines)
 
 
-def aggregate_overall(dataset_summaries: list[dict[str, Any]]) -> dict[str, Any]:
+def aggregate_overall(dataset_summaries: list[dict[str, Any]], report_mode: str = BENCHMARK_MODE) -> dict[str, Any]:
     notebook_scores = [row["notebook_only_total"] for summary in dataset_summaries for row in summary["rows"]]
     hybrid_scores = [row["hybrid_total"] for summary in dataset_summaries for row in summary["rows"]]
     notebook_rating = round(sum(notebook_scores) / (2 * len(notebook_scores)), 3)
@@ -800,19 +1016,32 @@ def aggregate_overall(dataset_summaries: list[dict[str, Any]]) -> dict[str, Any]
     wins = sum(summary["wins"] for summary in dataset_summaries)
     losses = sum(summary["losses"] for summary in dataset_summaries)
     ties = sum(summary["ties"] for summary in dataset_summaries)
-    verdict = (
-        "Across these benchmark corpora, the NotebookLM + Neo4j workflow was materially better overall, especially on questions that required multi-hop connectivity, bridge-node discovery, or cross-record clustering."
-        if hybrid_rating > notebook_rating
-        else "Across these benchmark corpora, NotebookLM only scored better overall, which suggests the current graph workflow added more complexity than value for the final question set."
-        if hybrid_rating < notebook_rating
-        else "Across these benchmark corpora, the two workflows ended effectively tied overall, with graph value appearing only for a subset of strongly relational questions."
-    )
+    if report_mode == BENCHMARK_MODE:
+        verdict = (
+            "Across these benchmark corpora, the NotebookLM + Neo4j workflow was materially better overall, especially on questions that required multi-hop connectivity, bridge-node discovery, or cross-record clustering."
+            if hybrid_rating > notebook_rating
+            else "Across these benchmark corpora, NotebookLM only scored better overall, which suggests the current graph workflow added more complexity than value for the final question set."
+            if hybrid_rating < notebook_rating
+            else "Across these benchmark corpora, the two workflows ended effectively tied overall, with graph value appearing only for a subset of strongly relational questions."
+        )
+    else:
+        verdict = (
+            "Across this corpus, the NotebookLM + Neo4j workflow was materially better overall, especially on questions that required multi-hop connectivity, bridge-node discovery, or structural clustering."
+            if hybrid_rating > notebook_rating
+            else "Across this corpus, NotebookLM only scored better overall, which suggests the graph-backed workflow added more complexity than value for the final question set."
+            if hybrid_rating < notebook_rating
+            else "Across this corpus, the two workflows ended effectively tied overall, with graph value appearing only for a subset of strongly relational questions."
+        )
     return {"notebook_only_rating_10": notebook_rating, "hybrid_rating_10": hybrid_rating, "wins": wins, "losses": losses, "ties": ties, "verdict": verdict}
 
 
-def benchmark_dataset(*, run_dir: Path, temp_root: Path, dataset: DatasetSpec, entry: DatasetRegistryEntry, model: str) -> tuple[dict[str, Any], list[str], dict[str, dict[str, AnswerArtifact]], dict[str, AnswerScore], dict[str, AnswerScore], dict[str, ComparisonScore], list[dict[str, str]]]:
-    log(f"Starting dataset benchmark: {dataset.key}")
-    start_container(entry.neo4j.container_name or "")
+def benchmark_dataset(*, run_dir: Path, temp_root: Path, dataset: DatasetSpec, entry: DatasetRegistryEntry, model: str, manage_container: bool = True) -> tuple[dict[str, Any], list[str], dict[str, dict[str, AnswerArtifact]], dict[str, AnswerScore], dict[str, AnswerScore], dict[str, ComparisonScore], list[dict[str, str]]]:
+    log(f"Starting dataset evaluation: {dataset.key}")
+    if manage_container and entry.neo4j.container_name:
+        log(f"Using Docker-managed Neo4j container for {dataset.key}: {entry.neo4j.container_name}")
+        start_container(entry.neo4j.container_name)
+    else:
+        log(f"Using direct Neo4j connection without Docker for {dataset.key}: {entry.neo4j.uri}")
     try:
         smoke_notebook = run_answer_generation(
             run_dir=run_dir,
@@ -875,33 +1104,74 @@ def benchmark_dataset(*, run_dir: Path, temp_root: Path, dataset: DatasetSpec, e
         return summary, final_question_ids, answer_artifacts, notebook_scores, hybrid_scores, comparisons, swap_records
     finally:
         try:
-            stop_container(entry.neo4j.container_name or "")
-            log(f"Stopped dataset container: {dataset.key}")
+            if manage_container and entry.neo4j.container_name:
+                stop_container(entry.neo4j.container_name)
+                log(f"Stopped dataset container: {dataset.key}")
         except BenchmarkError as exc:
-            log(f"Warning: failed to stop dataset container {dataset.key}: {exc}")
+            if manage_container:
+                log(f"Warning: failed to stop dataset container {dataset.key}: {exc}")
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    spec_map = dataset_specs()
+    report_mode = GENERIC_MODE if args.manifest_path else BENCHMARK_MODE
     datasets: list[DatasetSpec] = []
     entries: list[DatasetRegistryEntry] = []
-    for dataset_key in args.datasets:
-        if dataset_key not in spec_map:
-            raise BenchmarkError(f"Unknown dataset key: {dataset_key}")
-        datasets.append(spec_map[dataset_key])
-        entries.append(load_dataset_entry(dataset_key, args.registry_path))
-
-    preflight_notebooks(entries)
-    for entry in entries:
-        ensure_container_exists(entry.neo4j.container_name or "")
+    manage_containers: list[bool] = []
 
     benchmark_root = Path(args.run_dir).resolve() if args.run_dir else run_root(Path(args.runs_root).resolve())
     temp_root = Path(args.temp_root).resolve()
     temp_root.mkdir(parents=True, exist_ok=True)
-    if not args.run_dir:
-        write_json(benchmark_root / "preflight.json", {"datasets": [entry.key for entry in entries]})
-    log(f"Writing benchmark artifacts to {benchmark_root}")
+
+    if report_mode == GENERIC_MODE:
+        dataset, entry = load_manifest_dataset(args.manifest_path, dataset_label=args.dataset_label)
+        preflight_notebooks([entry])
+        if args.questions_file:
+            background, rationale, questions = load_question_plan_file(args.questions_file, dataset)
+        else:
+            background, rationale, questions = generate_question_plan(benchmark_root, temp_root, dataset, entry, args.model)
+        datasets = [
+            DatasetSpec(
+                key=dataset.key,
+                title=dataset.title,
+                notebook_id=dataset.notebook_id,
+                background=background,
+                rationale=rationale,
+                questions=questions,
+            )
+        ]
+        entries = [entry]
+        manage_containers = [False]
+        if not args.run_dir:
+            write_json(
+                benchmark_root / "preflight.json",
+                {
+                    "mode": GENERIC_MODE,
+                    "datasets": [dataset.key],
+                    "manifest_path": str(Path(args.manifest_path).resolve()),
+                },
+            )
+    else:
+        spec_map = dataset_specs()
+        docker_is_available = docker_available()
+        for dataset_key in args.datasets:
+            if dataset_key not in spec_map:
+                raise BenchmarkError(f"Unknown dataset key: {dataset_key}")
+            datasets.append(spec_map[dataset_key])
+            entry = load_dataset_entry(dataset_key, args.registry_path)
+            entries.append(entry)
+            manage_containers.append(should_manage_container(entry, docker_is_available=docker_is_available))
+        preflight_notebooks(entries)
+        if docker_is_available:
+            for entry, manage_container in zip(entries, manage_containers):
+                if manage_container:
+                    ensure_container_exists(entry.neo4j.container_name or "")
+        else:
+            log("Docker unavailable; benchmark evaluation will use direct Neo4j connections.")
+        if not args.run_dir:
+            write_json(benchmark_root / "preflight.json", {"mode": BENCHMARK_MODE, "datasets": [entry.key for entry in entries]})
+
+    log(f"Writing evaluation artifacts to {benchmark_root}")
 
     dataset_summaries: list[dict[str, Any]] = []
     question_orders: dict[str, list[str]] = {}
@@ -911,8 +1181,15 @@ def main() -> int:
     all_hybrid_scores: dict[str, dict[str, AnswerScore]] = {}
     all_comparisons: dict[str, dict[str, ComparisonScore]] = {}
 
-    for dataset, entry in zip(datasets, entries):
-        summary, final_questions, answer_artifacts, notebook_scores, hybrid_scores, comparisons, swap_records = benchmark_dataset(run_dir=benchmark_root, temp_root=temp_root, dataset=dataset, entry=entry, model=args.model)
+    for dataset, entry, manage_container in zip(datasets, entries, manage_containers):
+        summary, final_questions, answer_artifacts, notebook_scores, hybrid_scores, comparisons, swap_records = benchmark_dataset(
+            run_dir=benchmark_root,
+            temp_root=temp_root,
+            dataset=dataset,
+            entry=entry,
+            model=args.model,
+            manage_container=manage_container,
+        )
         dataset_summaries.append(summary)
         question_orders[dataset.key] = final_questions
         replacements[dataset.key] = swap_records
@@ -921,11 +1198,11 @@ def main() -> int:
         all_hybrid_scores[dataset.key] = hybrid_scores
         all_comparisons[dataset.key] = comparisons
 
-    aggregate = aggregate_overall(dataset_summaries)
+    aggregate = aggregate_overall(dataset_summaries, report_mode=report_mode)
     write_json(benchmark_root / "aggregate_summary.json", {"datasets": dataset_summaries, "overall": aggregate})
-    write_text(benchmark_root / "technical_blog.md", render_technical_blog(benchmark_root, dataset_summaries, aggregate, datasets))
+    write_text(benchmark_root / "technical_blog.md", render_technical_blog(benchmark_root, dataset_summaries, aggregate, datasets, report_mode=report_mode))
     write_text(benchmark_root / "appendix.md", render_appendix(run_dir=benchmark_root, datasets=datasets, question_orders=question_orders, replacements=replacements, answer_artifacts=all_answer_artifacts, notebook_scores=all_notebook_scores, hybrid_scores=all_hybrid_scores, comparisons=all_comparisons))
-    log(f"Benchmark completed successfully: {benchmark_root}")
+    log(f"Evaluation completed successfully: {benchmark_root}")
     return 0
 
 

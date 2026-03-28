@@ -651,11 +651,11 @@ def resolve_runtime_for_update(
     project_slug: str,
     project_title_hash: str,
 ) -> Neo4jRuntime:
-    if manifest_state.neo4j is not None:
-        return provisioner.ensure_runtime(project_slug, project_title_hash, manifest_state.neo4j)
     explicit_runtime = explicit_runtime_from_args(args)
     if explicit_runtime is not None:
         return explicit_runtime
+    if manifest_state.neo4j is not None:
+        return provisioner.ensure_runtime(project_slug, project_title_hash, manifest_state.neo4j)
     raise SyncError(
         "Legacy manifests without Neo4j runtime metadata require explicit --neo4j-uri/--neo4j-user/--neo4j-password/--neo4j-database."
     )
@@ -672,8 +672,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     def add_common(subparser: argparse.ArgumentParser, *, require_title: bool) -> None:
         subparser.add_argument("--dataset-dir", required=True, help="Directory containing the source dataset")
-        subparser.add_argument("--dataset-key", help="Dataset key from config/benchmark_dataset_registry.json")
-        subparser.add_argument("--registry-path", help="Path to benchmark dataset registry JSON")
+        subparser.add_argument("--dataset-key", help="Optional dataset key from a local registry JSON")
+        subparser.add_argument("--registry-path", help="Path to an optional local dataset registry JSON")
         subparser.add_argument("--notebook-title", required=False, help="NotebookLM notebook title")
         subparser.add_argument("--notebook-id", help="NotebookLM notebook id override")
         subparser.add_argument("--export-dir", help="Export directory for manifest and staged sources")
