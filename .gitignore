@@ -3,5 +3,6 @@ __pycache__/
 .pytest_cache/
 tests/_tmp/
 runs/
+benchmark-datasets/
 config/benchmark_dataset_registry.json
 models/local_model/

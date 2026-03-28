@@ -1,260 +1,229 @@
 # notebooklm-graph-pipe
 
-This repository keeps local orchestration, workflow scripts, and backend overlay patches separate from the upstream `llm-graph-builder` project.
+`notebooklm-graph-pipe` extends upstream [`llm-graph-builder`](https://github.com/neo4j-labs/llm-graph-builder) with agent skills and workflows that combine NotebookLM and Neo4j across Codex, Claude, and OpenCode. It provides an end-to-end pipeline for turning a NotebookLM-backed corpus into a Neo4j graph, a self-improving graph consolidation workflow, and A/B evaluation of notebook-only retrieval vs hybrid vector RAG + GraphRAG.
 
-The intent is to keep `vendor/llm-graph-builder/` pinned as a Git submodule while carrying repo-specific graph build, NotebookLM sync, consolidation, and agent-skill assets here.
+## Pipeline Overview
 
-## Prerequisites
+```mermaid
+flowchart LR
+    A["Local Corpus"] -- "sync_notebook_graph.py" --> B["NotebookLM"]
+    B -- "export" --> C["Staged .txt Files"]
+    C -- "build_graph.py" --> D["Neo4j Graph"]
+    D -- "postprocess_graph.py" --> E["Post-processed Graph"]
+    E -- "run_ab_evaluation.py" --> F["A/B Evaluation Report"]
+    E -- "consolidate_self_improving.py" --> G["Consolidated Graph"]
+```
 
-- Python `3.12` or newer
-- `pip`
-- Docker Desktop or a compatible Docker engine
-- Access to a Neo4j instance
-- An authenticated Google account for NotebookLM
-- NotebookLM CLI `nlm` on `PATH` if you use `scripts/sync_notebook_graph.py` or `scripts/run_ab_evaluation.py`
-- MCP servers for `notebooklm-mcp` and `neo4j` if you want to use the bundled deep-research agent or skill packages
-- For the default consolidation flow with no routing config:
-  - `codex` on `PATH`
-  - `GOOGLE_API_KEY` for the default `genai` prompt, judge, and embedding roles
-- Optional: if you provide `--llm-routing-config`, agent-driven review flows can use one of:
-  - `codex`
-  - `claude` (Claude Code)
-  - `opencode`
-- OpenRouter-backed agent use is technically supported through routing configs, but it is not the recommended path for review or taxonomy-tail automation because many open-source or open-weight models do not reliably return the strict JSON payloads required by the orchestrator.
+## Setup
 
-## Python Setup
+- Python `3.12+`
+- Google account signed into NotebookLM
+- [`notebooklm-mcp`](https://github.com/jacob-bd/notebooklm-mcp-cli) and [`neo4j`](https://github.com/neo4j-contrib/mcp-neo4j) MCP servers configured for the bundled NotebookLM and graph workflows
+- Docker if you want `scripts/sync_notebook_graph.py` to provision or resume a managed Neo4j container automatically, or your own Neo4j instance if you want to pass explicit `--neo4j-*` connection details
+- One of the supported agents on `PATH`: `codex`, `claude`, or `opencode`
 
-Create and activate a virtual environment:
+### 1. Install dependencies
 
-```powershell
+```bash
+git clone --recurse-submodules <repo-url>
+cd llm-graph-builder-scripts
 python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
-
-Install Python dependencies:
-
-```powershell
+source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt -c vendor\llm-graph-builder\backend\constraints.txt
+python -m pip install -r requirements.txt -c vendor/llm-graph-builder/backend/constraints.txt
 ```
 
-The top-level `requirements.txt` keeps this repo aligned with the vendored backend and adds the extra packages imported directly by this repo's local scripts and tests.
+### 2. Authenticate NotebookLM
 
-## Non-Python Dependencies
+```bash
+nlm login
+```
 
-- Docker is required when `scripts/sync_notebook_graph.py` provisions or resumes a managed Neo4j container.
-- Docker is also used by `scripts/run_ab_evaluation.py` when it checks or starts benchmark Neo4j containers.
-- If you pass an explicit Neo4j runtime with `--neo4j-uri`, `--neo4j-user`, `--neo4j-password`, and `--neo4j-database`, the sync workflow can run without Docker.
-- NotebookLM workflows require the `nlm` CLI to be installed and authenticated.
+### 3. Environment Variables
 
-## NotebookLM Account Requirements
+Set provider keys only for the flows that use them:
 
-- You must be signed into NotebookLM with a Google account before using the NotebookLM CLI or the bundled NotebookLM-driven workflows.
-- Per Google's current NotebookLM help pages, the standard NotebookLM tier allows up to `100` notebooks and up to `50` sources per notebook.
-- If the `50`-source cap becomes a bottleneck, upgrade to a paid Google AI plan that includes higher NotebookLM limits, typically `Google AI Pro` or `Google AI Ultra`.
-- Google documents the higher-tier NotebookLM upgrade path and limits here:
-  - [Upgrade NotebookLM](https://support.google.com/notebooklm/answer/16213268?hl=en)
-  - [Google AI plans](https://one.google.com/intl/en/about/google-ai-plans)
+```bash
+# Optional - required for the default Google-backed postprocess/consolidation path,
+# or whenever your routing config selects Google providers
+export GOOGLE_API_KEY="your-key-here"
 
-## MCP Tooling
+# Optional - only if your routing config selects these providers
+export OPENAI_API_KEY="..."
+export OPENROUTER_API_KEY="..."
+```
 
-The included deep-research skill and agent definitions assume these MCP servers are available:
+### 4. Optional: use your own Neo4j instance
 
-- `notebooklm-mcp`
-  - Used for notebook querying and NotebookLM source access
-  - The Codex skill explicitly relies on `mcp__notebooklm-mcp__notebook_query`
-- `neo4j`
-  - Used for schema reads and Cypher exploration
-  - The Codex skill explicitly relies on `mcp__neo4j__get-schema` and `mcp__neo4j__read-cypher`
+You do not need to provide Neo4j connection details to `scripts/sync_notebook_graph.py` by default. If you omit `--neo4j-uri`, `--neo4j-user`, `--neo4j-password`, and `--neo4j-database`, the sync workflow provisions or resumes a Docker-managed Neo4j runtime for you automatically.
 
-Without those MCP servers, the bundled `.claude`, `.opencode`, and `.codex` deep-research packages are not usable as intended.
+Only pass explicit Neo4j flags when you want the scripts to target a Neo4j instance that you manage yourself:
 
-## Repository Structure
+```bash
+python scripts/sync_notebook_graph.py create \
+  --dataset-dir path/to/corpus \
+  --notebook-title my-corpus \
+  --neo4j-uri bolt://127.0.0.1:7687 \
+  --neo4j-user neo4j \
+  --neo4j-password your-password \
+  --neo4j-database neo4j
+```
 
-- `vendor/llm-graph-builder/`
-  - Upstream Git submodule checkout of `neo4j-labs/llm-graph-builder`
-  - Currently pinned to commit `61121df4c15716f67636a4fac2c96e909d374ada`
-- `src/`
-  - Overlay package for backend modules that differ from upstream
-- `scripts/build_graph.py`
-  - Local register/extract/post-process entrypoint
-- `notebooklm_graph_pipe/runtime/graph_builder_runtime.py`
-  - Local runtime wrapper exposing the orchestration surface used by repo workflows
-- `scripts/`
-  - Workflow entrypoints for NotebookLM sync, post-processing, A/B evaluation, and consolidation
-- `tests/`
-  - Regression coverage for orchestration and overlay behavior
-- `.claude/`
-  - Claude agent definitions bundled with this repo
-- `.opencode/`
-  - OpenCode agent definitions bundled with this repo
-- `.codex/`
-  - Codex skill definitions bundled with this repo
+*Note: NotebookLM standard tier allows up to `100` notebooks and `50` sources per notebook. If source-count limits become a bottleneck, upgrade through [NotebookLM](https://support.google.com/notebooklm/answer/16213268?hl=en) or the [Google AI plans](https://one.google.com/intl/en/about/google-ai-plans).*
 
-## Included Skills And Agents
+*Docker notes:*
+- `scripts/sync_notebook_graph.py` can run without Docker when you provide explicit Neo4j credentials for your own instance
+- `scripts/run_ab_evaluation.py --manifest-path ...` does not require Docker
+- `scripts/run_ab_evaluation.py --datasets ...` auto-manages configured containers only when Docker is available
 
-This repository ships the same `notebooklm-neo4j-deep-research` workflow packaged for multiple coding-agent runtimes:
+## Getting Started
 
+### 5-minute path
+
+Assuming you have completed the [Setup](#setup), the shortest path is to let `scripts/sync_notebook_graph.py` manage the Neo4j container automatically:
+
+```bash
+python scripts/sync_notebook_graph.py create \
+  --dataset-dir path/to/your/corpus \
+  --notebook-title my-corpus
+
+python scripts/run_ab_evaluation.py \
+  --manifest-path data/notebooklm_exports/my-corpus/manifest.json
+```
+
+This writes `data/notebooklm_exports/my-corpus/manifest.json`, stages NotebookLM exports under `sources/`, builds the graph, and runs the 4-factor A/B evaluation.
+
+### What gets built
+
+`scripts/build_graph.py` consumes staged NotebookLM-exported `.txt` files. When you run `scripts/sync_notebook_graph.py`, it executes the bridge from a local corpus to that staged format in this order:
+
+- it walks the files under `--dataset-dir`
+- it uploads those files into NotebookLM
+- it exports NotebookLM source content into `data/notebooklm_exports/<project_slug>/sources/*.txt`
+- it writes `manifest.json` with the notebook id and Neo4j runtime
+- if you do not pass explicit `--neo4j-*` flags, it provisions or resumes a Docker-managed Neo4j runtime
+- unless you pass `--skip-build`, it runs graph extraction from the staged `sources/` directory
+- unless you pass `--skip-postprocess`, it runs the post-processing tail after graph extraction
+
+Use local files that NotebookLM can ingest. The graph build itself always runs from the staged `.txt` exports.
+
+### 1. Create or sync a notebook and build the graph
+
+```bash
+python scripts/sync_notebook_graph.py create \
+  --dataset-dir path/to/corpus \
+  --notebook-title my-corpus
+```
+
+Add `--skip-build` to stop after NotebookLM sync and manifest creation. Add `--skip-postprocess` to skip the post-processing tail after graph extraction. Add explicit `--neo4j-*` flags only if you want to use your own Neo4j instance instead of the managed Docker runtime.
+
+### 2. Update an existing notebook and rebuild
+
+```bash
+python scripts/sync_notebook_graph.py update \
+  --dataset-dir path/to/corpus \
+  --notebook-id 12345678-1234-1234-1234-123456789abc
+```
+
+Explicit Neo4j flags on `update` override any managed Neo4j runtime recorded in the manifest.
+
+### 3. Rebuild from staged NotebookLM exports
+
+```bash
+python scripts/build_graph.py \
+  --sources-dir ./data/notebooklm_exports/my-corpus/sources \
+  --neo4j-uri bolt://127.0.0.1:7687 \
+  --neo4j-user neo4j \
+  --neo4j-password your-password \
+  --neo4j-database neo4j
+
+python scripts/postprocess_graph.py \
+  --neo4j-uri bolt://127.0.0.1:7687 \
+  --neo4j-user neo4j \
+  --neo4j-password your-password \
+  --neo4j-database neo4j
+```
+
+These direct graph and postprocess entrypoints target a Neo4j instance explicitly, so pass `--neo4j-*` for the server you want to use.
+
+### 4. Run A/B evaluation
+
+```bash
+python scripts/run_ab_evaluation.py \
+  --manifest-path ./data/notebooklm_exports/my-corpus/manifest.json
+```
+
+Manifest-driven evaluation loads the notebook and Neo4j runtime from the manifest, generates `8` primary questions plus `2` reserves, runs `notebook_only` and `hybrid`, and scores them on correctness, completeness, evidence quality, and cross-document synthesis.
+
+If you want to supply your own questions:
+
+```bash
+python scripts/run_ab_evaluation.py \
+  --manifest-path ./data/notebooklm_exports/my-corpus/manifest.json \
+  --questions-file path/to/questions.json \
+  --dataset-label my-corpus
+```
+
+### 5. Run self-improving consolidation
+
+```bash
+python scripts/consolidation/consolidate_self_improving.py
+```
+
+Tier 1 handles lexical merges first. Tier 2 and Tier 3 then run in a self-improving loop until the consolidation gate passes or the iteration budget is exhausted.
+
+## Providers, Agents, And Skills
+
+The default local graph-build embedding is `sentence-transformer` with `all-MiniLM-L6-v2`. Routing config can switch embedding, prompt, and judge roles across these providers:
+
+| Provider or runtime | Env variables | When required | Python dependency |
+|---------------------|---------------|---------------|-------------------|
+| `genai` / `gemini` | `GOOGLE_API_KEY` | Whenever `scripts/postprocess_graph.py` or the default consolidation flow uses Google-backed prompt / judge / embedding roles, or whenever `--llm-routing-config` selects Google-backed roles | `google-genai`, `langchain-google-vertexai` |
+| `openai` | `OPENAI_API_KEY` | Whenever the routing config selects OpenAI for embeddings or single-prompt roles | `openai`, `langchain-openai` |
+| `openrouter` | `OPENROUTER_API_KEY` | Whenever the routing config selects OpenRouter for embeddings or single-prompt roles | `openai`, `langchain-openai` |
+| `sentence-transformer` | None | Default local graph-build embeddings, or whenever local embeddings are selected explicitly | `sentence-transformers`, `langchain-huggingface` |
+
+Without `--llm-routing-config`, `scripts/postprocess_graph.py` and the default consolidation flow use Google-backed prompt, judge, and embedding roles, so those paths require `GOOGLE_API_KEY`. The main sync, graph-build, and A/B evaluation flow does not require it by default.
+
+Supported agent runtimes for review or taxonomy-tail steps are `codex`, `claude`, and `opencode`. Without a routing config, consolidation defaults to `codex`.
+
+The bundled `notebooklm-neo4j-deep-research` workflow is packaged for `.claude`, `.opencode`, and `.codex`. It alternates between NotebookLM answers and Neo4j neighborhood expansion, keeps only the strongest branches, and stops when additional loops stop adding signal.
+
+## MCP Tooling & Agent Skills
+
+- [`notebooklm-mcp`](https://github.com/jacob-bd/notebooklm-mcp-cli): notebook querying and NotebookLM source access
+- [`neo4j`](https://github.com/neo4j-contrib/mcp-neo4j): schema reads and Cypher exploration
+
+The bundled deep-research agent packages depend on both MCP servers:
+
+- `.codex/skills/notebooklm-neo4j-deep-research/`
 - `.claude/agents/notebooklm-neo4j-deep-research.md`
-  - Claude agent definition
 - `.opencode/agents/notebooklm-neo4j-deep-research.md`
-  - OpenCode subagent definition
-- `.codex/skills/notebooklm-neo4j-deep-research/SKILL.md`
-  - Codex skill definition
 
-The shared purpose of this workflow is to alternate between NotebookLM notebook queries and Neo4j neighborhood exploration when researching a topic against the same corpus.
+What the provided skill does:
 
-## Model And Client Requirements
+- treats NotebookLM as the high-context reader and Neo4j as the topology explorer
+- starts from a notebook answer, extracts concrete entities, concepts, aliases, and open questions
+- expands the strongest seeds through graph neighborhoods, then turns the best graph findings into tighter NotebookLM follow-ups
+- scores candidate branches for relevance, novelty, graph support, and explainability, and stops when the loop stops adding signal
 
-### Optional agent clients
+Example use:
 
-The routing layer supports these agent clients for review or taxonomy-tail steps when you provide `--llm-routing-config`:
-
-- `codex`
-- `claude`
-- `opencode`
-
-Without a routing config, the consolidation entrypoints default to `codex`.
-
-`opencode` can be pointed at OpenRouter-hosted models, so this is technically supported. In practice, it is not the recommended review-agent path because the review and taxonomy-tail steps require strict machine-readable JSON, and many open-source or open-weight models return narrative prose instead of the required object.
-
-### Embedding options
-
-Graph build and post-processing use one embedding provider and model combination.
-
-- Default local graph-build embedding:
-  - client or provider: `sentence-transformer`
-  - model: `all-MiniLM-L6-v2`
-- Routing-config embedding clients supported by `notebooklm_graph_pipe/runtime/llm_routing.py`:
-  - `genai`
-  - `openai`
-  - `openrouter`
-- Backend embedding provider aliases accepted by the runtime:
-  - `genai` maps to Gemini embeddings
-  - `gemini`
-  - `openai`
-  - `openrouter`
-  - `sentence-transformer`
-  - `titan` for AWS Bedrock embeddings
-
-Relevant API keys or credentials depend on the selected embedding provider:
-
-- `GOOGLE_API_KEY` for `genai`
-- `OPENAI_API_KEY` for `openai`
-- `OPENROUTER_API_KEY` for `openrouter`
-- AWS Bedrock credentials for `titan`
-
-### LLM prediction and judge clients
-
-The consolidation and post-processing routing layer supports these single-prompt clients for tier-2 classification, taxonomy cleanup, and tier-3 judge calls:
-
-- `genai`
-- `openai`
-- `openrouter`
-
-Without a routing config, these roles default to `genai`, so the zero-config path requires `GOOGLE_API_KEY`.
-
-If you use a routing config, these prompt-client choices apply to roles such as:
-
-- `single_prompt.tier2_primary`
-- `single_prompt.tier2_secondary`
-- `single_prompt.taxonomy_primary`
-- `single_prompt.taxonomy_secondary`
-- `single_prompt.tier3_judge_primary`
-- `single_prompt.tier3_judge_secondary`
-- `embeddings.tier3`
-- `embeddings.graph_build`
-
-## Overlay Contract
-
-`src/` overlays `vendor/llm-graph-builder/backend/src`.
-
-These modules are intentionally overridden here:
-
-- `src/main.py`
-- `src/llm.py`
-- `src/adaptive_retry.py`
-- `src/shared/common_fn.py`
-
-Everything else resolves from the upstream submodule.
-
-Do not patch files under `vendor/llm-graph-builder/` for local behavior changes. Put those changes in the overlay package instead.
-
-## Main Entry Points
-
-- `python scripts/build_graph.py --help`
-- `python scripts/sync_notebook_graph.py --help`
-- `python scripts/postprocess_graph.py --help`
-- `python scripts/run_ab_evaluation.py --help`
-- `powershell -ExecutionPolicy Bypass -File scripts/run_consolidation.ps1`
-
-## Benchmark Datasets
-
-Benchmark dataset connection details live in `config/benchmark_dataset_registry.json`.
-
-This file is local runtime state, not a sanitized sample manifest. In the current implementation it may contain:
-
-- NotebookLM notebook IDs
-- Docker container IDs and mapped ports
-- Local Neo4j connection URIs
-- Plaintext Neo4j passwords for benchmark containers
-
-Treat it as sensitive local configuration and avoid sharing it unchanged.
-
-The current registered dataset keys are:
-
-- `bench-openalex-rag`
-- `bench-imdb-scifi`
-- `bench-opentargets-alzheimers`
-
-The main entrypoints accept `--dataset-key` and resolve stored Neo4j runtime details from that registry. `scripts/sync_notebook_graph.py` also uses the registry to resolve the NotebookLM notebook id or title and the default export directory.
-
-Examples:
-
-```powershell
-python scripts/build_graph.py --dataset-key bench-openalex-rag
-
-python scripts\sync_notebook_graph.py update `
-  --dataset-dir C:\Users\Roman\repos\misc_notebooks\benchmark-datasets\openalex-rag\sources `
-  --dataset-key bench-openalex-rag
-
-python scripts\postprocess_graph.py --dataset-key bench-imdb-scifi
+```text
+Use the bundled notebooklm-neo4j-deep-research skill against the notebook "my-corpus"
+and the connected Neo4j graph. Research this question: "Which methods connect graph-based
+retrieval with hallucination control in this corpus?" Use a 3-iteration loop budget and
+return the full skill output.
 ```
 
-## Runtime Notes
+In practice, that workflow queries NotebookLM for an initial answer, extracts high-signal seeds, probes Neo4j for neighborhoods and bridge concepts, asks targeted NotebookLM follow-ups, and returns a structured report with the final answer, iteration log, accepted/rejected branches, stop reason, and self-critique.
 
-- Local entrypoints import the vendored backend through the `src` overlay package.
-- `scripts/run_consolidation.ps1 -InstallDeps` installs backend-aligned dependencies if the required Python modules are missing.
-- Without a routing config, consolidation defaults to `codex` plus `genai` roles and therefore requires `GOOGLE_API_KEY`.
-- With a routing config, consolidation may instead require `OPENAI_API_KEY` or `OPENROUTER_API_KEY`, and can switch review agents away from `codex`.
-- Neo4j connection details can come from explicit CLI flags, the dataset registry, or a local `.codex/config.toml` if you create one for your Codex MCP setup.
+## Repo Layout And Overlay
 
-## Testing
+- `vendor/llm-graph-builder/`: upstream `neo4j-labs/llm-graph-builder` submodule
+- `src/`: local backend overlay modules that override selected upstream behavior
+- `scripts/`: sync, graph build, post-processing, evaluation, and consolidation entrypoints
+- `tests/`: regression coverage for orchestration and overlay behavior
+- `.claude/`, `.opencode/`, `.codex/`: bundled agent and skill definitions
 
-Run the test suite:
-
-```powershell
-pytest -q
-```
-
-Useful smoke checks:
-
-```powershell
-python -m py_compile scripts/build_graph.py notebooklm_graph_pipe\runtime\graph_builder_runtime.py `
-  notebooklm_graph_pipe\runtime\dataset_registry.py notebooklm_graph_pipe\runtime\llm_routing.py `
-  notebooklm_graph_pipe\consolidation\self_improving.py `
-  src\__init__.py src\main.py src\llm.py src\adaptive_retry.py `
-  src\shared\__init__.py src\shared\common_fn.py `
-  scripts\sync_notebook_graph.py scripts\postprocess_graph.py scripts\run_ab_evaluation.py
-
-python scripts/build_graph.py --help
-python scripts\sync_notebook_graph.py --help
-python scripts\postprocess_graph.py --help
-python scripts\run_ab_evaluation.py --help
-```
-
-## Notes
-
-- This repo owns orchestration code, agent packaging, and backend deltas.
-- The upstream submodule remains the baseline implementation.
-- Generated artifacts such as `__pycache__`, `.pytest_cache`, `tests/_tmp`, and `runs/` are ignored.
+`src/` overlays `vendor/llm-graph-builder/backend/src`. Put local backend behavior changes in the overlay package, not in the vendored submodule.

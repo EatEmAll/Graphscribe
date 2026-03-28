@@ -400,7 +400,7 @@ def main():
     for rec in report["recommendations"]:
         print(f"  â€¢ {rec}")
 
-    print(f"\nReport saved to: {CONSOLIDATION_REPORT_DIR}\\consolidation_quality_report_[timestamp].json")
+    print(f"\nReport saved to: {report_file}")
 
     return report
 
