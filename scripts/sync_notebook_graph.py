@@ -857,7 +857,32 @@ def sync_dataset(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
-    return sync_dataset(args)
+    print(
+        "DEPRECATED: sync_notebook_graph.py now delegates to sync_corpus_graph.py; "
+        "use --corpus-title/--corpus-key with the new command.",
+        file=sys.stderr,
+    )
+    if args.notebook_id and not args.notebook_title:
+        raise SyncError("--notebook-id cannot identify a local corpus. Provide --notebook-title or use --corpus-key.")
+    from scripts.sync_corpus_graph import main as sync_corpus_main
+
+    delegated = [args.command, "--dataset-dir", args.dataset_dir]
+    if args.notebook_title:
+        delegated.extend(["--corpus-title", args.notebook_title])
+    if args.dataset_key:
+        delegated.extend(["--corpus-key", args.dataset_key])
+    if args.export_dir:
+        delegated.extend(["--export-dir", args.export_dir])
+    for option, value in (
+        ("--neo4j-uri", args.neo4j_uri),
+        ("--neo4j-user", args.neo4j_user),
+        ("--neo4j-password", args.neo4j_password),
+        ("--neo4j-password-env", getattr(args, "neo4j_password_env", None)),
+        ("--neo4j-database", args.neo4j_database),
+    ):
+        if value:
+            delegated.extend([option, str(value)])
+    return sync_corpus_main(delegated)
 
 
 if __name__ == "__main__":

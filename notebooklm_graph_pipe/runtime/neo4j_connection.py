@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
-from typing import Mapping
+from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from neo4j import GraphDatabase
@@ -74,16 +75,36 @@ def connection_spec_from_mapping(
     )
 
 
+def connection_spec_to_mapping(
+    connection: Neo4jConnectionSpec | ResolvedNeo4jConnection,
+    *,
+    password_env: str = "NEO4J_PASSWORD",
+    extra: Mapping[str, object] | None = None,
+) -> dict[str, object]:
+    deployment = connection.deployment
+    payload: dict[str, object] = {
+        "deployment": deployment,
+        "uri": connection.uri,
+        "username": connection.username,
+        "database": connection.database,
+        "password_env": password_env,
+    }
+    if extra:
+        payload.update({key: value for key, value in extra.items() if value is not None and key != "password"})
+    return payload
+
+
 def resolve_connection(
     spec: Neo4jConnectionSpec,
     *,
     environ: Mapping[str, str] | None = None,
     password: str | None = None,
+    allow_standard_env_overrides: bool = True,
 ) -> ResolvedNeo4jConnection:
     env = environ if environ is not None else os.environ
-    uri = validate_neo4j_uri(env.get("NEO4J_URI", spec.uri))
-    username = env.get("NEO4J_USERNAME", spec.username).strip()
-    database = env.get("NEO4J_DATABASE", spec.database).strip()
+    uri = validate_neo4j_uri(env.get("NEO4J_URI", spec.uri) if allow_standard_env_overrides else spec.uri)
+    username = (env.get("NEO4J_USERNAME", spec.username) if allow_standard_env_overrides else spec.username).strip()
+    database = (env.get("NEO4J_DATABASE", spec.database) if allow_standard_env_overrides else spec.database).strip()
     secret = password or env.get(spec.password_env, "")
     if not username:
         raise Neo4jConnectionError("Neo4j username is required.")
@@ -94,6 +115,23 @@ def resolve_connection(
             f"Neo4j password is required. Set environment variable '{spec.password_env}'."
         )
     return ResolvedNeo4jConnection(uri, username, secret, database, spec.deployment)
+
+
+def resolve_connection_mapping(
+    value: Mapping[str, object],
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> ResolvedNeo4jConnection:
+    """Resolve a persisted connection without allowing global URI/user/database overrides."""
+    spec = connection_spec_from_mapping(value)
+    env = environ if environ is not None else os.environ
+    legacy_password = None if env.get(spec.password_env) else (str(value.get("password") or "") or None)
+    return resolve_connection(
+        spec,
+        environ=env,
+        password=legacy_password,
+        allow_standard_env_overrides=False,
+    )
 
 
 def verify_connection(connection: ResolvedNeo4jConnection, *, require_write: bool = False) -> dict[str, str]:
@@ -140,6 +178,129 @@ def verify_workflow_connection(connection: ResolvedNeo4jConnection) -> dict[str,
         raise Neo4jConnectionError(
             "Neo4j is missing APOC capabilities required by the graph workflow: " + ", ".join(missing)
         )
+    return server
+
+
+def _neo4j_version(server_agent: str) -> tuple[int, int, int]:
+    match = re.search(r"(?:Neo4j/)?(\d+)\.(\d+)(?:\.(\d+))?", server_agent)
+    if not match:
+        raise Neo4jConnectionError(f"Unable to determine Neo4j version from server agent: {server_agent}")
+    return tuple(int(value or 0) for value in match.groups())
+
+
+def _validate_corpus_indexes(session: Any, dimension: int) -> None:
+    required = {
+        "document_status": ("RANGE", "NODE", ["Document"], ["status"]),
+        "revision_ready": ("RANGE", "NODE", ["DocumentRevision"], ["vector_ready", "graph_ready"]),
+        "chunk_parent_id": ("RANGE", "NODE", ["Chunk"], ["parent_id"]),
+        "chunk_keyword_v1": ("FULLTEXT", "NODE", ["Chunk"], ["text"]),
+        "entities": ("FULLTEXT", "NODE", ["__Entity__"], ["id", "description"]),
+        "community_keyword": ("FULLTEXT", "NODE", ["__Community__"], ["summary"]),
+        "chunk_embedding_v1": ("VECTOR", "NODE", ["Chunk"], ["embedding"]),
+    }
+    rows = {
+        str(row["name"]): dict(row)
+        for row in session.run(
+            "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, options, state "
+            "RETURN name, type, entityType, labelsOrTypes, properties, options, state"
+        )
+    }
+    for name, expected in required.items():
+        row = rows.get(name)
+        if row is None:
+            raise Neo4jConnectionError(
+                f"Required corpus index '{name}' was not created. A conflicting index may already use its schema. "
+                "Use a fresh blue-green database or remove the incompatible index explicitly."
+            )
+        actual = (
+            str(row.get("type")),
+            str(row.get("entityType")),
+            sorted(str(value) for value in row.get("labelsOrTypes") or []),
+            [str(value) for value in row.get("properties") or []],
+        )
+        normalized_expected = (expected[0], expected[1], sorted(expected[2]), expected[3])
+        if actual != normalized_expected:
+            raise Neo4jConnectionError(
+                f"Corpus index '{name}' has incompatible schema: expected={normalized_expected}, actual={actual}."
+            )
+        if str(row.get("state")) != "ONLINE":
+            raise Neo4jConnectionError(f"Corpus index '{name}' is not ONLINE (state={row.get('state')}).")
+        if name == "chunk_embedding_v1":
+            config = dict((dict(row.get("options") or {}).get("indexConfig") or {}))
+            actual_dimension = int(config.get("vector.dimensions") or 0)
+            similarity = str(config.get("vector.similarity_function") or "").lower()
+            if actual_dimension != dimension or similarity != "cosine":
+                raise Neo4jConnectionError(
+                    "Corpus vector index has incompatible configuration: "
+                    f"expected dimension={dimension}/cosine, actual dimension={actual_dimension}/{similarity or 'unknown'}."
+                )
+
+
+def _validate_corpus_constraints(session: Any) -> None:
+    required = {
+        "corpus_id_unique": (["Corpus"], ["id"]),
+        "corpus_key_unique": (["Corpus"], ["key"]),
+        "document_id_unique": (["Document"], ["id"]),
+        "revision_id_unique": (["DocumentRevision"], ["id"]),
+        "parent_chunk_id_unique": (["ParentChunk"], ["id"]),
+        "chunk_id_unique": (["Chunk"], ["id"]),
+    }
+    rows = {
+        str(row["name"]): dict(row)
+        for row in session.run(
+            "SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties "
+            "RETURN name, type, entityType, labelsOrTypes, properties"
+        )
+    }
+    for name, (labels, properties) in required.items():
+        row = rows.get(name)
+        if row is None:
+            raise Neo4jConnectionError(f"Required corpus constraint '{name}' was not created.")
+        actual = (
+            str(row.get("type")),
+            str(row.get("entityType")),
+            sorted(str(value) for value in row.get("labelsOrTypes") or []),
+            [str(value) for value in row.get("properties") or []],
+        )
+        expected = ("UNIQUENESS", "NODE", sorted(labels), properties)
+        if actual != expected:
+            raise Neo4jConnectionError(
+                f"Corpus constraint '{name}' has incompatible schema: expected={expected}, actual={actual}."
+            )
+
+
+def verify_corpus_connection(
+    connection: ResolvedNeo4jConnection,
+    *,
+    dimension: int = 384,
+    initialize_schema: bool = False,
+    require_write: bool = False,
+) -> dict[str, str]:
+    server = verify_connection(connection, require_write=require_write or initialize_schema)
+    if _neo4j_version(server["agent"]) < (5, 23, 0):
+        raise Neo4jConnectionError("The corpus workflow requires Neo4j 5.23 or later.")
+    with GraphDatabase.driver(connection.uri, auth=(connection.username, connection.password)) as driver:
+        if initialize_schema:
+            from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
+
+            Neo4jCorpusStore(driver, connection.database).ensure_schema(dimension)
+        with driver.session(database=connection.database) as session:
+            if initialize_schema:
+                session.run("CALL db.awaitIndexes(300)").consume()
+            _validate_corpus_indexes(session, dimension)
+            _validate_corpus_constraints(session)
+            query_vector = [0.0] * dimension
+            query_vector[0] = 1.0
+            session.run(
+                "CALL db.index.vector.queryNodes('chunk_embedding_v1', 1, $embedding) "
+                "YIELD node RETURN node LIMIT 1",
+                embedding=query_vector,
+            ).consume()
+            session.run(
+                "CALL db.index.fulltext.queryNodes('chunk_keyword_v1', $search_text) "
+                "YIELD node RETURN node LIMIT 1",
+                search_text="__lgp_preflight_no_match__",
+            ).consume()
     return server
 
 

@@ -65,6 +65,12 @@ def test_verify_inventory_rejects_label_mismatch() -> None:
         migration.verify_inventory(source, target)
 
 
+def test_verify_corpus_inventory_rejects_missing_active_embedding() -> None:
+    inventory = migration.CorpusInventory(1, 1, 1, 2, 1, 2, 1)
+    with pytest.raises(migration.MigrationError, match="active chunks are missing embeddings"):
+        migration.verify_corpus_inventory(inventory, inventory)
+
+
 def test_activate_manifest_writes_non_secret_target(tmp_path: Path) -> None:
     path = tmp_path / "manifest.json"
     path.write_text(
@@ -83,6 +89,27 @@ def test_activate_manifest_writes_non_secret_target(tmp_path: Path) -> None:
         "database": "neo4j",
         "password_env": "NEO4J_TARGET_PASSWORD",
     }
+    assert "old-secret" not in path.read_text(encoding="utf-8")
+
+
+def test_activate_corpus_manifest_preserves_corpus_and_embedding_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    payload = {
+        "version": 3,
+        "corpus": {"id": "corpus-id", "key": "demo", "title": "Demo"},
+        "embedding": {"provider": "sentence-transformer", "model": "all-MiniLM-L6-v2", "dimension": 384},
+        "sources": {"a.txt": {"document_id": "doc"}},
+        "neo4j": {"uri": "bolt://local", "password": "old-secret"},
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    migration.activate_manifest(path, connection(), "DEMO_NEO4J_PASSWORD")
+
+    updated = json.loads(path.read_text(encoding="utf-8"))
+    assert updated["corpus"] == payload["corpus"]
+    assert updated["embedding"] == payload["embedding"]
+    assert updated["sources"] == payload["sources"]
+    assert updated["neo4j"]["password_env"] == "DEMO_NEO4J_PASSWORD"
     assert "old-secret" not in path.read_text(encoding="utf-8")
 
 
@@ -106,6 +133,7 @@ def test_portable_dry_run_rejects_non_empty_target_without_overwrite(monkeypatch
         ]
     )
     monkeypatch.setattr(migration, "read_inventory", lambda *args: next(inventories))
+    monkeypatch.setattr(migration, "read_corpus_inventory", lambda *args: migration.CorpusInventory(0, 0, 0, 0, 0, 0, 0))
     monkeypatch.setattr(migration, "read_schema", lambda *args: [])
     monkeypatch.setattr(migration, "read_schema_signature", lambda *args: {})
     monkeypatch.setattr(migration, "read_staging_state", lambda *args: (1, 0, 0))
@@ -173,6 +201,27 @@ def test_aura_dry_run_allows_dump_planned_from_container(tmp_path: Path, monkeyp
     assert summary["executed"] is False
 
 
+def test_aura_dry_run_accepts_neo4j_5_26_lts(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "neo4j.dump").write_bytes(b"dump")
+    monkeypatch.setattr(migration.shutil, "which", lambda value: "neo4j-admin")
+    monkeypatch.setattr(
+        migration.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"returncode": 0, "stdout": "5.26.0", "stderr": ""})(),
+    )
+
+    summary = migration.aura_upload(
+        connection(),
+        database="neo4j",
+        dump_dir=tmp_path,
+        neo4j_admin_bin="neo4j-admin",
+        execute=False,
+        overwrite_target=True,
+    )
+
+    assert summary["executed"] is False
+
+
 def test_aura_container_upload_keeps_password_out_of_command(tmp_path: Path, monkeypatch) -> None:
     (tmp_path / "neo4j.dump").write_bytes(b"dump")
     captured: dict[str, object] = {}
@@ -189,6 +238,11 @@ def test_aura_container_upload_keeps_password_out_of_command(tmp_path: Path, mon
 
     monkeypatch.setattr(migration.subprocess, "run", fake_run)
     monkeypatch.setattr(migration, "verify_connection", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        migration,
+        "inspect_corpus_connection",
+        lambda *args, **kwargs: (migration.CorpusInventory(0, 0, 0, 0, 0, 0, 0), 384, False),
+    )
 
     summary = migration.aura_upload(
         connection(),
@@ -203,6 +257,34 @@ def test_aura_container_upload_keeps_password_out_of_command(tmp_path: Path, mon
     assert summary["verified"] is True
     assert "secret" not in " ".join(captured["command"])
     assert captured["env"]["NEO4J_PASSWORD"] == "secret"
+
+
+def test_aura_upload_rejects_expected_corpus_without_vector_schema(tmp_path: Path, monkeypatch) -> None:
+    (tmp_path / "neo4j.dump").write_bytes(b"dump")
+    expected = migration.CorpusInventory(1, 1, 1, 1, 1, 1, 1)
+    monkeypatch.setattr(migration.shutil, "which", lambda value: "neo4j-admin")
+    monkeypatch.setattr(
+        migration.subprocess,
+        "run",
+        lambda *args, **kwargs: type("Result", (), {"returncode": 0, "stdout": "5.26.0", "stderr": ""})(),
+    )
+    monkeypatch.setattr(migration, "verify_connection", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        migration,
+        "inspect_corpus_connection",
+        lambda *args, **kwargs: (expected, 384, False),
+    )
+
+    with pytest.raises(migration.MigrationError, match="without its required vector index"):
+        migration.aura_upload(
+            connection(),
+            database="neo4j",
+            dump_dir=tmp_path,
+            neo4j_admin_bin="neo4j-admin",
+            execute=True,
+            overwrite_target=True,
+            expected_corpus=expected,
+        )
 
 
 def test_portable_resume_rejects_non_staging_target(monkeypatch) -> None:
@@ -223,6 +305,7 @@ def test_portable_resume_rejects_non_staging_target(monkeypatch) -> None:
         "read_inventory",
         lambda *args: migration.GraphInventory(1, 0, {"Document": 1}, {}),
     )
+    monkeypatch.setattr(migration, "read_corpus_inventory", lambda *args: migration.CorpusInventory(0, 0, 0, 0, 0, 0, 0))
     monkeypatch.setattr(migration, "read_schema", lambda *args: [])
     monkeypatch.setattr(migration, "read_schema_signature", lambda *args: {})
     monkeypatch.setattr(migration, "ensure_migration_names_available", lambda *args: None)
