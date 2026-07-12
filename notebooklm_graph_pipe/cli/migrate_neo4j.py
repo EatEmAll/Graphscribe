@@ -23,6 +23,7 @@ from notebooklm_graph_pipe.runtime.neo4j_connection import (
     resolve_connection,
     validate_neo4j_uri,
     verify_connection,
+    verify_corpus_connection,
 )
 
 MIGRATION_LABEL = "__LGP_MIGRATION__"
@@ -50,6 +51,32 @@ class SchemaObject:
     kind: str
     name: str
     create_statement: str
+
+
+@dataclass(frozen=True)
+class CorpusInventory:
+    corpora: int
+    documents: int
+    active_revisions: int
+    chunks: int
+    embedded_chunks: int
+    active_chunks: int
+    active_embedded_chunks: int
+
+    @property
+    def present(self) -> bool:
+        return self.corpora > 0
+
+    def to_dict(self) -> dict[str, int]:
+        return {
+            "corpora": self.corpora,
+            "documents": self.documents,
+            "active_revisions": self.active_revisions,
+            "chunks": self.chunks,
+            "embedded_chunks": self.embedded_chunks,
+            "active_chunks": self.active_chunks,
+            "active_embedded_chunks": self.active_embedded_chunks,
+        }
 
 
 def quote_token(value: str) -> str:
@@ -98,6 +125,53 @@ def read_inventory(driver: Any, database: str) -> GraphInventory:
         node_property_keys,
         relationship_property_keys,
     )
+
+
+def read_corpus_inventory(driver: Any, database: str) -> CorpusInventory:
+    queries = {
+        "corpora": "MATCH (n:Corpus) RETURN count(n) AS count",
+        "documents": "MATCH (n:Document) RETURN count(n) AS count",
+        "active_revisions": "MATCH (:Document)-[:ACTIVE_REVISION]->(n:DocumentRevision) RETURN count(n) AS count",
+        "chunks": "MATCH (n:Chunk) RETURN count(n) AS count",
+        "embedded_chunks": "MATCH (n:Chunk) WHERE n.embedding IS NOT NULL RETURN count(n) AS count",
+        "active_chunks": (
+            "MATCH (:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)<-[:IN_REVISION]-(n:Chunk) "
+            "RETURN count(n) AS count"
+        ),
+        "active_embedded_chunks": (
+            "MATCH (:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)<-[:IN_REVISION]-(n:Chunk) "
+            "WHERE n.embedding IS NOT NULL RETURN count(n) AS count"
+        ),
+    }
+    with driver.session(database=database) as session:
+        counts = {
+            key: int(session.run(query).single(strict=True)["count"])
+            for key, query in queries.items()
+        }
+    return CorpusInventory(**counts)
+
+
+def verify_corpus_inventory(expected: CorpusInventory, actual: CorpusInventory) -> None:
+    if expected != actual:
+        raise MigrationError(
+            "Corpus migration verification failed: "
+            f"source={expected.to_dict()}, target={actual.to_dict()}."
+        )
+    if actual.present and actual.active_chunks != actual.active_embedded_chunks:
+        raise MigrationError(
+            "Corpus migration verification failed: one or more active chunks are missing embeddings."
+        )
+
+
+def inspect_corpus_connection(
+    connection: ResolvedNeo4jConnection,
+) -> tuple[CorpusInventory, int, bool]:
+    with GraphDatabase.driver(connection.uri, auth=(connection.username, connection.password)) as driver:
+        driver.verify_connectivity()
+        inventory = read_corpus_inventory(driver, connection.database)
+        schema_signature = read_schema_signature(driver, connection.database)
+    dimension = corpus_vector_dimension(schema_signature)
+    return inventory, dimension, inventory.present and "chunk_embedding_v1" in schema_signature
 
 
 def read_schema_signature(driver: Any, database: str) -> dict[str, dict[str, Any]]:
@@ -162,6 +236,12 @@ def read_schema(driver: Any, database: str) -> list[SchemaObject]:
             if row["createStatement"]
         ]
     return constraints + indexes
+
+
+def corpus_vector_dimension(schema_signature: Mapping[str, dict[str, Any]]) -> int:
+    vector_index = schema_signature.get("chunk_embedding_v1") or {}
+    config = vector_index.get("index_config") or {}
+    return int(config.get("vector.dimensions") or 384)
 
 
 def portable_schema_statement(statement: str) -> str:
@@ -441,6 +521,7 @@ def _portable_migrate_impl(
                 raise MigrationError("Source and target resolve to the same Neo4j server and database.")
             progress["phase"] = "inventory"
             inventory = read_inventory(source, source_connection.database)
+            corpus_inventory = read_corpus_inventory(source, source_connection.database)
             target_inventory = read_inventory(target, target_connection.database)
             progress["source"] = {"nodes": inventory.nodes, "relationships": inventory.relationships}
             progress["target_before"] = {
@@ -449,6 +530,8 @@ def _portable_migrate_impl(
             }
             schema = read_schema(source, source_connection.database)
             source_schema_signature = read_schema_signature(source, source_connection.database)
+            corpus_dimension = corpus_vector_dimension(source_schema_signature)
+            is_v3_corpus = corpus_inventory.present and "chunk_embedding_v1" in source_schema_signature
             target_schema = read_schema(target, target_connection.database)
             ensure_migration_names_available(source, source_connection.database)
             total_target_nodes, staged_target_nodes, unstaged_target_relationships = read_staging_state(
@@ -484,6 +567,13 @@ def _portable_migrate_impl(
                 "schema_objects": len(schema),
                 "resume": resume,
             }
+            if is_v3_corpus:
+                summary["source_corpus"] = corpus_inventory.to_dict()
+                if target_connection.uri.startswith("neo4j+s://") and corpus_inventory.embedded_chunks:
+                    summary.setdefault("warnings", []).append(
+                        "Portable mode streams and fingerprints every stored embedding; prefer Aura dump/upload "
+                        "for large v3 vector corpora."
+                    )
             if not execute:
                 summary["cleanup_only_resume"] = cleanup_only_resume
                 return summary
@@ -498,6 +588,11 @@ def _portable_migrate_impl(
                 target_schema_signature = read_schema_signature(target, target_connection.database)
                 if source_schema_signature != target_schema_signature:
                     raise MigrationError("Migration schema verification failed after resumed cleanup.")
+                if is_v3_corpus:
+                    target_corpus_inventory = read_corpus_inventory(target, target_connection.database)
+                    verify_corpus_inventory(corpus_inventory, target_corpus_inventory)
+                    verify_corpus_connection(target_connection, dimension=corpus_dimension)
+                    summary["target_corpus"] = target_corpus_inventory.to_dict()
                 summary["cleanup_only_resume"] = True
                 summary["target_after"] = {
                     "nodes": final_inventory.nodes,
@@ -540,6 +635,11 @@ def _portable_migrate_impl(
                     "Migration schema verification failed after copy. "
                     f"source objects={sorted(source_schema_signature)}, target objects={sorted(target_schema_signature)}"
                 )
+            if is_v3_corpus:
+                target_corpus_inventory = read_corpus_inventory(target, target_connection.database)
+                verify_corpus_inventory(corpus_inventory, target_corpus_inventory)
+                verify_corpus_connection(target_connection, dimension=corpus_dimension)
+                summary["target_corpus"] = target_corpus_inventory.to_dict()
             summary["target_after"] = {
                 "nodes": final_inventory.nodes,
                 "relationships": final_inventory.relationships,
@@ -615,6 +715,8 @@ def aura_upload(
     overwrite_target: bool,
     dump_will_be_created: bool = False,
     neo4j_admin_container: str | None = None,
+    expected_corpus: CorpusInventory | None = None,
+    corpus_dimension: int = 384,
 ) -> dict[str, Any]:
     if not target.uri.startswith("neo4j+s://") or not target.uri.endswith(".databases.neo4j.io"):
         raise MigrationError("Aura upload requires an Aura neo4j+s://*.databases.neo4j.io target URI.")
@@ -637,8 +739,8 @@ def aura_upload(
             raise MigrationError(f"neo4j-admin executable not found: {neo4j_admin_bin}")
         version_command = [executable, "--version"]
     version = subprocess.run(version_command, capture_output=True, text=True, check=False)
-    if version.returncode != 0 or parse_neo4j_version(version.stdout + version.stderr) < (5, 26, 7):
-        raise MigrationError("Aura upload requires neo4j-admin and a dump from Neo4j 5.26.7 or later.")
+    if version.returncode != 0 or parse_neo4j_version(version.stdout + version.stderr) < (5, 26, 0):
+        raise MigrationError("Aura upload requires neo4j-admin and a dump from Neo4j 5.26 LTS or later.")
     dump_file = dump_dir / f"{database}.dump"
     if not dump_file.exists() and not (not execute and dump_will_be_created):
         raise MigrationError(f"Database dump not found: {dump_file}")
@@ -651,6 +753,8 @@ def aura_upload(
         "target": target.uri,
         "warnings": ["Aura capacity is not exposed over Bolt; confirm the target tier can hold the source dump."],
     }
+    if expected_corpus is not None:
+        summary["source_corpus"] = expected_corpus.to_dict()
     if not execute:
         return summary
     env = os.environ.copy()
@@ -681,6 +785,22 @@ def aura_upload(
         ]
     _run_checked(command, env=env)
     verify_connection(target, require_write=True)
+    target_corpus, target_dimension, is_v3_corpus = inspect_corpus_connection(target)
+    if expected_corpus is not None:
+        verify_corpus_inventory(expected_corpus, target_corpus)
+        if not is_v3_corpus:
+            raise MigrationError("Aura upload copied v3 corpus data without its required vector index.")
+    if (
+        expected_corpus is None
+        and target_corpus.present
+        and (target_corpus.active_revisions or target_corpus.embedded_chunks)
+        and not is_v3_corpus
+    ):
+        raise MigrationError("Aura upload contains v3-like corpus data without its required vector index.")
+    if is_v3_corpus:
+        expected_dimension = corpus_dimension if expected_corpus is not None else target_dimension
+        verify_corpus_connection(target, dimension=expected_dimension)
+        summary["target_corpus"] = target_corpus.to_dict()
     summary["verified"] = True
     return summary
 
@@ -700,9 +820,9 @@ def create_container_dump(
     )
     if version.returncode != 0:
         raise MigrationError(f"Unable to run neo4j-admin in source container '{container_name}'.")
-    if parse_neo4j_version(version.stdout + version.stderr) < (5, 26, 7):
+    if parse_neo4j_version(version.stdout + version.stderr) < (5, 26, 0):
         raise MigrationError(
-            "Aura upload requires a source container running Neo4j 5.26.7 or later; use portable mode for older containers."
+            "Aura upload requires a source container running Neo4j 5.26 LTS or later; use portable mode for older containers."
         )
     dump_path = dump_dir / f"{source.database}.dump"
     if not execute:
@@ -873,8 +993,14 @@ def main(argv: list[str] | None = None) -> int:
             raise MigrationError("Aura upload requires --dump-dir containing <source-database>.dump.")
         database = args.source_database or os.environ.get("NEO4J_SOURCE_DATABASE", "neo4j")
         generated_dump: Path | None = None
+        expected_corpus: CorpusInventory | None = None
+        expected_corpus_dimension = 384
         if args.source_container:
             source = _connection_from_args(args, "source")
+            source_corpus, source_dimension, source_is_v3 = inspect_corpus_connection(source)
+            if source_is_v3:
+                expected_corpus = source_corpus
+                expected_corpus_dimension = source_dimension
             generated_dump = create_container_dump(
                 source,
                 container_name=args.source_container,
@@ -890,6 +1016,8 @@ def main(argv: list[str] | None = None) -> int:
             overwrite_target=args.overwrite_target,
             dump_will_be_created=bool(args.source_container),
             neo4j_admin_container=args.source_container,
+            expected_corpus=expected_corpus,
+            corpus_dimension=expected_corpus_dimension,
         )
         if generated_dump is not None and args.execute and not args.keep_dump:
             generated_dump.unlink(missing_ok=True)
