@@ -1,8 +1,37 @@
 # notebooklm-graph-pipe
 
-`notebooklm-graph-pipe` extends upstream [`llm-graph-builder`](https://github.com/neo4j-labs/llm-graph-builder) with agent skills and workflows that combine NotebookLM and Neo4j across Codex, Claude, and OpenCode. It provides an end-to-end pipeline for turning a NotebookLM-backed corpus into a Neo4j graph, a self-improving graph consolidation workflow, and A/B evaluation of notebook-only retrieval vs hybrid vector RAG + GraphRAG.
+`notebooklm-graph-pipe` is a self-hosted corpus ingestion, vector RAG, and GraphRAG pipeline built on Neo4j. Its primary v3 workflow ingests local text, Markdown, PDF, and YouTube transcripts without NotebookLM, creates hierarchical retrieval chunks and native Neo4j vector/full-text indexes, extracts a knowledge graph, and exposes cited research through REST and MCP.
 
-## Pipeline Overview
+See [Local Neo4j Corpus RAG](docs/LOCAL_CORPUS_RAG.md) for the primary setup, migration, API, MCP, and operations guide.
+
+## Primary Local Pipeline
+
+```mermaid
+flowchart LR
+    A["TXT / Markdown / PDF / YouTube"] --> B["Canonical structured documents"]
+    B --> C["Parent and MiniLM-safe child chunks"]
+    C --> D["Neo4j vector and full-text indexes"]
+    C --> E["Parent-based graph extraction"]
+    D --> F["Hybrid retrieval and reranking"]
+    E --> F
+    F --> G["REST / MCP cited answers"]
+```
+
+Quick start:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\sync_corpus_graph.py create `
+  --dataset-dir C:\path\to\corpus `
+  --corpus-title my-corpus
+
+.\.venv\Scripts\python.exe scripts\serve_corpus_api.py
+```
+
+## Legacy NotebookLM Pipeline
+
+The workflow below is retained temporarily for blue-green migration and historical benchmark compatibility. `sync_notebook_graph.py` is deprecated and delegates to the local corpus synchronizer when executed directly.
+
+### Legacy Pipeline Overview
 
 ```mermaid
 flowchart LR
@@ -14,7 +43,7 @@ flowchart LR
     E -- "consolidate_self_improving.py" --> G["Consolidated Graph"]
 ```
 
-## Setup
+### Legacy Setup
 
 - Python `3.12+`
 - Google account signed into NotebookLM
@@ -187,36 +216,36 @@ Without `--llm-routing-config`, `scripts/postprocess_graph.py` and the default c
 
 Supported agent runtimes for review or taxonomy-tail steps are `codex`, `claude`, and `opencode`. Without a routing config, consolidation defaults to `codex`.
 
-The bundled `notebooklm-neo4j-deep-research` workflow is packaged for `.claude`, `.opencode`, and `.codex`. It alternates between NotebookLM answers and Neo4j neighborhood expansion, keeps only the strongest branches, and stops when additional loops stop adding signal.
+The bundled `neo4j-corpus-deep-research` workflow is packaged for `.claude`, `.opencode`, and `.codex`. It alternates cited local corpus retrieval with Neo4j neighborhood expansion, keeps only source-verifiable branches, and stops when additional loops stop adding signal.
 
 ## MCP Tooling & Agent Skills
 
-- [`notebooklm-mcp`](https://github.com/jacob-bd/notebooklm-mcp-cli): notebook querying and NotebookLM source access
+- Local corpus MCP (`scripts/serve_corpus_mcp.py`): cited corpus search, answers, source metadata, graph neighborhoods, and sync status
 - [`neo4j`](https://github.com/neo4j-contrib/mcp-neo4j): schema reads and Cypher exploration
 
-The bundled deep-research agent packages depend on both MCP servers:
+The bundled deep-research packages use the local corpus MCP and optionally the Neo4j MCP:
 
-- `.codex/skills/notebooklm-neo4j-deep-research/`
-- `.claude/agents/notebooklm-neo4j-deep-research.md`
-- `.opencode/agents/notebooklm-neo4j-deep-research.md`
+- `.codex/skills/neo4j-corpus-deep-research/`
+- `.claude/agents/neo4j-corpus-deep-research.md`
+- `.opencode/agents/neo4j-corpus-deep-research.md`
 
 What the provided skill does:
 
-- treats NotebookLM as the high-context reader and Neo4j as the topology explorer
-- starts from a notebook answer, extracts concrete entities, concepts, aliases, and open questions
-- expands the strongest seeds through graph neighborhoods, then turns the best graph findings into tighter NotebookLM follow-ups
+- treats cited corpus retrieval as the high-context reader and Neo4j as the topology explorer
+- starts from a grounded answer, extracts concrete entities, concepts, aliases, and open questions
+- expands the strongest seeds through graph neighborhoods, then turns the best graph findings into tighter corpus follow-ups
 - scores candidate branches for relevance, novelty, graph support, and explainability, and stops when the loop stops adding signal
 
 Example use:
 
 ```text
-Use the bundled notebooklm-neo4j-deep-research skill against the notebook "my-corpus"
-and the connected Neo4j graph. Research this question: "Which methods connect graph-based
+Use the bundled neo4j-corpus-deep-research skill against corpus "my-corpus"
+and its connected Neo4j graph. Research this question: "Which methods connect graph-based
 retrieval with hallucination control in this corpus?" Use a 3-iteration loop budget and
 return the full skill output.
 ```
 
-In practice, that workflow queries NotebookLM for an initial answer, extracts high-signal seeds, probes Neo4j for neighborhoods and bridge concepts, asks targeted NotebookLM follow-ups, and returns a structured report with the final answer, iteration log, accepted/rejected branches, stop reason, and self-critique.
+In practice, that workflow queries the local corpus for an initial cited answer, extracts high-signal seeds, probes Neo4j for neighborhoods and bridge concepts, revalidates graph discoveries against source chunks, and returns a structured report with the final answer, iteration log, accepted/rejected branches, stop reason, and self-critique.
 
 ## Repo Layout And Overlay
 

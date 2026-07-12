@@ -3,3 +3,7 @@ google-genai
 inflect
 numpy
 pytest
+docling
+markdown-it-py
+mcp[cli]
+yt-dlp
