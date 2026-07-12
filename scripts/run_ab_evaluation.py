@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -499,6 +500,16 @@ def run_codex_exec(
     for override in config_overrides:
         command.extend(["-c", override])
     command.append("-")
+    env = os.environ.copy()
+    if dataset_entry is not None:
+        env.update(
+            {
+                "NEO4J_URI": dataset_entry.neo4j.uri,
+                "NEO4J_USERNAME": dataset_entry.neo4j.username,
+                "NEO4J_PASSWORD": dataset_entry.neo4j.password,
+                "NEO4J_DATABASE": dataset_entry.neo4j.database,
+            }
+        )
     try:
         result = subprocess.run(
             command,
@@ -507,6 +518,7 @@ def run_codex_exec(
             capture_output=True,
             check=False,
             timeout=timeout_seconds,
+            env=env,
         )
     except subprocess.TimeoutExpired as exc:
         partial_stdout = exc.stdout or ""
@@ -524,10 +536,8 @@ def run_codex_exec(
 
 def build_hybrid_overrides(entry: DatasetRegistryEntry) -> list[str]:
     return [
-        f'mcp_servers.neo4j.env.NEO4J_URI="{entry.neo4j.uri}"',
-        f'mcp_servers.neo4j.env.NEO4J_USERNAME="{entry.neo4j.username}"',
-        f'mcp_servers.neo4j.env.NEO4J_PASSWORD="{entry.neo4j.password}"',
-        f'mcp_servers.neo4j.env.NEO4J_DATABASE="{entry.neo4j.database}"',
+        "mcp_servers.neo4j.env={}",
+        'mcp_servers.neo4j.env_vars=["NEO4J_URI","NEO4J_USERNAME","NEO4J_PASSWORD","NEO4J_DATABASE"]',
     ]
 
 
@@ -638,16 +648,38 @@ def load_manifest_dataset(manifest_path: str | Path, dataset_label: str | None =
     payload = json.loads(path.read_text(encoding="utf-8"))
     notebook = payload.get("notebook") or {}
     neo4j = payload.get("neo4j") or {}
+    if "password" in neo4j:
+        warnings.warn(
+            f"Legacy plaintext Neo4j password found in {path}; migrate the manifest to password_env.",
+            FutureWarning,
+            stacklevel=2,
+        )
     notebook_id = str(notebook.get("id") or "").strip()
     notebook_title = str(notebook.get("title") or "").strip()
     if not notebook_id or not notebook_title:
         raise BenchmarkError("Manifest is missing notebook.id or notebook.title.")
     uri = str(neo4j.get("uri") or "").strip()
     username = str(neo4j.get("username") or neo4j.get("user") or "").strip()
-    password = str(neo4j.get("password") or "").strip()
+    password_env = str(neo4j.get("password_env") or "NEO4J_PASSWORD").strip()
+    password = str(neo4j.get("password") or os.environ.get(password_env) or "").strip()
+    container_name = str(neo4j.get("container_name") or "").strip() or None
+    if not password and container_name:
+        result = subprocess.run(
+            ["docker", "inspect", container_name],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            containers = json.loads(result.stdout or "[]")
+            environment = ((containers[0].get("Config") or {}).get("Env") or []) if containers else []
+            auth = next((item for item in environment if item.startswith("NEO4J_AUTH=")), "")
+            password = auth.partition("=")[2].partition("/")[2].strip()
     database = str(neo4j.get("database") or "").strip()
     if not uri or not username or not password or not database:
-        raise BenchmarkError("Manifest is missing required neo4j runtime fields.")
+        raise BenchmarkError(
+            f"Manifest is missing required Neo4j connection fields or environment variable {password_env} is not set."
+        )
     key = str(dataset_label or payload.get("project_slug") or slugify(notebook_title)).strip()
     if not key:
         raise BenchmarkError("Could not derive dataset label from manifest.")
@@ -668,7 +700,9 @@ def load_manifest_dataset(manifest_path: str | Path, dataset_label: str | None =
             username=username,
             password=password,
             database=database,
-            container_name=str(neo4j.get("container_name") or "").strip() or None,
+            password_env=password_env,
+            deployment=str(neo4j.get("deployment") or ("managed-local" if neo4j.get("container_name") else "external")),
+            container_name=container_name,
         ),
     )
     return dataset, entry

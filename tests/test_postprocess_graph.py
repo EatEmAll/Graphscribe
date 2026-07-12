@@ -61,7 +61,7 @@ def test_run_backend_postprocess_executes_index_workflow() -> None:
 def test_run_backend_postprocess_fails_when_backend_unhealthy() -> None:
     api = FakeGraphAPI(healthy=False)
 
-    with pytest.raises(ppg.WorkflowError, match="Local graph runtime health check failed"):
+    with pytest.raises(ppg.WorkflowError, match="Neo4j graph runtime health check failed"):
         ppg.run_backend_postprocess(
             api,
             embedding_provider="sentence-transformer",

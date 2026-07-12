@@ -136,6 +136,21 @@ class GraphBuilderAPI:
     def _graph(self):
         return create_graph_database_connection(self.credentials)
 
+    def preflight_capabilities(self) -> dict[str, str]:
+        from notebooklm_graph_pipe.runtime.neo4j_connection import (
+            ResolvedNeo4jConnection,
+            verify_workflow_connection,
+        )
+
+        return verify_workflow_connection(
+            ResolvedNeo4jConnection(
+                uri=self.credentials.uri,
+                username=self.credentials.userName,
+                password=self.credentials.password,
+                database=self.credentials.database,
+            )
+        )
+
     def _resolve_source_path(self, file_name: str) -> Path:
         if self.sources_dir is None:
             raise FileNotFoundError(f"No sources_dir configured for runtime; cannot resolve '{file_name}'")

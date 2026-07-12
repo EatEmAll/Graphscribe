@@ -69,12 +69,69 @@ python scripts/sync_notebook_graph.py create \
   --neo4j-database neo4j
 ```
 
+For a hosted Neo4j deployment, prefer environment variables so the password is not exposed in process arguments or written to the project manifest. AuraDB uses the TLS and routing-enabled `neo4j+s://` URI supplied by Aura; the same variables work with other hosted Neo4j services and with `bolt+s://` endpoints:
+
+```bash
+export NEO4J_URI="neo4j+s://your-instance.databases.neo4j.io"
+export NEO4J_USERNAME="neo4j"
+export NEO4J_PASSWORD="your-password"
+export NEO4J_DATABASE="neo4j"
+
+python scripts/sync_notebook_graph.py create \
+  --dataset-dir path/to/corpus \
+  --notebook-title my-corpus
+```
+
+New manifests record the URI, username, database, deployment type, and the name of the password environment variable. They do not store the password. Legacy manifests containing a `password` field remain readable, but are rewritten in the non-secret format on the next sync. Hosted consolidation requires the target to expose the APOC Core procedures used by this project, including `apoc.refactor.mergeNodes` and `apoc.text.distance`.
+
 *Note: NotebookLM standard tier allows up to `100` notebooks and `50` sources per notebook. If source-count limits become a bottleneck, upgrade through [NotebookLM](https://support.google.com/notebooklm/answer/16213268?hl=en) or the [Google AI plans](https://one.google.com/intl/en/about/google-ai-plans).*
 
 *Docker notes:*
 - `scripts/sync_notebook_graph.py` can run without Docker when you provide explicit Neo4j credentials for your own instance
 - `scripts/run_ab_evaluation.py --manifest-path ...` does not require Docker
 - `scripts/run_ab_evaluation.py --datasets ...` auto-manages configured containers only when Docker is available
+- newly provisioned managed containers use Neo4j `5.26.7`; existing `5.23` containers are not upgraded automatically
+
+### 4a. Migrate a local graph to a hosted graph
+
+The portable migration mode works through the Neo4j driver and is the default for AuraDB and other hosted Neo4j providers. It supports existing local `5.23` containers and does not require `neo4j-admin`:
+
+```bash
+export NEO4J_SOURCE_PASSWORD="local-password"
+export NEO4J_TARGET_PASSWORD="hosted-password"
+
+# Preflight only: verifies both endpoints and reports the copy plan.
+python scripts/migrate_neo4j.py \
+  --source-uri bolt://127.0.0.1:7687 \
+  --target-uri neo4j+s://your-instance.databases.neo4j.io
+
+# Execute the migration and activate the hosted target in the project manifest.
+python scripts/migrate_neo4j.py \
+  --source-uri bolt://127.0.0.1:7687 \
+  --target-uri neo4j+s://your-instance.databases.neo4j.io \
+  --manifest-path data/notebooklm_exports/my-corpus/manifest.json \
+  --execute \
+  --activate-target
+```
+
+The target must contain no data or user-created schema. Replacing a populated target requires both `--overwrite-target` and an exact confirmation such as `--confirm-target "neo4j+s://your-instance.databases.neo4j.io|neo4j"`.
+
+If a portable migration is interrupted after staging begins, rerun the same source and target with `--resume --execute`. Resume is accepted only when every target node belongs to that interrupted migration and no unrelated relationships are present; it is mutually exclusive with overwrite.
+
+For a Neo4j `5.26.7+` dump, Aura's native upload can be used explicitly:
+
+```bash
+python scripts/migrate_neo4j.py \
+  --mode aura-upload \
+  --dump-dir path/to/dumps \
+  --source-database neo4j \
+  --target-uri neo4j+s://your-instance.databases.neo4j.io \
+  --overwrite-target \
+  --confirm-target "neo4j+s://your-instance.databases.neo4j.io|neo4j" \
+  --execute
+```
+
+Add `--source-container <managed-container-name>` plus the source connection variables to create the dump from a compatible managed container before upload. The utility stops that container, runs `neo4j-admin database dump` in a temporary sidecar sharing its data volumes, and restarts the source in `finally`; this also works with Community Edition, where `STOP DATABASE` is unavailable. A generated dump is removed after verified upload unless `--keep-dump` is supplied, and is retained after failure for retry. Aura upload is a whole-database replacement. The utility supplies the target password to `neo4j-admin` through the environment and verifies connectivity after upload.
 
 ## Getting Started
 
