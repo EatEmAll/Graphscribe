@@ -162,6 +162,31 @@ class OrchestratorConfig:
     resume: bool = False
 
 
+def _serialize_graph_params(params: Tier2Params | Tier3Params | TaxonomyParams) -> dict[str, Any]:
+    payload = asdict(params)
+    payload.pop("neo4j_password", None)
+    return payload
+
+
+def _serialize_runtime_params(
+    tier2: Tier2Params,
+    taxonomy: TaxonomyParams,
+    tier3: Tier3Params,
+) -> dict[str, dict[str, Any]]:
+    return {
+        "tier2": _serialize_graph_params(tier2),
+        "taxonomy": _serialize_graph_params(taxonomy),
+        "tier3": _serialize_graph_params(tier3),
+    }
+
+
+def _restore_graph_params(parameter_type: type[Any], payload: dict[str, Any]) -> Any:
+    values = dict(payload)
+    values.pop("neo4j_password", None)
+    values["neo4j_password"] = os.environ.get("NEO4J_PASSWORD", parameter_type().neo4j_password)
+    return parameter_type(**values)
+
+
 def _default_tier2_catalog() -> Tier2LabelCatalog:
     return Tier2LabelCatalog(
         labels=list(DEFAULT_TIER2_LABELS),
@@ -906,13 +931,17 @@ def update_plateau_streak(
     )
 
 
-def _run_command(command: list[str], log_file: Path) -> None:
+def _run_command(command: list[str], log_file: Path, *, neo4j_password: str | None = None) -> None:
+    env = os.environ.copy()
+    if neo4j_password is not None:
+        env["NEO4J_PASSWORD"] = neo4j_password
     result = subprocess.run(
         command,
         text=True,
         input=None,
         capture_output=True,
         cwd=REPO_ROOT,
+        env=env,
         check=False,
     )
     log_file.write_text(
@@ -1158,14 +1187,12 @@ def run_tier1(*, params: Tier2Params, dry_run: bool, iteration_dir: Path) -> Non
         params.neo4j_uri,
         "--neo4j-user",
         params.neo4j_user,
-        "--neo4j-password",
-        params.neo4j_password,
         "--neo4j-database",
         params.neo4j_database,
     ]
     if dry_run:
         command.append("--dry-run")
-    _run_command(command, iteration_dir / "tier1.log")
+    _run_command(command, iteration_dir / "tier1.log", neo4j_password=params.neo4j_password)
 
 
 def run_tier2(
@@ -1196,8 +1223,6 @@ def run_tier2(
         params.neo4j_uri,
         "--neo4j-user",
         params.neo4j_user,
-        "--neo4j-password",
-        params.neo4j_password,
         "--neo4j-database",
         params.neo4j_database,
         "--labels-json",
@@ -1211,7 +1236,7 @@ def run_tier2(
         command.extend(["--llm-routing-config", llm_routing_config])
     if dry_run:
         command.append("--dry-run")
-    _run_command(command, iteration_dir / "tier2.log")
+    _run_command(command, iteration_dir / "tier2.log", neo4j_password=params.neo4j_password)
     return _read_json(summary_path)
 
 
@@ -1245,8 +1270,6 @@ def run_taxonomy(
         params.neo4j_uri,
         "--neo4j-user",
         params.neo4j_user,
-        "--neo4j-password",
-        params.neo4j_password,
         "--neo4j-database",
         params.neo4j_database,
         "--labels-json",
@@ -1266,7 +1289,7 @@ def run_taxonomy(
         command.extend(["--prior-review-json", prior_review_json])
     if dry_run:
         command.append("--dry-run")
-    _run_command(command, iteration_dir / "taxonomy.log")
+    _run_command(command, iteration_dir / "taxonomy.log", neo4j_password=params.neo4j_password)
     return _read_json(summary_path)
 
 
@@ -1757,8 +1780,6 @@ def run_tier3(
         params.neo4j_uri,
         "--neo4j-user",
         params.neo4j_user,
-        "--neo4j-password",
-        params.neo4j_password,
         "--neo4j-database",
         params.neo4j_database,
         "--summary-json",
@@ -1768,7 +1789,7 @@ def run_tier3(
         command.extend(["--llm-routing-config", llm_routing_config])
     if dry_run:
         command.append("--dry-run")
-    _run_command(command, iteration_dir / "tier3.log")
+    _run_command(command, iteration_dir / "tier3.log", neo4j_password=params.neo4j_password)
     return _read_json(summary_path)
 
 
@@ -2107,11 +2128,7 @@ def _initialize_run_state(config: OrchestratorConfig, run_dir: Path) -> dict[str
         "plateau_streak": 0,
         "active_step": "initializing",
         "last_error": None,
-        "current_params": {
-            "tier2": asdict(Tier2Params()),
-            "taxonomy": asdict(TaxonomyParams()),
-            "tier3": asdict(Tier3Params()),
-        },
+        "current_params": _serialize_runtime_params(Tier2Params(), TaxonomyParams(), Tier3Params()),
         "current_tier2_catalog": _serialize_catalog(default_catalog),
         "last_tier2_catalog_proposal": None,
         "last_tier2_summary": None,
@@ -2131,9 +2148,11 @@ def _prepare_state(state: dict[str, Any], state_path: Path) -> dict[str, Any]:
     state.setdefault("iterations", [])
     state.setdefault(
         "current_params",
-        {"tier2": asdict(Tier2Params()), "taxonomy": asdict(TaxonomyParams()), "tier3": asdict(Tier3Params())},
+        _serialize_runtime_params(Tier2Params(), TaxonomyParams(), Tier3Params()),
     )
-    state["current_params"].setdefault("taxonomy", asdict(TaxonomyParams()))
+    state["current_params"].setdefault("taxonomy", _serialize_graph_params(TaxonomyParams()))
+    for parameter_values in state["current_params"].values():
+        parameter_values.pop("neo4j_password", None)
     state.setdefault("current_tier2_catalog", _serialize_catalog(_default_tier2_catalog()))
     state.setdefault("consecutive_passes", 0)
     state.setdefault("plateau_streak", 0)
@@ -2158,9 +2177,9 @@ def _prepare_state(state: dict[str, Any], state_path: Path) -> dict[str, Any]:
 def _restore_runtime_state(
     state: dict[str, Any],
 ) -> tuple[Tier2Params, TaxonomyParams, Tier3Params, Tier2LabelCatalog, int, int, int, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None, dict[str, Any] | None]:
-    tier2 = Tier2Params(**state["current_params"]["tier2"])
-    taxonomy = TaxonomyParams(**state["current_params"]["taxonomy"])
-    tier3 = Tier3Params(**state["current_params"]["tier3"])
+    tier2 = _restore_graph_params(Tier2Params, state["current_params"]["tier2"])
+    taxonomy = _restore_graph_params(TaxonomyParams, state["current_params"]["taxonomy"])
+    tier3 = _restore_graph_params(Tier3Params, state["current_params"]["tier3"])
     tier2_catalog = _deserialize_catalog(state.get("current_tier2_catalog"))
     consecutive_passes = int(state.get("consecutive_passes", 0))
     plateau_streak = int(state.get("plateau_streak", 0))
@@ -2302,9 +2321,9 @@ def _run_initial_iteration(
         iter0["tier3_summary"] = run_tier3(**tier3_kwargs)
         _write_json(state_path, state)
 
-    iter0["applied_params"] = {"tier2": asdict(tier2), "taxonomy": asdict(taxonomy), "tier3": asdict(tier3)}
+    iter0["applied_params"] = _serialize_runtime_params(tier2, taxonomy, tier3)
     state["next_iteration"] = 1
-    state["current_params"] = {"tier2": asdict(tier2), "taxonomy": asdict(taxonomy), "tier3": asdict(tier3)}
+    state["current_params"] = _serialize_runtime_params(tier2, taxonomy, tier3)
     state["current_tier2_catalog"] = _serialize_catalog(tier2_catalog)
     state["last_tier2_summary"] = iter0["tier2_summary"]
     state["last_taxonomy_summary"] = iter0["taxonomy_summary"]
@@ -2493,9 +2512,12 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
                 )
 
             if "applied_params" in iteration_record:
-                next_tier2 = Tier2Params(**iteration_record["applied_params"]["tier2"])
-                next_taxonomy = TaxonomyParams(**iteration_record["applied_params"].get("taxonomy", asdict(taxonomy)))
-                next_tier3 = Tier3Params(**iteration_record["applied_params"]["tier3"])
+                next_tier2 = _restore_graph_params(Tier2Params, iteration_record["applied_params"]["tier2"])
+                next_taxonomy = _restore_graph_params(
+                    TaxonomyParams,
+                    iteration_record["applied_params"].get("taxonomy", _serialize_graph_params(taxonomy)),
+                )
+                next_tier3 = _restore_graph_params(Tier3Params, iteration_record["applied_params"]["tier3"])
             else:
                 next_tier2, next_tier3 = apply_guardrails(
                     review=review,
@@ -2507,11 +2529,9 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
                     last_tier3_summary=last_tier3_summary,
                 )
                 next_taxonomy = taxonomy
-                iteration_record["applied_params"] = {
-                    "tier2": asdict(next_tier2),
-                    "taxonomy": asdict(next_taxonomy),
-                    "tier3": asdict(next_tier3),
-                }
+                iteration_record["applied_params"] = _serialize_runtime_params(
+                    next_tier2, next_taxonomy, next_tier3
+                )
                 _write_json(iteration_dir / "applied_params.json", iteration_record["applied_params"])
                 _write_json(state_path, state)
 
@@ -2537,11 +2557,9 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
                 ):
                     iteration_record["tier2_skipped"] = False
                     iteration_record.pop("tier2_skip_reason", None)
-                    state["current_params"] = {
-                        "tier2": asdict(next_tier2),
-                        "taxonomy": asdict(next_taxonomy),
-                        "tier3": asdict(next_tier3),
-                    }
+                    state["current_params"] = _serialize_runtime_params(
+                        next_tier2, next_taxonomy, next_tier3
+                    )
                     state["current_tier2_catalog"] = _serialize_catalog(next_catalog)
                     state["last_tier2_catalog_proposal"] = iteration_record.get("tier2_catalog_proposal")
                     state["active_step"] = f"iteration_{next_iteration}_tier2"
@@ -2645,11 +2663,7 @@ def run_self_improving(config: OrchestratorConfig) -> dict[str, Any]:
             last_review = {**review, "diagnosis": effective_diagnosis}
             next_iteration += 1
 
-            state["current_params"] = {
-                "tier2": asdict(tier2),
-                "taxonomy": asdict(taxonomy),
-                "tier3": asdict(tier3),
-            }
+            state["current_params"] = _serialize_runtime_params(tier2, taxonomy, tier3)
             state["current_tier2_catalog"] = _serialize_catalog(tier2_catalog)
             state["last_tier2_catalog_proposal"] = iteration_record.get("tier2_catalog_proposal")
             state["last_tier2_summary"] = last_tier2_summary
@@ -2736,7 +2750,21 @@ def parse_args() -> OrchestratorConfig:
 
 
 def main() -> None:
+    from notebooklm_graph_pipe.runtime.neo4j_connection import (
+        ResolvedNeo4jConnection,
+        verify_workflow_connection,
+    )
+
     config = parse_args()
+    connection = Tier2Params()
+    verify_workflow_connection(
+        ResolvedNeo4jConnection(
+            uri=connection.neo4j_uri,
+            username=connection.neo4j_user,
+            password=connection.neo4j_password,
+            database=connection.neo4j_database,
+        )
+    )
     state = run_self_improving(config=config)
     print(json.dumps({"status": state["status"], "run_dir": state["run_dir"]}, indent=2))
 

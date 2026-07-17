@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import warnings
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -22,6 +24,8 @@ class RegistryNeo4j:
     username: str
     password: str
     database: str
+    password_env: str = "NEO4J_PASSWORD"
+    deployment: str = "external"
     container_name: str | None = None
     container_id: str | None = None
     bolt_port: int | None = None
@@ -71,6 +75,12 @@ def load_dataset_registry(registry_path: str | Path | None = None) -> dict[str, 
             continue
         notebook = raw_entry.get("notebook") or {}
         neo4j = raw_entry.get("neo4j") or {}
+        if "password" in neo4j:
+            warnings.warn(
+                f"Dataset '{key}' uses a legacy plaintext Neo4j password; replace it with password_env.",
+                FutureWarning,
+                stacklevel=2,
+            )
         entries[str(key)] = DatasetRegistryEntry(
             key=str(key),
             notebook=RegistryNotebook(
@@ -80,8 +90,16 @@ def load_dataset_registry(registry_path: str | Path | None = None) -> dict[str, 
             neo4j=RegistryNeo4j(
                 uri=str(neo4j.get("uri") or ""),
                 username=str(neo4j.get("username") or neo4j.get("user") or ""),
-                password=str(neo4j.get("password") or ""),
+                password=str(
+                    neo4j.get("password")
+                    or os.environ.get(str(neo4j.get("password_env") or "NEO4J_PASSWORD"), "")
+                ),
                 database=str(neo4j.get("database") or ""),
+                password_env=str(neo4j.get("password_env") or "NEO4J_PASSWORD"),
+                deployment=str(
+                    neo4j.get("deployment")
+                    or ("managed-local" if neo4j.get("container_name") else "external")
+                ),
                 container_name=neo4j.get("container_name"),
                 container_id=neo4j.get("container_id"),
                 bolt_port=_to_int(neo4j.get("bolt_port")),

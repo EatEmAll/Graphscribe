@@ -221,6 +221,8 @@ def test_manifest_v2_round_trip(tmp_path: Path) -> None:
     assert state.notebook_id == "nb-1"
     assert state.neo4j is not None
     assert state.neo4j.uri == runtime.uri
+    assert state.neo4j.deployment == "managed-local"
+    assert "password" not in json.loads(manifest_path.read_text(encoding="utf-8"))["neo4j"]
     assert state.entries["paper.pdf"].staged_txt_name == "paper.txt"
 
 
@@ -613,7 +615,8 @@ def test_create_reuses_single_existing_notebook_and_manifest_runtime(monkeypatch
 
     assert exit_code == 0
     assert fake_cli.create_calls == []
-    assert fake_provisioner.ensure_runtime_calls == [("demo", sng.notebook_title_hash("demo"), runtime)]
+    assert fake_provisioner.ensure_runtime_calls[0][:2] == ("demo", sng.notebook_title_hash("demo"))
+    assert fake_provisioner.ensure_runtime_calls[0][2].password == ""
 
 
 def test_create_is_idempotent_for_unchanged_dataset(monkeypatch, tmp_path: Path) -> None:
@@ -657,7 +660,7 @@ def test_create_is_idempotent_for_unchanged_dataset(monkeypatch, tmp_path: Path)
     exit_code = sng.sync_dataset(args)
 
     assert exit_code == 0
-    assert fake_provisioner.ensure_runtime_calls == [("demo", sng.notebook_title_hash("demo"), runtime)]
+    assert fake_provisioner.ensure_runtime_calls[0][2].password == ""
     assert fake_cli.create_calls == []
     assert fake_cli.deleted == []
     assert fake_cli.added == []
@@ -770,7 +773,7 @@ def test_create_uses_manifest_pinned_notebook_when_titles_are_duplicated(monkeyp
 
     assert exit_code == 0
     assert fake_cli.create_calls == []
-    assert fake_provisioner.ensure_runtime_calls == [("demo", sng.notebook_title_hash("demo"), runtime)]
+    assert fake_provisioner.ensure_runtime_calls[0][2].password == ""
 
 
 def test_update_uses_manifest_runtime_and_retries_changed_sources(monkeypatch, tmp_path: Path) -> None:
@@ -814,7 +817,7 @@ def test_update_uses_manifest_runtime_and_retries_changed_sources(monkeypatch, t
     exit_code = sng.sync_dataset(args)
 
     assert exit_code == 0
-    assert fake_provisioner.ensure_runtime_calls == [("demo", sng.notebook_title_hash("demo"), runtime)]
+    assert fake_provisioner.ensure_runtime_calls[0][2].password == ""
     assert fake_cli.deleted == ["src-old"]
     assert fake_graph.retry_calls == [(staged_name, sng.RETRY_CONDITION)]
     assert build_calls == [(export_dir / "sources", runtime)]
@@ -880,7 +883,8 @@ def test_update_explicit_runtime_overrides_manifest_managed_runtime(monkeypatch,
     manifest = sng.load_manifest_state(export_dir / "manifest.json")
     assert manifest.neo4j is not None
     assert manifest.neo4j.uri == explicit_runtime.uri
-    assert manifest.neo4j.password == explicit_runtime.password
+    assert manifest.neo4j.password == ""
+    assert manifest.neo4j.password_env == "NEO4J_PASSWORD"
     assert manifest.neo4j.container_name is None
 
 
@@ -925,7 +929,7 @@ def test_update_is_idempotent_for_unchanged_dataset(monkeypatch, tmp_path: Path)
     exit_code = sng.sync_dataset(args)
 
     assert exit_code == 0
-    assert fake_provisioner.ensure_runtime_calls == [("demo", sng.notebook_title_hash("demo"), runtime)]
+    assert fake_provisioner.ensure_runtime_calls[0][2].password == ""
     assert fake_cli.deleted == []
     assert fake_cli.added == []
     assert fake_graph.retry_calls == []
@@ -975,7 +979,7 @@ def test_update_adds_new_sources_to_notebook_and_staged_exports(monkeypatch, tmp
     exit_code = sng.sync_dataset(args)
 
     assert exit_code == 0
-    assert fake_provisioner.ensure_runtime_calls == [("demo", sng.notebook_title_hash("demo"), runtime)]
+    assert fake_provisioner.ensure_runtime_calls[0][2].password == ""
     assert fake_cli.deleted == []
     assert fake_cli.added == [new_path]
     assert fake_graph.retry_calls == []
@@ -1346,4 +1350,32 @@ def test_sync_dataset_uses_dataset_registry_defaults(monkeypatch, tmp_path: Path
     assert manifest.notebook_title == "bench-imdb-scifi"
     assert manifest.neo4j is not None
     assert manifest.neo4j.uri == runtime.uri
-    assert build_calls == [(export_dir / "sources", manifest.neo4j)]
+    assert build_calls[0][0] == export_dir / "sources"
+    assert build_calls[0][1].password == runtime.password
+    assert manifest.neo4j.password == ""
+
+
+def test_dataset_registry_connection_defaults_do_not_override_environment(monkeypatch, tmp_path: Path) -> None:
+    entry = dr.DatasetRegistryEntry(
+        key="dataset",
+        notebook=dr.RegistryNotebook(id="nb-1", title="Dataset"),
+        neo4j=dr.RegistryNeo4j("bolt://registry:7687", "registry-user", "registry-secret", "registry-db"),
+    )
+    monkeypatch.setattr(sng, "load_dataset_entry", lambda *args, **kwargs: entry)
+    monkeypatch.setattr(sng, "default_export_dir", lambda key: tmp_path / "export")
+    monkeypatch.setenv("NEO4J_URI", "neo4j+s://hosted.example.com")
+    monkeypatch.setenv("NEO4J_USERNAME", "env-user")
+    monkeypatch.setenv("NEO4J_PASSWORD", "env-secret")
+    monkeypatch.setenv("NEO4J_DATABASE", "env-db")
+    args = sng.build_parser().parse_args(
+        ["create", "--dataset-dir", str(tmp_path), "--dataset-key", "dataset"]
+    )
+
+    sng.apply_dataset_registry_defaults(args)
+    runtime = sng.explicit_runtime_from_args(args)
+
+    assert runtime is not None
+    assert runtime.uri == "neo4j+s://hosted.example.com"
+    assert runtime.username == "env-user"
+    assert runtime.password == "env-secret"
+    assert runtime.database == "env-db"

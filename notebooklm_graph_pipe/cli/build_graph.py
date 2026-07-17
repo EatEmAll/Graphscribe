@@ -353,10 +353,10 @@ Examples:
     )
     parser.add_argument("--dataset-key", help="Optional dataset key from a local registry JSON")
     parser.add_argument("--registry-path", help="Path to an optional local dataset registry JSON")
-    parser.add_argument("--neo4j-uri", default=DEFAULT_NEO4J_URI, help="Neo4j Bolt URI")
-    parser.add_argument("--neo4j-user", default=DEFAULT_NEO4J_USER, help="Neo4j username")
-    parser.add_argument("--neo4j-password", default=DEFAULT_NEO4J_PASSWORD, help="Neo4j password")
-    parser.add_argument("--neo4j-database", default=DEFAULT_NEO4J_DATABASE, help="Neo4j database name")
+    parser.add_argument("--neo4j-uri", default=os.environ.get("NEO4J_URI", DEFAULT_NEO4J_URI), help="Neo4j Bolt URI")
+    parser.add_argument("--neo4j-user", default=os.environ.get("NEO4J_USERNAME", DEFAULT_NEO4J_USER), help="Neo4j username")
+    parser.add_argument("--neo4j-password", default=os.environ.get("NEO4J_PASSWORD", DEFAULT_NEO4J_PASSWORD), help="Neo4j password (prefer NEO4J_PASSWORD)")
+    parser.add_argument("--neo4j-database", default=os.environ.get("NEO4J_DATABASE", DEFAULT_NEO4J_DATABASE), help="Neo4j database name")
     parser.add_argument("--model", default="google_flash", help="LLM model name for extraction")
     parser.add_argument("--sources-dir", default=DEFAULT_SOURCES_DIR, help="Directory containing exported .txt source files")
     parser.add_argument("--parallel", type=int, default=1, help="Concurrent extractions")
@@ -419,11 +419,12 @@ def main() -> None:
         sources_dir=sources_dir,
     )
 
-    log("Checking local graph runtime...", "INFO")
+    log("Checking Neo4j graph runtime and APOC capabilities...", "INFO")
+    api.preflight_capabilities()
     if not api.health_check():
         log("Neo4j/runtime check failed", "ERROR")
         sys.exit(1)
-    log("Local runtime is healthy", "OK")
+    log("Neo4j runtime is healthy", "OK")
 
     with _temporary_embedding_dimension_override(graph_build_embedding.dimension):
         log("Connecting to Neo4j...", "INFO")

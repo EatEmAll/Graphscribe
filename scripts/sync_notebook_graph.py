@@ -7,9 +7,11 @@ import json
 import re
 import secrets
 import socket
+import os
 import subprocess
 import sys
 import time
+import warnings
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
@@ -22,7 +24,7 @@ if str(REPO_ROOT) not in sys.path:
 from notebooklm_graph_pipe.runtime.dataset_registry import default_export_dir, load_dataset_entry
 from notebooklm_graph_pipe.runtime.graph_builder_runtime import GraphBuilderAPI
 
-DEFAULT_NEO4J_IMAGE = "neo4j:5.23"
+DEFAULT_NEO4J_IMAGE = "neo4j:5.26.7"
 DEFAULT_DIRECT_NEO4J_URI = "bolt://127.0.0.1:7687"
 DEFAULT_NEO4J_USER = "neo4j"
 DEFAULT_NEO4J_PASSWORD = "password123"
@@ -31,7 +33,7 @@ MANAGED_CONTAINER_PREFIX = "llm-graph-builder-neo4j"
 MANAGED_LABEL = "io.llm_graph_builder.managed"
 PROJECT_SLUG_LABEL = "io.llm_graph_builder.project_slug"
 PROJECT_TITLE_HASH_LABEL = "io.llm_graph_builder.project_title_hash"
-MANIFEST_VERSION = 2
+MANIFEST_VERSION = 3
 RETRY_CONDITION = "delete_entities_and_start_from_beginning"
 
 
@@ -73,6 +75,8 @@ class Neo4jRuntime:
     username: str
     password: str
     database: str
+    password_env: str = "NEO4J_PASSWORD"
+    deployment: str = "external"
     container_name: str | None = None
     container_id: str | None = None
     bolt_port: int | None = None
@@ -290,7 +294,10 @@ def save_manifest(
         "removed_files": sorted(removed_files),
     }
     if neo4j_runtime is not None:
-        payload["neo4j"] = asdict(neo4j_runtime)
+        runtime_payload = asdict(neo4j_runtime)
+        runtime_payload.pop("password", None)
+        runtime_payload["deployment"] = "managed-local" if neo4j_runtime.container_name else "external"
+        payload["neo4j"] = runtime_payload
     manifest_path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -304,11 +311,22 @@ def load_manifest_state(manifest_path: Path) -> ManifestState:
     neo4j_data = data.get("neo4j")
     neo4j = None
     if neo4j_data:
+        if "password" in neo4j_data:
+            warnings.warn(
+                f"Legacy plaintext Neo4j password found in {manifest_path}; set password_env and resave manifest v3.",
+                FutureWarning,
+                stacklevel=2,
+            )
         neo4j = Neo4jRuntime(
             uri=str(neo4j_data["uri"]),
             username=str(neo4j_data.get("username") or neo4j_data.get("user") or DEFAULT_NEO4J_USER),
-            password=str(neo4j_data.get("password") or DEFAULT_NEO4J_PASSWORD),
+            password=str(neo4j_data.get("password") or ""),
             database=str(neo4j_data.get("database") or DEFAULT_NEO4J_DATABASE),
+            password_env=str(neo4j_data.get("password_env") or "NEO4J_PASSWORD"),
+            deployment=str(
+                neo4j_data.get("deployment")
+                or ("managed-local" if neo4j_data.get("container_name") else "external")
+            ),
             container_name=neo4j_data.get("container_name"),
             container_id=neo4j_data.get("container_id"),
             bolt_port=neo4j_data.get("bolt_port"),
@@ -390,6 +408,7 @@ class DockerNeo4jProvisioner:
             username="neo4j",
             password=password,
             database="neo4j",
+            deployment="managed-local",
             container_name=str(inspect_payload.get("Name", "")).lstrip("/"),
             container_id=str(inspect_payload.get("Id") or ""),
             bolt_port=bolt_port,
@@ -520,18 +539,26 @@ class DockerNeo4jProvisioner:
 
 
 def explicit_runtime_from_args(args: argparse.Namespace) -> Neo4jRuntime | None:
-    values = [args.neo4j_uri, args.neo4j_user, args.neo4j_password, args.neo4j_database]
-    if not any(values):
+    password_env = str(getattr(args, "neo4j_password_env", None) or "NEO4J_PASSWORD")
+    cli_values = [args.neo4j_uri, args.neo4j_user, args.neo4j_password, args.neo4j_database]
+    if not any(cli_values) and not os.environ.get("NEO4J_URI"):
         return None
+    uri = args.neo4j_uri or os.environ.get("NEO4J_URI")
+    user = args.neo4j_user or os.environ.get("NEO4J_USERNAME")
+    password = args.neo4j_password or os.environ.get(password_env)
+    database = args.neo4j_database or os.environ.get("NEO4J_DATABASE")
+    values = [uri, user, password, database]
     if not all(values):
         raise SyncError(
-            "Explicit Neo4j runtime requires --neo4j-uri, --neo4j-user, --neo4j-password, and --neo4j-database."
+            "External Neo4j runtime requires URI, username, password, and database via flags or NEO4J_* environment variables."
         )
     return Neo4jRuntime(
-        uri=str(args.neo4j_uri),
-        username=str(args.neo4j_user),
-        password=str(args.neo4j_password),
-        database=str(args.neo4j_database),
+        uri=str(uri),
+        username=str(user),
+        password=str(password),
+        database=str(database),
+        password_env=password_env,
+        deployment="external",
     )
 
 
@@ -544,8 +571,6 @@ def build_graph_command(args: argparse.Namespace, sources_dir: Path, runtime: Ne
         runtime.uri,
         "--neo4j-user",
         runtime.username,
-        "--neo4j-password",
-        runtime.password,
         "--neo4j-database",
         runtime.database,
         "--sources-dir",
@@ -579,7 +604,16 @@ def build_graph_command(args: argparse.Namespace, sources_dir: Path, runtime: Ne
 def run_build_graph(args: argparse.Namespace, sources_dir: Path, runtime: Neo4jRuntime) -> None:
     command = build_graph_command(args, sources_dir, runtime)
     log(f"Running graph build: {' '.join(command)}")
-    result = subprocess.run(command, text=True, check=False)
+    env = os.environ.copy()
+    env.update(
+        {
+            "NEO4J_URI": runtime.uri,
+            "NEO4J_USERNAME": runtime.username,
+            "NEO4J_PASSWORD": runtime.password,
+            "NEO4J_DATABASE": runtime.database,
+        }
+    )
+    result = subprocess.run(command, text=True, check=False, env=env)
     if result.returncode != 0:
         raise SyncError(f"notebooklm_graph_pipe.cli.build_graph failed with exit code {result.returncode}")
 
@@ -600,13 +634,14 @@ def apply_dataset_registry_defaults(args: argparse.Namespace) -> None:
         args.notebook_title = entry.notebook.title
     if not args.export_dir:
         args.export_dir = str(default_export_dir(args.dataset_key))
-    if not args.neo4j_uri:
+    password_env = str(getattr(args, "neo4j_password_env", None) or "NEO4J_PASSWORD")
+    if not args.neo4j_uri and not os.environ.get("NEO4J_URI"):
         args.neo4j_uri = entry.neo4j.uri
-    if not args.neo4j_user:
+    if not args.neo4j_user and not os.environ.get("NEO4J_USERNAME"):
         args.neo4j_user = entry.neo4j.username
-    if not args.neo4j_password:
+    if not args.neo4j_password and not os.environ.get(password_env):
         args.neo4j_password = entry.neo4j.password
-    if not args.neo4j_database:
+    if not args.neo4j_database and not os.environ.get("NEO4J_DATABASE"):
         args.neo4j_database = entry.neo4j.database
 
 
@@ -641,6 +676,13 @@ def resolve_runtime_for_create(
     explicit_runtime = explicit_runtime_from_args(args)
     if explicit_runtime is not None:
         return explicit_runtime
+    if manifest_state.neo4j is not None and not manifest_state.neo4j.container_name:
+        password = os.environ.get(manifest_state.neo4j.password_env, "")
+        if not password:
+            raise SyncError(
+                f"Set {manifest_state.neo4j.password_env} before using or upgrading the hosted Neo4j runtime recorded in the manifest."
+            )
+        return Neo4jRuntime(**{**asdict(manifest_state.neo4j), "password": password})
     return provisioner.ensure_runtime(project_slug, project_title_hash, manifest_state.neo4j)
 
 
@@ -655,6 +697,13 @@ def resolve_runtime_for_update(
     if explicit_runtime is not None:
         return explicit_runtime
     if manifest_state.neo4j is not None:
+        if not manifest_state.neo4j.container_name:
+            password = os.environ.get(manifest_state.neo4j.password_env, "")
+            if not password:
+                raise SyncError(
+                    f"Set {manifest_state.neo4j.password_env} before using or upgrading the hosted Neo4j runtime recorded in the manifest."
+                )
+            return Neo4jRuntime(**{**asdict(manifest_state.neo4j), "password": password})
         return provisioner.ensure_runtime(project_slug, project_title_hash, manifest_state.neo4j)
     raise SyncError(
         "Legacy manifests without Neo4j runtime metadata require explicit --neo4j-uri/--neo4j-user/--neo4j-password/--neo4j-database."
@@ -680,6 +729,7 @@ def build_parser() -> argparse.ArgumentParser:
         subparser.add_argument("--neo4j-uri", help="Explicit Neo4j Bolt URI")
         subparser.add_argument("--neo4j-user", help="Explicit Neo4j username")
         subparser.add_argument("--neo4j-password", help="Explicit Neo4j password")
+        subparser.add_argument("--neo4j-password-env", default="NEO4J_PASSWORD", help="Environment variable containing the Neo4j password")
         subparser.add_argument("--neo4j-database", help="Explicit Neo4j database")
         subparser.add_argument("--model", default="google_flash", help="Graph extraction model name")
         subparser.add_argument("--parallel", type=int, default=1, help="Concurrent extractions")
@@ -743,6 +793,8 @@ def sync_dataset(args: argparse.Namespace) -> int:
         neo4j_database=runtime.database,
         sources_dir=export_dir / "sources",
     )
+    if hasattr(graph_api, "preflight_capabilities"):
+        graph_api.preflight_capabilities()
     graph_sources = {
         row.get("fileName") or row.get("name") or row.get("file_name")
         for row in graph_api.sources_list()
@@ -805,7 +857,32 @@ def sync_dataset(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = build_parser().parse_args()
-    return sync_dataset(args)
+    print(
+        "DEPRECATED: sync_notebook_graph.py now delegates to sync_corpus_graph.py; "
+        "use --corpus-title/--corpus-key with the new command.",
+        file=sys.stderr,
+    )
+    if args.notebook_id and not args.notebook_title:
+        raise SyncError("--notebook-id cannot identify a local corpus. Provide --notebook-title or use --corpus-key.")
+    from scripts.sync_corpus_graph import main as sync_corpus_main
+
+    delegated = [args.command, "--dataset-dir", args.dataset_dir]
+    if args.notebook_title:
+        delegated.extend(["--corpus-title", args.notebook_title])
+    if args.dataset_key:
+        delegated.extend(["--corpus-key", args.dataset_key])
+    if args.export_dir:
+        delegated.extend(["--export-dir", args.export_dir])
+    for option, value in (
+        ("--neo4j-uri", args.neo4j_uri),
+        ("--neo4j-user", args.neo4j_user),
+        ("--neo4j-password", args.neo4j_password),
+        ("--neo4j-password-env", getattr(args, "neo4j_password_env", None)),
+        ("--neo4j-database", args.neo4j_database),
+    ):
+        if value:
+            delegated.extend([option, str(value)])
+    return sync_corpus_main(delegated)
 
 
 if __name__ == "__main__":

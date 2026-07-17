@@ -163,7 +163,7 @@ def run_backend_postprocess(
     embedding_model: str,
 ) -> None:
     if not api.health_check():
-        raise WorkflowError("Local graph runtime health check failed.")
+        raise WorkflowError("Neo4j graph runtime health check failed.")
 
     response = api.connect(embedding_provider, embedding_model)
     if response.get("status") != "Success":
@@ -246,10 +246,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run graph indexes followed by self-improving consolidation.")
     parser.add_argument("--dataset-key", help="Optional dataset key from a local registry JSON")
     parser.add_argument("--registry-path", help="Path to an optional local dataset registry JSON")
-    parser.add_argument("--neo4j-uri", default=DEFAULT_NEO4J_URI, help="Neo4j Bolt URI")
-    parser.add_argument("--neo4j-user", default=DEFAULT_NEO4J_USER, help="Neo4j username")
-    parser.add_argument("--neo4j-password", default=DEFAULT_NEO4J_PASSWORD, help="Neo4j password")
-    parser.add_argument("--neo4j-database", default=DEFAULT_NEO4J_DATABASE, help="Neo4j database name")
+    parser.add_argument("--neo4j-uri", default=os.environ.get("NEO4J_URI", DEFAULT_NEO4J_URI), help="Neo4j Bolt URI")
+    parser.add_argument("--neo4j-user", default=os.environ.get("NEO4J_USERNAME", DEFAULT_NEO4J_USER), help="Neo4j username")
+    parser.add_argument("--neo4j-password", default=os.environ.get("NEO4J_PASSWORD", DEFAULT_NEO4J_PASSWORD), help="Neo4j password (prefer NEO4J_PASSWORD)")
+    parser.add_argument("--neo4j-database", default=os.environ.get("NEO4J_DATABASE", DEFAULT_NEO4J_DATABASE), help="Neo4j database name")
     parser.add_argument("--embedding-provider", default=None, help="Embedding provider override")
     parser.add_argument("--embedding-model", default=None, help="Embedding model override")
     parser.add_argument("--llm-routing-config", default=None, help="Optional JSON config for role-based LLM routing")
@@ -319,6 +319,7 @@ def main() -> int:
         neo4j_password=args.neo4j_password,
         neo4j_database=args.neo4j_database,
     )
+    api.preflight_capabilities()
     with _temporary_embedding_dimension_override(graph_build_embedding.dimension):
         run_backend_postprocess(
             api,

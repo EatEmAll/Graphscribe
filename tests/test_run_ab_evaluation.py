@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -253,11 +254,55 @@ def test_build_hybrid_overrides_uses_manifest_runtime(tmp_path: Path) -> None:
     overrides = ab.build_hybrid_overrides(entry)
 
     assert overrides == [
-        'mcp_servers.neo4j.env.NEO4J_URI="bolt://127.0.0.1:7687"',
-        'mcp_servers.neo4j.env.NEO4J_USERNAME="neo4j"',
-        'mcp_servers.neo4j.env.NEO4J_PASSWORD="secret"',
-        'mcp_servers.neo4j.env.NEO4J_DATABASE="neo4j"',
+        "mcp_servers.neo4j.env={}",
+        'mcp_servers.neo4j.env_vars=["NEO4J_URI","NEO4J_USERNAME","NEO4J_PASSWORD","NEO4J_DATABASE"]',
     ]
+    assert "secret" not in " ".join(overrides)
+
+
+def test_run_codex_exec_passes_neo4j_secret_only_in_child_environment(monkeypatch, tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "project_slug": "hosted",
+                "notebook": {"id": "nb-1", "title": "Hosted"},
+                "neo4j": {
+                "uri": "neo4j+s://hosted.databases.neo4j.io",
+                "username": "neo4j",
+                "password": "environment-only-secret",
+                "database": "neo4j",
+            },
+            }
+        ),
+        encoding="utf-8",
+    )
+    _, entry = ab.load_manifest_dataset(manifest_path)
+    captured: dict[str, object] = {}
+    answer_path = tmp_path / "answer.md"
+
+    def fake_run(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        answer_path.write_text("answer", encoding="utf-8")
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(ab, "resolve_codex_launcher", lambda: ["codex"])
+    monkeypatch.setattr(ab.subprocess, "run", fake_run)
+
+    ab.run_codex_exec(
+        prompt_text="prompt",
+        temp_root=tmp_path / "temp",
+        answer_path=answer_path,
+        events_path=tmp_path / "events.jsonl",
+        model="gpt-5.4",
+        config_overrides=ab.build_hybrid_overrides(entry),
+        dataset_entry=entry,
+        timeout_seconds=30,
+    )
+
+    assert "environment-only-secret" not in " ".join(captured["command"])
+    assert captured["env"]["NEO4J_PASSWORD"] == "environment-only-secret"
 
 
 def test_load_manifest_dataset_rejects_missing_neo4j(tmp_path: Path) -> None:
@@ -267,8 +312,69 @@ def test_load_manifest_dataset_rejects_missing_neo4j(tmp_path: Path) -> None:
         encoding="utf-8",
     )
 
-    with pytest.raises(ab.BenchmarkError, match="neo4j runtime"):
+    with pytest.raises(ab.BenchmarkError, match="Neo4j connection fields"):
         ab.load_manifest_dataset(manifest_path)
+
+
+def test_load_manifest_dataset_resolves_password_environment(monkeypatch, tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "project_slug": "hosted",
+                "notebook": {"id": "nb-1", "title": "Hosted"},
+                "neo4j": {
+                    "uri": "neo4j+s://hosted.databases.neo4j.io",
+                    "username": "neo4j",
+                    "database": "neo4j",
+                    "password_env": "HOSTED_NEO4J_PASSWORD",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HOSTED_NEO4J_PASSWORD", "secret-from-env")
+
+    _, entry = ab.load_manifest_dataset(manifest_path)
+
+    assert entry.neo4j.password == "secret-from-env"
+    assert entry.neo4j.password_env == "HOSTED_NEO4J_PASSWORD"
+
+
+def test_load_manifest_dataset_recovers_managed_container_password(monkeypatch, tmp_path: Path) -> None:
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "project_slug": "local",
+                "notebook": {"id": "nb-1", "title": "Local"},
+                "neo4j": {
+                    "uri": "bolt://127.0.0.1:17687",
+                    "username": "neo4j",
+                    "database": "neo4j",
+                    "container_name": "managed-neo4j",
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("NEO4J_PASSWORD", raising=False)
+    monkeypatch.setattr(
+        ab.subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            args=args[0],
+            returncode=0,
+            stdout=json.dumps([{"Config": {"Env": ["NEO4J_AUTH=neo4j/container-secret"]}}]),
+            stderr="",
+        ),
+    )
+
+    _, entry = ab.load_manifest_dataset(manifest_path)
+
+    assert entry.neo4j.password == "container-secret"
 
 
 def test_load_question_plan_file_normalizes_ids_and_defaults(tmp_path: Path) -> None:

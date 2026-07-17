@@ -323,6 +323,29 @@ def test_validate_codex_taxonomy_tail_payload_round_trip() -> None:
     assert validated["decisions"][1]["relation"] == "SUBCLASS_OF"
 
 
+def test_run_state_omits_neo4j_password_and_restores_it_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("NEO4J_PASSWORD", "hosted-secret")
+    state = csi._initialize_run_state(csi.OrchestratorConfig(), tmp_path)
+
+    assert "hosted-secret" not in json.dumps(state)
+    assert all("neo4j_password" not in values for values in state["current_params"].values())
+
+    tier2, taxonomy, tier3, *_ = csi._restore_runtime_state(state)
+    assert {tier2.neo4j_password, taxonomy.neo4j_password, tier3.neo4j_password} == {"hosted-secret"}
+
+
+def test_prepare_state_scrubs_legacy_neo4j_password(tmp_path: Path) -> None:
+    state = csi._initialize_run_state(csi.OrchestratorConfig(), tmp_path)
+    state["current_params"]["tier2"]["neo4j_password"] = "legacy-secret"
+    state_path = tmp_path / "run_state.json"
+
+    csi._prepare_state(state, state_path)
+
+    assert "legacy-secret" not in state_path.read_text(encoding="utf-8")
+
 def test_run_codex_taxonomy_tail_retries_invalid_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     queue_path = tmp_path / "taxonomy_codex_queue.jsonl"
     queue_path.write_text(
