@@ -179,7 +179,13 @@ def read_schema_signature(driver: Any, database: str) -> dict[str, dict[str, Any
         constraints = {
             str(row["name"]): {
                 "kind": "constraint",
-                "type": str(row["type"]),
+                # Neo4j Community and Aura expose the same property-uniqueness
+                # constraint with different type names.
+                "type": (
+                    "UNIQUENESS"
+                    if str(row["type"]) == "NODE_PROPERTY_UNIQUENESS"
+                    else str(row["type"])
+                ),
                 "entity_type": str(row["entityType"]),
                 "labels_or_types": sorted(str(item) for item in row["labelsOrTypes"]),
                 "properties": [str(item) for item in row["properties"]],
