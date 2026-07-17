@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 AGENT_CLIENTS = {"codex", "claude", "opencode"}
-SINGLE_PROMPT_CLIENTS = {"genai", "openai", "openrouter"}
+SINGLE_PROMPT_CLIENTS = {"genai", "openai", "openrouter", "codex", "claude"}
 EMBEDDING_CLIENTS = {"genai", "openai", "openrouter"}
 
 AGENT_REVIEW_ROLE = "agents.review"
@@ -42,6 +42,7 @@ class AgentRoleConfig:
 class PromptRoleConfig:
     client: str
     model: str
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -141,6 +142,7 @@ def resolve_prompt_role(
     *,
     default_client: str,
     default_model: str,
+    default_reasoning_effort: str | None = None,
 ) -> PromptRoleConfig:
     config = load_routing_config(config_path)
     raw = _lookup_role(config, role) or {}
@@ -148,7 +150,16 @@ def resolve_prompt_role(
     model = str(raw.get("model", default_model)).strip()
     if not model:
         raise ValueError(f"Role '{role}' must define a non-empty model.")
-    return PromptRoleConfig(client=client, model=model)
+    inherited_effort = default_reasoning_effort if client == default_client else None
+    reasoning_effort_raw = raw.get("reasoning_effort", inherited_effort)
+    reasoning_effort = str(reasoning_effort_raw).strip().lower() if reasoning_effort_raw is not None else None
+    if reasoning_effort not in {None, "low", "medium", "high", "xhigh"}:
+        raise ValueError(f"Role '{role}' has invalid reasoning_effort '{reasoning_effort_raw}'.")
+    if reasoning_effort and client not in {"codex", "claude"}:
+        raise ValueError(f"Role '{role}' can only set reasoning_effort for a subscription CLI client.")
+    if client == "claude" and reasoning_effort == "xhigh":
+        raise ValueError(f"Role '{role}' cannot use xhigh reasoning_effort with Claude CLI.")
+    return PromptRoleConfig(client=client, model=model, reasoning_effort=reasoning_effort)
 
 
 def resolve_embedding_role(

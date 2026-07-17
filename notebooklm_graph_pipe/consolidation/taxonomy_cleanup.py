@@ -31,8 +31,10 @@ DEFAULT_NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "password123")
 DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 
-MODEL_NAME = os.environ.get("TAXONOMY_MODEL_NAME", "gemini-3.1-flash-lite-preview")
+PRIMARY_CLIENT = os.environ.get("TAXONOMY_PRIMARY_CLIENT", "openrouter")
+MODEL_NAME = os.environ.get("TAXONOMY_MODEL_NAME", "minimax/minimax-m3")
 SECOND_STAGE_MODEL_NAME = os.environ.get("TAXONOMY_SECOND_STAGE_MODEL_NAME", "gemini-3.1-pro-preview")
+SECOND_STAGE_CLIENT = os.environ.get("TAXONOMY_SECOND_STAGE_CLIENT", "genai")
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("TAXONOMY_LOW_CONFIDENCE_THRESHOLD", "0.7"))
 APPLY_CONFIDENCE_THRESHOLD = float(os.environ.get("TAXONOMY_APPLY_CONFIDENCE_THRESHOLD", "0.85"))
 MODEL_MAX_ATTEMPTS = int(os.environ.get("TAXONOMY_MODEL_MAX_ATTEMPTS", "3"))
@@ -688,6 +690,7 @@ def _classify_once(
         _resolve_client(clients, role_config.client),
         client_name=role_config.client,
         model_name=role_config.model,
+        reasoning_effort=role_config.reasoning_effort,
         prompt=prompt,
         system_instruction=build_system_prompt(label_catalog, relation_only=relation_only),
         max_output_tokens=220,
@@ -1059,13 +1062,13 @@ def run(
     primary_role_config = resolve_prompt_role(
         llm_routing_config,
         TAXONOMY_PRIMARY_ROLE,
-        default_client="genai",
+        default_client=PRIMARY_CLIENT,
         default_model=MODEL_NAME,
     )
     secondary_role_config = resolve_prompt_role(
         llm_routing_config,
         TAXONOMY_SECONDARY_ROLE,
-        default_client="genai",
+        default_client=SECOND_STAGE_CLIENT,
         default_model=SECOND_STAGE_MODEL_NAME,
     )
     label_catalog = load_label_catalog(labels_json)

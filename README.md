@@ -267,9 +267,11 @@ The default local graph-build embedding is `sentence-transformer` with `all-Mini
 | `genai` / `gemini` | `GOOGLE_API_KEY` | Whenever `scripts/postprocess_graph.py` or the default consolidation flow uses Google-backed prompt / judge / embedding roles, or whenever `--llm-routing-config` selects Google-backed roles | `google-genai`, `langchain-google-vertexai` |
 | `openai` | `OPENAI_API_KEY` | Whenever the routing config selects OpenAI for embeddings or single-prompt roles | `openai`, `langchain-openai` |
 | `openrouter` | `OPENROUTER_API_KEY` | Whenever the routing config selects OpenRouter for embeddings or single-prompt roles | `openai`, `langchain-openai` |
+| `codex` | ChatGPT subscription login (`codex login`) | Subscription-backed single-prompt roles; the CLI is invoked non-interactively with read-only sandboxing and structured JSON output | Codex CLI |
+| `claude` | Claude subscription login (`claude auth login`) | Subscription-backed single-prompt roles; the CLI is invoked non-interactively with tools disabled and structured JSON output | Claude Code CLI |
 | `sentence-transformer` | None | Default local graph-build embeddings, or whenever local embeddings are selected explicitly | `sentence-transformers`, `langchain-huggingface` |
 
-Without `--llm-routing-config`, `scripts/postprocess_graph.py` and the default consolidation flow use Google-backed prompt, judge, and embedding roles, so those paths require `GOOGLE_API_KEY`. The main sync, graph-build, and A/B evaluation flow does not require it by default.
+Without `--llm-routing-config`, Tier 2, taxonomy, and Tier 3 use `minimax/minimax-m3` through OpenRouter for their primary prompt roles. Tier 2 escalates to subscription-authenticated `gpt-5.6-luna` through Codex at low reasoning effort, while Tier 3 escalates to the same model at medium effort. Taxonomy's secondary role remains `gemini-3.1-pro-preview`, and Tier 3 embeddings remain `gemini-embedding-001`, so default consolidation requires `OPENROUTER_API_KEY`, `GOOGLE_API_KEY`, and an authenticated Codex CLI. Set `reasoning_effort` to `low`, `medium`, `high`, or `xhigh` on a Codex single-prompt role; Claude supports `low`, `medium`, or `high`.
 
 Supported agent runtimes for review or taxonomy-tail steps are `codex`, `claude`, and `opencode`. Without a routing config, consolidation defaults to `codex`.
 

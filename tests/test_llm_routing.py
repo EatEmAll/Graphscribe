@@ -120,6 +120,57 @@ def test_resolve_prompt_role_rejects_unknown_client(tmp_path: Path) -> None:
         )
 
 
+def test_resolve_prompt_role_accepts_subscription_client_effort(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        {
+            "single_prompt": {
+                "tier3_judge_secondary": {
+                    "client": "codex",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "medium",
+                }
+            }
+        },
+    )
+
+    resolved = routing.resolve_prompt_role(
+        config_path,
+        routing.TIER3_JUDGE_SECONDARY_ROLE,
+        default_client="genai",
+        default_model="gemini-3-flash-preview",
+    )
+
+    assert resolved == routing.PromptRoleConfig(
+        client="codex",
+        model="gpt-5.6-luna",
+        reasoning_effort="medium",
+    )
+
+
+def test_resolve_prompt_role_rejects_effort_for_api_client(tmp_path: Path) -> None:
+    config_path = _write_config(
+        tmp_path,
+        {
+            "single_prompt": {
+                "tier2_primary": {
+                    "client": "openrouter",
+                    "model": "minimax/minimax-m3",
+                    "reasoning_effort": "low",
+                }
+            }
+        },
+    )
+
+    with pytest.raises(ValueError, match="subscription CLI"):
+        routing.resolve_prompt_role(
+            config_path,
+            routing.TIER2_PRIMARY_ROLE,
+            default_client="genai",
+            default_model="gemini-3.1-flash-lite-preview",
+        )
+
+
 def test_load_embedding_model_openrouter_honors_dimension_override(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, object] = {}
 

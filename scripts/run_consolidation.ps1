@@ -131,12 +131,12 @@ if ($LlmRoutingConfig) {
 }
 
 $promptRoles = @(
-    @("single_prompt", "tier2_primary", "client", "genai"),
-    @("single_prompt", "tier2_secondary", "client", "genai"),
-    @("single_prompt", "taxonomy_primary", "client", "genai"),
+    @("single_prompt", "tier2_primary", "client", "openrouter"),
+    @("single_prompt", "tier2_secondary", "client", "codex"),
+    @("single_prompt", "taxonomy_primary", "client", "openrouter"),
     @("single_prompt", "taxonomy_secondary", "client", "genai"),
-    @("single_prompt", "tier3_judge_primary", "client", "genai"),
-    @("single_prompt", "tier3_judge_secondary", "client", "genai"),
+    @("single_prompt", "tier3_judge_primary", "client", "openrouter"),
+    @("single_prompt", "tier3_judge_secondary", "client", "codex"),
     @("embeddings", "tier3", "client", "genai")
 )
 

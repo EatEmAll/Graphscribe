@@ -112,12 +112,12 @@ def resolve_codex_executable(codex_bin: str) -> str:
 
 def _required_consolidation_api_envs(config: ConsolidationConfig) -> list[str]:
     prompt_roles = [
-        resolve_prompt_role(config.llm_routing_config, TIER2_PRIMARY_ROLE, default_client="genai", default_model="gemini-3.1-flash-lite-preview"),
-        resolve_prompt_role(config.llm_routing_config, TIER2_SECONDARY_ROLE, default_client="genai", default_model="gemini-3-flash-preview"),
-        resolve_prompt_role(config.llm_routing_config, TAXONOMY_PRIMARY_ROLE, default_client="genai", default_model="gemini-3.1-flash-lite-preview"),
+        resolve_prompt_role(config.llm_routing_config, TIER2_PRIMARY_ROLE, default_client="openrouter", default_model="minimax/minimax-m3"),
+        resolve_prompt_role(config.llm_routing_config, TIER2_SECONDARY_ROLE, default_client="codex", default_model="gpt-5.6-luna", default_reasoning_effort="low"),
+        resolve_prompt_role(config.llm_routing_config, TAXONOMY_PRIMARY_ROLE, default_client="openrouter", default_model="minimax/minimax-m3"),
         resolve_prompt_role(config.llm_routing_config, TAXONOMY_SECONDARY_ROLE, default_client="genai", default_model="gemini-3.1-pro-preview"),
-        resolve_prompt_role(config.llm_routing_config, TIER3_JUDGE_PRIMARY_ROLE, default_client="genai", default_model="gemini-3.1-flash-lite-preview"),
-        resolve_prompt_role(config.llm_routing_config, TIER3_JUDGE_SECONDARY_ROLE, default_client="genai", default_model="gemini-3-flash-preview"),
+        resolve_prompt_role(config.llm_routing_config, TIER3_JUDGE_PRIMARY_ROLE, default_client="openrouter", default_model="minimax/minimax-m3"),
+        resolve_prompt_role(config.llm_routing_config, TIER3_JUDGE_SECONDARY_ROLE, default_client="codex", default_model="gpt-5.6-luna", default_reasoning_effort="medium"),
     ]
     embedding_role = resolve_embedding_role(
         config.llm_routing_config,

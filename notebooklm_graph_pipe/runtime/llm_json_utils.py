@@ -4,7 +4,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
+import tempfile
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
@@ -13,6 +17,20 @@ from google.genai import types
 from openai import OpenAI
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+CLI_JSON_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
+DEFAULT_CLI_TIMEOUT_SECONDS = 120.0
+
+
+@dataclass(frozen=True)
+class SubscriptionCliClient:
+    name: str
+    executable: str
+    timeout_seconds: float = DEFAULT_CLI_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
+class CliResponse:
+    output_text: str
 
 
 def extract_response_text(response: Any) -> str:
@@ -137,6 +155,7 @@ def generate_json_payload(
     system_instruction: str,
     max_output_tokens: int,
     temperature: float = 0.0,
+    reasoning_effort: str | None = None,
     max_attempts: int = 1,
     retry_sleep_seconds: float = 0.0,
     retry_on_exception: Callable[[Exception], bool] | None = None,
@@ -153,6 +172,7 @@ def generate_json_payload(
                 system_instruction=system_instruction,
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
+                reasoning_effort=reasoning_effort,
             )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -203,6 +223,23 @@ def build_single_prompt_clients(*client_names: str) -> dict[str, Any]:
                 raise RuntimeError("Set OPENROUTER_API_KEY environment variable.")
             clients[client_name] = build_openai_compatible_client(api_key=api_key, base_url=OPENROUTER_BASE_URL)
             continue
+        if client_name in {"codex", "claude"}:
+            executable = shutil.which(client_name)
+            if not executable:
+                raise RuntimeError(f"Install the {client_name} CLI and ensure it is available on PATH.")
+            timeout_raw = os.environ.get("LLM_CLI_TIMEOUT_SECONDS", str(DEFAULT_CLI_TIMEOUT_SECONDS))
+            try:
+                timeout_seconds = float(timeout_raw)
+            except ValueError as exc:
+                raise RuntimeError("LLM_CLI_TIMEOUT_SECONDS must be a number.") from exc
+            if timeout_seconds <= 0:
+                raise RuntimeError("LLM_CLI_TIMEOUT_SECONDS must be positive.")
+            clients[client_name] = SubscriptionCliClient(
+                name=client_name,
+                executable=executable,
+                timeout_seconds=timeout_seconds,
+            )
+            continue
         raise ValueError(f"Unsupported single-prompt client '{raw_client_name}'.")
     return clients
 
@@ -216,6 +253,7 @@ def _generate_structured_response(
     system_instruction: str,
     max_output_tokens: int,
     temperature: float,
+    reasoning_effort: str | None = None,
 ) -> Any:
     normalized_client = client_name.strip().lower()
     if normalized_client == "genai":
@@ -239,4 +277,123 @@ def _generate_structured_response(
             max_output_tokens=max_output_tokens,
             temperature=temperature,
         )
+    if normalized_client in {"codex", "claude"}:
+        if not isinstance(client, SubscriptionCliClient) or client.name != normalized_client:
+            raise TypeError(f"Expected a {normalized_client} subscription CLI client.")
+        return _generate_cli_response(
+            client,
+            model_name=model_name,
+            prompt=prompt,
+            system_instruction=system_instruction,
+            reasoning_effort=reasoning_effort,
+        )
     raise ValueError(f"Unsupported single-prompt client '{client_name}'.")
+
+
+def _generate_cli_response(
+    client: SubscriptionCliClient,
+    *,
+    model_name: str,
+    prompt: str,
+    system_instruction: str,
+    reasoning_effort: str | None,
+) -> CliResponse:
+    combined_prompt = (
+        f"{system_instruction.strip()}\n\n"
+        "Return only one JSON object that satisfies the supplied JSON schema.\n\n"
+        f"{prompt.strip()}"
+    )
+    schema_json = json.dumps(CLI_JSON_SCHEMA, separators=(",", ":"))
+
+    with tempfile.TemporaryDirectory(prefix=f"llm-{client.name}-") as temp_dir:
+        temp_path = Path(temp_dir)
+        if client.name == "codex":
+            schema_path = temp_path / "output-schema.json"
+            output_path = temp_path / "response.json"
+            schema_path.write_text(schema_json, encoding="utf-8")
+            args = [
+                client.executable,
+                "--ask-for-approval",
+                "never",
+                "--sandbox",
+                "read-only",
+                "exec",
+                "--ephemeral",
+                "--skip-git-repo-check",
+                "--color",
+                "never",
+                "--output-schema",
+                str(schema_path),
+                "--output-last-message",
+                str(output_path),
+                "--model",
+                model_name,
+            ]
+            if reasoning_effort:
+                args.extend(["--config", f'model_reasoning_effort="{reasoning_effort}"'])
+            args.append("-")
+            _run_cli(args, prompt=combined_prompt, cwd=temp_path, timeout_seconds=client.timeout_seconds)
+            if not output_path.exists():
+                raise RuntimeError("Codex CLI did not write its final response.")
+            return CliResponse(output_text=output_path.read_text(encoding="utf-8").strip())
+
+        args = [
+            client.executable,
+            "--print",
+            "--no-session-persistence",
+            "--permission-mode",
+            "dontAsk",
+            "--tools",
+            "",
+            "--output-format",
+            "json",
+            "--json-schema",
+            schema_json,
+            "--model",
+            model_name,
+        ]
+        if reasoning_effort:
+            args.extend(["--effort", reasoning_effort])
+        completed = _run_cli(args, prompt=combined_prompt, cwd=temp_path, timeout_seconds=client.timeout_seconds)
+        try:
+            envelope = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError("Claude CLI returned an invalid JSON envelope.") from exc
+        structured_output = envelope.get("structured_output") if isinstance(envelope, dict) else None
+        if isinstance(structured_output, dict):
+            return CliResponse(output_text=json.dumps(structured_output, ensure_ascii=True))
+        result = envelope.get("result") if isinstance(envelope, dict) else None
+        if isinstance(result, str):
+            return CliResponse(output_text=result.strip())
+        raise RuntimeError("Claude CLI response did not contain structured output.")
+
+
+def _run_cli(
+    args: list[str],
+    *,
+    prompt: str,
+    cwd: Path,
+    timeout_seconds: float,
+) -> subprocess.CompletedProcess[str]:
+    try:
+        completed = subprocess.run(
+            args,
+            input=prompt,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+            shell=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"{Path(args[0]).stem} CLI timed out after {timeout_seconds:g} seconds.") from exc
+    if completed.returncode != 0:
+        details = (completed.stderr or completed.stdout).strip()
+        if len(details) > 500:
+            details = details[-500:]
+        suffix = f": {details}" if details else ""
+        raise RuntimeError(f"{Path(args[0]).stem} CLI exited with code {completed.returncode}{suffix}")
+    return completed

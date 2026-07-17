@@ -40,11 +40,14 @@ DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 EMBED_MODEL = os.environ.get("TIER3_EMBED_MODEL", "gemini-embedding-001")
+PRIMARY_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_PRIMARY", "openrouter")
 PRIMARY_JUDGE_MODEL = os.environ.get(
     "TIER3_JUDGE_MODEL_PRIMARY",
-    os.environ.get("TIER3_JUDGE_MODEL", "gemini-3.1-flash-lite-preview"),
+    os.environ.get("TIER3_JUDGE_MODEL", "minimax/minimax-m3"),
 )
-SECOND_STAGE_JUDGE_MODEL = os.environ.get("TIER3_JUDGE_MODEL_SECOND_STAGE", "gemini-3-flash-preview")
+SECOND_STAGE_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_SECOND_STAGE", "codex")
+SECOND_STAGE_JUDGE_MODEL = os.environ.get("TIER3_JUDGE_MODEL_SECOND_STAGE", "gpt-5.6-luna")
+SECOND_STAGE_JUDGE_REASONING_EFFORT = os.environ.get("TIER3_JUDGE_REASONING_EFFORT_SECOND_STAGE", "medium")
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("TIER3_LOW_CONFIDENCE_THRESHOLD", "0.72"))
 MODEL_MAX_ATTEMPTS = int(os.environ.get("TIER3_MODEL_MAX_ATTEMPTS", "3"))
 MODEL_RETRY_SLEEP_SECONDS = float(os.environ.get("TIER3_MODEL_RETRY_SLEEP_SECONDS", "1.0"))
@@ -288,6 +291,7 @@ def _build_judge_cache_key(
     *,
     client_name: str,
     model_name: str,
+    reasoning_effort: str | None,
     entity_a: dict[str, Any],
     entity_b: dict[str, Any],
 ) -> str:
@@ -296,6 +300,7 @@ def _build_judge_cache_key(
         payload={
             "client_name": client_name,
             "model_name": model_name,
+            "reasoning_effort": reasoning_effort,
             "system_instruction": JUDGE_SYSTEM,
             "entity_a": entity_a,
             "entity_b": entity_b,
@@ -323,6 +328,7 @@ def _judge_once(
     cache_key = _build_judge_cache_key(
         client_name=role_config.client,
         model_name=role_config.model,
+        reasoning_effort=role_config.reasoning_effort,
         entity_a=normalized_a,
         entity_b=normalized_b,
     )
@@ -335,6 +341,7 @@ def _judge_once(
         _resolve_client(clients, role_config.client),
         client_name=role_config.client,
         model_name=role_config.model,
+        reasoning_effort=role_config.reasoning_effort,
         prompt=_build_prompt(normalized_a, normalized_b),
         system_instruction=JUDGE_SYSTEM,
         max_output_tokens=120,
@@ -577,7 +584,7 @@ def run(
     embedding_role_config = resolve_embedding_role(
         llm_routing_config,
         TIER3_EMBEDDING_ROLE,
-        default_client="genai",
+        default_client=PRIMARY_JUDGE_CLIENT,
         default_model=EMBED_MODEL,
     )
     primary_judge_role_config = resolve_prompt_role(
@@ -589,8 +596,9 @@ def run(
     secondary_judge_role_config = resolve_prompt_role(
         llm_routing_config,
         TIER3_JUDGE_SECONDARY_ROLE,
-        default_client="genai",
+        default_client=SECOND_STAGE_JUDGE_CLIENT,
         default_model=SECOND_STAGE_JUDGE_MODEL,
+        default_reasoning_effort=SECOND_STAGE_JUDGE_REASONING_EFFORT,
     )
     clients = build_single_prompt_clients(
         embedding_role_config.client,

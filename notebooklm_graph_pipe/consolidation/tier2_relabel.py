@@ -35,8 +35,11 @@ DEFAULT_NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 DEFAULT_NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")
 DEFAULT_NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "password123")
 DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
-MODEL_NAME = os.environ.get("TIER2_MODEL_NAME", "gemini-3.1-flash-lite-preview")
-SECOND_STAGE_MODEL_NAME = os.environ.get("TIER2_SECOND_STAGE_MODEL_NAME", "gemini-3-flash-preview")
+PRIMARY_CLIENT = os.environ.get("TIER2_PRIMARY_CLIENT", "openrouter")
+MODEL_NAME = os.environ.get("TIER2_MODEL_NAME", "minimax/minimax-m3")
+SECOND_STAGE_CLIENT = os.environ.get("TIER2_SECOND_STAGE_CLIENT", "codex")
+SECOND_STAGE_MODEL_NAME = os.environ.get("TIER2_SECOND_STAGE_MODEL_NAME", "gpt-5.6-luna")
+SECOND_STAGE_REASONING_EFFORT = os.environ.get("TIER2_SECOND_STAGE_REASONING_EFFORT", "low")
 LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("TIER2_LOW_CONFIDENCE_THRESHOLD", "0.65"))
 MAX_RETRIES = int(os.environ.get("TIER2_MAX_RETRIES", "3"))
 INITIAL_RETRY_DELAY_SECONDS = float(os.environ.get("TIER2_INITIAL_RETRY_DELAY_SECONDS", "1.0"))
@@ -224,6 +227,7 @@ def _build_classification_cache_key(
     *,
     client_name: str,
     model_name: str,
+    reasoning_effort: str | None,
     normalized_node: dict[str, Any],
     system_instruction: str,
 ) -> str:
@@ -232,6 +236,7 @@ def _build_classification_cache_key(
         payload={
             "client_name": client_name,
             "model_name": model_name,
+            "reasoning_effort": reasoning_effort,
             "system_instruction": system_instruction,
             "node": normalized_node,
             "temperature": 0.0,
@@ -259,6 +264,7 @@ def _classify_once(
     cache_key = _build_classification_cache_key(
         client_name=role_config.client,
         model_name=role_config.model,
+        reasoning_effort=role_config.reasoning_effort,
         normalized_node=normalized_node,
         system_instruction=system_instruction,
     )
@@ -271,6 +277,7 @@ def _classify_once(
         _resolve_client(clients, role_config.client),
         client_name=role_config.client,
         model_name=role_config.model,
+        reasoning_effort=role_config.reasoning_effort,
         prompt=_build_prompt(normalized_node),
         system_instruction=system_instruction,
         max_output_tokens=120,
@@ -504,14 +511,15 @@ def run(
     primary_role_config = resolve_prompt_role(
         llm_routing_config,
         TIER2_PRIMARY_ROLE,
-        default_client="genai",
+        default_client=PRIMARY_CLIENT,
         default_model=MODEL_NAME,
     )
     secondary_role_config = resolve_prompt_role(
         llm_routing_config,
         TIER2_SECONDARY_ROLE,
-        default_client="genai",
+        default_client=SECOND_STAGE_CLIENT,
         default_model=SECOND_STAGE_MODEL_NAME,
+        default_reasoning_effort=SECOND_STAGE_REASONING_EFFORT,
     )
     clients = build_single_prompt_clients(primary_role_config.client, secondary_role_config.client)
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))

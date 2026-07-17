@@ -24,7 +24,8 @@ if str(REPO_ROOT) not in sys.path:
 from notebooklm_graph_pipe.paths import RUNS_DIR
 from notebooklm_graph_pipe.runtime.dataset_registry import DatasetRegistryEntry, RegistryNeo4j, RegistryNotebook, load_dataset_entry
 
-MODEL_NAME = "gpt-5.4"
+MODEL_NAME = "gpt-5.6-sol"
+MODEL_REASONING_EFFORT = "low"
 BENCHMARK_RUN_PREFIX = "ab_eval_"
 NOTEBOOK_ONLY = "notebook_only"
 HYBRID = "hybrid"
@@ -493,6 +494,8 @@ def run_codex_exec(
         "read-only",
         "--model",
         model,
+        "-c",
+        f'model_reasoning_effort="{MODEL_REASONING_EFFORT}"',
         "--json",
         "-o",
         str(answer_path),
@@ -1018,7 +1021,7 @@ def render_technical_blog(run_dir: Path, dataset_summaries: list[dict[str, Any]]
 
 
 def render_appendix(*, run_dir: Path, datasets: list[DatasetSpec], question_orders: dict[str, list[str]], replacements: dict[str, list[dict[str, str]]], answer_artifacts: dict[str, dict[str, dict[str, AnswerArtifact]]], notebook_scores: dict[str, dict[str, AnswerScore]], hybrid_scores: dict[str, dict[str, AnswerScore]], comparisons: dict[str, dict[str, ComparisonScore]]) -> str:
-    lines = ["# Appendix: A/B Evaluation Artifacts", "", "## Command Shape", "All answer-generation runs used this shape from a temp working root, with prompts provided through stdin:", "", "```powershell", "codex exec -C <temp-root> --skip-git-repo-check --ephemeral --sandbox read-only --model gpt-5.4 --json -o <answer-file> -", "```", "", "Hybrid runs additionally overrode the Neo4j MCP env with `-c mcp_servers.neo4j.env.*=...` per corpus. Passwords are redacted here and were not written into this appendix.", "", "## Corpus Question Sets"]
+    lines = ["# Appendix: A/B Evaluation Artifacts", "", "## Command Shape", "All answer-generation runs used this shape from a temp working root, with prompts provided through stdin:", "", "```powershell", "codex exec -C <temp-root> --skip-git-repo-check --ephemeral --sandbox read-only --model gpt-5.6-sol -c model_reasoning_effort=\"low\" --json -o <answer-file> -", "```", "", "Hybrid runs additionally overrode the Neo4j MCP env with `-c mcp_servers.neo4j.env.*=...` per corpus. Passwords are redacted here and were not written into this appendix.", "", "## Corpus Question Sets"]
     for dataset in datasets:
         lines.append(f"### {dataset.key}")
         for question in dataset.questions:

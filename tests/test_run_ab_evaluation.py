@@ -9,6 +9,11 @@ import pytest
 import scripts.run_ab_evaluation as ab
 
 
+def test_ab_evaluation_defaults_to_sol_low_effort() -> None:
+    assert ab.MODEL_NAME == "gpt-5.6-sol"
+    assert ab.MODEL_REASONING_EFFORT == "low"
+
+
 def test_parse_jsonl_events_collects_mcp_tool_calls() -> None:
     raw_output = "\n".join(
         [
@@ -302,6 +307,8 @@ def test_run_codex_exec_passes_neo4j_secret_only_in_child_environment(monkeypatc
     )
 
     assert "environment-only-secret" not in " ".join(captured["command"])
+    assert captured["command"][captured["command"].index("--model") + 1] == "gpt-5.4"
+    assert 'model_reasoning_effort="low"' in captured["command"]
     assert captured["env"]["NEO4J_PASSWORD"] == "environment-only-secret"
 
 
