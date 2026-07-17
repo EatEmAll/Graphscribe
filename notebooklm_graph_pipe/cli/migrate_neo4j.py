@@ -251,6 +251,19 @@ def corpus_vector_dimension(schema_signature: Mapping[str, dict[str, Any]]) -> i
 
 
 def portable_schema_statement(statement: str) -> str:
+    if re.match(r"\s*CREATE\s+VECTOR\s+INDEX\b", statement, flags=re.IGNORECASE):
+        dimension = re.search(r"`?vector\.dimensions`?\s*:\s*(\d+)", statement, flags=re.IGNORECASE)
+        similarity = re.search(
+            r"`?vector\.similarity_function`?\s*:\s*['\"]([^'\"]+)['\"]",
+            statement,
+            flags=re.IGNORECASE,
+        )
+        if dimension and similarity:
+            prefix = re.split(r"\s+OPTIONS\s+", statement, maxsplit=1, flags=re.IGNORECASE)[0]
+            return (
+                f"{prefix} OPTIONS {{indexConfig: {{`vector.dimensions`: {dimension.group(1)}, "
+                f"`vector.similarity_function`: '{similarity.group(1)}'}}}}"
+            )
     without_provider_only = re.sub(
         r"\s+OPTIONS\s+\{\s*indexProvider\s*:\s*'[^']+'\s*\}\s*$",
         "",
@@ -501,6 +514,28 @@ def verify_entity_counts(expected: GraphInventory, actual: GraphInventory) -> No
         )
 
 
+def complete_staging_resume_ready(
+    *,
+    resume: bool,
+    staging_constraint: bool,
+    source_inventory: GraphInventory,
+    target_inventory: GraphInventory,
+    total_target_nodes: int,
+    staged_target_nodes: int,
+    unstaged_target_relationships: int,
+    source_schema: Mapping[str, dict[str, Any]],
+    target_schema: Mapping[str, dict[str, Any]],
+) -> bool:
+    return bool(
+        resume
+        and staging_constraint
+        and total_target_nodes == staged_target_nodes == source_inventory.nodes
+        and target_inventory.relationships == source_inventory.relationships
+        and unstaged_target_relationships == 0
+        and source_schema == target_schema
+    )
+
+
 def _portable_migrate_impl(
     source_connection: ResolvedNeo4jConnection,
     target_connection: ResolvedNeo4jConnection,
@@ -539,6 +574,7 @@ def _portable_migrate_impl(
             corpus_dimension = corpus_vector_dimension(source_schema_signature)
             is_v3_corpus = corpus_inventory.present and "chunk_embedding_v1" in source_schema_signature
             target_schema = read_schema(target, target_connection.database)
+            target_schema_signature = read_schema_signature(target, target_connection.database)
             ensure_migration_names_available(source, source_connection.database)
             total_target_nodes, staged_target_nodes, unstaged_target_relationships = read_staging_state(
                 target, target_connection.database
@@ -549,6 +585,17 @@ def _portable_migrate_impl(
                 resume
                 and staging_constraint
                 and (staged_target_nodes != total_target_nodes or unstaged_target_relationships)
+            )
+            verification_only_resume = complete_staging_resume_ready(
+                resume=resume,
+                staging_constraint=staging_constraint,
+                source_inventory=inventory,
+                target_inventory=target_inventory,
+                total_target_nodes=total_target_nodes,
+                staged_target_nodes=staged_target_nodes,
+                unstaged_target_relationships=unstaged_target_relationships,
+                source_schema=source_schema_signature,
+                target_schema=target_schema_signature,
             )
             if resume:
                 if not cleanup_only_resume and (
@@ -609,19 +656,23 @@ def _portable_migrate_impl(
             if not resume and (target_inventory.nodes or target_inventory.relationships or target_schema):
                 progress["phase"] = "clear-target"
                 clear_target(target, target_connection.database)
-            progress["phase"] = "create-staging"
-            create_staging_constraint(target, target_connection.database)
-            progress["staging_started"] = True
-            progress["phase"] = "copy-nodes"
-            summary["nodes_copied"] = copy_nodes(
-                source, target, source_connection.database, target_connection.database, batch_size
-            )
-            progress["phase"] = "copy-relationships"
-            summary["relationships_copied"] = copy_relationships(
-                source, target, source_connection.database, target_connection.database, batch_size
-            )
-            progress["phase"] = "recreate-schema"
-            summary["schema_created"] = recreate_schema(target, target_connection.database, schema)
+            if verification_only_resume:
+                progress["staging_started"] = True
+                summary["verification_only_resume"] = True
+            else:
+                progress["phase"] = "create-staging"
+                create_staging_constraint(target, target_connection.database)
+                progress["staging_started"] = True
+                progress["phase"] = "copy-nodes"
+                summary["nodes_copied"] = copy_nodes(
+                    source, target, source_connection.database, target_connection.database, batch_size
+                )
+                progress["phase"] = "copy-relationships"
+                summary["relationships_copied"] = copy_relationships(
+                    source, target, source_connection.database, target_connection.database, batch_size
+                )
+                progress["phase"] = "recreate-schema"
+                summary["schema_created"] = recreate_schema(target, target_connection.database, schema)
             staged_inventory = read_inventory(target, target_connection.database)
             verify_entity_counts(inventory, staged_inventory)
             source_fingerprint = graph_content_fingerprint(source, source_connection.database, staged=False)

@@ -27,6 +27,20 @@ def test_portable_schema_statement_removes_version_specific_provider() -> None:
     )
 
 
+def test_portable_schema_statement_removes_aura_vector_tuning_options() -> None:
+    statement = (
+        "CREATE VECTOR INDEX `vector` FOR (n:`Chunk`) ON (n.`embedding`) OPTIONS {indexConfig: {"
+        "`vector.default_search_expansion_factor`: 1.5,`vector.dimensions`: 384,"
+        "`vector.hnsw.ef_construction`: 100,`vector.hnsw.m`: 16,"
+        "`vector.quantization.type`: 'SCALAR',`vector.similarity_function`: 'COSINE'}}"
+    )
+
+    assert migration.portable_schema_statement(statement) == (
+        "CREATE VECTOR INDEX `vector` FOR (n:`Chunk`) ON (n.`embedding`) "
+        "OPTIONS {indexConfig: {`vector.dimensions`: 384, `vector.similarity_function`: 'COSINE'}}"
+    )
+
+
 def test_batched_preserves_all_rows() -> None:
     assert list(migration.batched(({"id": value} for value in range(5)), 2)) == [
         [{"id": 0}, {"id": 1}],
@@ -69,6 +83,35 @@ def test_verify_corpus_inventory_rejects_missing_active_embedding() -> None:
     inventory = migration.CorpusInventory(1, 1, 1, 2, 1, 2, 1)
     with pytest.raises(migration.MigrationError, match="active chunks are missing embeddings"):
         migration.verify_corpus_inventory(inventory, inventory)
+
+
+def test_complete_staging_resume_skips_recopy_only_for_exact_staged_state() -> None:
+    source = migration.GraphInventory(2, 1, {"Document": 2}, {"LINKS": 1})
+    target = migration.GraphInventory(2, 1, {"Document": 2, "__LGP_MIGRATION__": 2}, {"LINKS": 1})
+    schema = {"vector": {"type": "VECTOR"}}
+
+    assert migration.complete_staging_resume_ready(
+        resume=True,
+        staging_constraint=True,
+        source_inventory=source,
+        target_inventory=target,
+        total_target_nodes=2,
+        staged_target_nodes=2,
+        unstaged_target_relationships=0,
+        source_schema=schema,
+        target_schema=schema,
+    )
+    assert not migration.complete_staging_resume_ready(
+        resume=True,
+        staging_constraint=True,
+        source_inventory=source,
+        target_inventory=target,
+        total_target_nodes=2,
+        staged_target_nodes=2,
+        unstaged_target_relationships=0,
+        source_schema=schema,
+        target_schema={},
+    )
 
 
 def test_activate_manifest_writes_non_secret_target(tmp_path: Path) -> None:
