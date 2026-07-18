@@ -63,6 +63,7 @@ class GroundedAnswerer:
             system_instruction="You are a source-grounded research assistant. Never invent citations.",
             max_output_tokens=4096,
             temperature=0.0,
+            reasoning_effort=self.role.reasoning_effort,
             max_attempts=2,
         )
         warnings: list[str] = []

@@ -30,6 +30,84 @@ MIGRATION_LABEL = "__LGP_MIGRATION__"
 MIGRATION_ID = "_lgp_migration_id"
 MIGRATION_CONSTRAINT = "__lgp_migration_id_unique"
 DEFAULT_BATCH_SIZE = 1000
+CORPUS_NODE_QUERIES = {
+    "Corpus": "MATCH (n:Corpus {id: $corpus_id}) RETURN n.id AS id, properties(n) AS properties",
+    "Document": (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(n:Document) "
+        "RETURN n.id AS id, properties(n) AS properties"
+    ),
+    "DocumentRevision": (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->(n:DocumentRevision) "
+        "RETURN n.id AS id, properties(n) AS properties"
+    ),
+    "ParentChunk": (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
+        "(:DocumentRevision)-[:HAS_PARENT]->(n:ParentChunk) "
+        "RETURN n.id AS id, properties(n) AS properties"
+    ),
+    "Chunk": (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
+        "(:DocumentRevision)<-[:IN_REVISION]-(n:Chunk) "
+        "RETURN n.id AS id, properties(n) AS properties"
+    ),
+}
+CORPUS_RELATIONSHIP_PATTERNS = (
+    ("Corpus", "HAS_DOCUMENT", "Document"),
+    ("Document", "HAS_REVISION", "DocumentRevision"),
+    ("Document", "ACTIVE_REVISION", "DocumentRevision"),
+    ("DocumentRevision", "HAS_PARENT", "ParentChunk"),
+    ("ParentChunk", "HAS_CHILD", "Chunk"),
+    ("Chunk", "IN_REVISION", "DocumentRevision"),
+    ("Chunk", "PART_OF", "Document"),
+    ("Chunk", "NEXT_CHUNK", "Chunk"),
+)
+CORPUS_RELATIONSHIP_QUERIES = {
+    ("Corpus", "HAS_DOCUMENT", "Document"): (
+        "MATCH (a:Corpus {id: $corpus_id})-[r:HAS_DOCUMENT]->(b:Document)"
+    ),
+    ("Document", "HAS_REVISION", "DocumentRevision"): (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(a:Document)-[r:HAS_REVISION]->(b:DocumentRevision)"
+    ),
+    ("Document", "ACTIVE_REVISION", "DocumentRevision"): (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(a:Document)-[r:ACTIVE_REVISION]->(b:DocumentRevision)"
+    ),
+    ("DocumentRevision", "HAS_PARENT", "ParentChunk"): (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
+        "(a:DocumentRevision)-[r:HAS_PARENT]->(b:ParentChunk)"
+    ),
+    ("ParentChunk", "HAS_CHILD", "Chunk"): (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
+        "(:DocumentRevision)-[:HAS_PARENT]->(a:ParentChunk)-[r:HAS_CHILD]->(b:Chunk)"
+    ),
+    ("Chunk", "IN_REVISION", "DocumentRevision"): (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
+        "(b:DocumentRevision)<-[r:IN_REVISION]-(a:Chunk)"
+    ),
+    ("Chunk", "PART_OF", "Document"): (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(b:Document)<-[r:PART_OF]-(a:Chunk)"
+    ),
+    ("Chunk", "NEXT_CHUNK", "Chunk"): (
+        "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
+        "(:DocumentRevision)<-[:IN_REVISION]-(a:Chunk)-[r:NEXT_CHUNK]->(b:Chunk)"
+    ),
+}
+CORPUS_SCHEMA_NAMES = {
+    "chunk_embedding_v1",
+    "chunk_id_unique",
+    "chunk_keyword_v1",
+    "chunk_parent_id",
+    "corpus_id_unique",
+    "corpus_key_unique",
+    "document_id_unique",
+    "document_status",
+    "entities",
+    "community_keyword",
+    "parent_chunk_id_unique",
+    "revision_id_unique",
+    "revision_ready",
+}
+CORPUS_SEMANTIC_INDEXES = {"chunk_embedding_v1", "chunk_keyword_v1", "entities", "community_keyword"}
+LEGACY_CHUNK_INDEXES = {"vector", "keyword"}
 
 
 class MigrationError(RuntimeError):
@@ -62,6 +140,10 @@ class CorpusInventory:
     embedded_chunks: int
     active_chunks: int
     active_embedded_chunks: int
+    parents: int = 0
+    embedded_parents: int = 0
+    active_parents: int = 0
+    active_embedded_parents: int = 0
 
     @property
     def present(self) -> bool:
@@ -76,6 +158,34 @@ class CorpusInventory:
             "embedded_chunks": self.embedded_chunks,
             "active_chunks": self.active_chunks,
             "active_embedded_chunks": self.active_embedded_chunks,
+            "parents": self.parents,
+            "embedded_parents": self.embedded_parents,
+            "active_parents": self.active_parents,
+            "active_embedded_parents": self.active_embedded_parents,
+        }
+
+
+@dataclass(frozen=True)
+class CorpusMergeInventory:
+    nodes: dict[str, int]
+    relationships: dict[str, int]
+    embedded_chunks: int
+
+    @property
+    def total_nodes(self) -> int:
+        return sum(self.nodes.values())
+
+    @property
+    def total_relationships(self) -> int:
+        return sum(self.relationships.values())
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "nodes": self.nodes,
+            "relationships": self.relationships,
+            "embedded_chunks": self.embedded_chunks,
+            "total_nodes": self.total_nodes,
+            "total_relationships": self.total_relationships,
         }
 
 
@@ -142,6 +252,16 @@ def read_corpus_inventory(driver: Any, database: str) -> CorpusInventory:
             "MATCH (:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)<-[:IN_REVISION]-(n:Chunk) "
             "WHERE n.embedding IS NOT NULL RETURN count(n) AS count"
         ),
+        "parents": "MATCH (n:ParentChunk) RETURN count(n) AS count",
+        "embedded_parents": "MATCH (n:ParentChunk) WHERE n.embedding IS NOT NULL RETURN count(n) AS count",
+        "active_parents": (
+            "MATCH (:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)-[:HAS_PARENT]->(n:ParentChunk) "
+            "RETURN count(n) AS count"
+        ),
+        "active_embedded_parents": (
+            "MATCH (:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)-[:HAS_PARENT]->(n:ParentChunk) "
+            "WHERE n.embedding IS NOT NULL RETURN count(n) AS count"
+        ),
     }
     with driver.session(database=database) as session:
         counts = {
@@ -151,27 +271,73 @@ def read_corpus_inventory(driver: Any, database: str) -> CorpusInventory:
     return CorpusInventory(**counts)
 
 
-def verify_corpus_inventory(expected: CorpusInventory, actual: CorpusInventory) -> None:
+def read_corpus_merge_inventory(driver: Any, database: str, corpus_id: str) -> CorpusMergeInventory:
+    node_counts: dict[str, int] = {}
+    relationship_counts: dict[str, int] = {}
+    with driver.session(database=database) as session:
+        for label, query in CORPUS_NODE_QUERIES.items():
+            match_query = query.rsplit(" RETURN ", 1)[0]
+            node_counts[label] = int(
+                session.run(
+                    f"{match_query} RETURN count(n) AS count",
+                    corpus_id=corpus_id,
+                ).single(strict=True)["count"]
+            )
+        chunk_match = CORPUS_NODE_QUERIES["Chunk"].rsplit(" RETURN ", 1)[0]
+        embedded_chunks = int(
+            session.run(
+                f"{chunk_match} RETURN count(CASE WHEN n.embedding IS NOT NULL THEN 1 END) AS count",
+                corpus_id=corpus_id,
+            ).single(strict=True)["count"]
+        )
+        for start_label, relationship_type, end_label in CORPUS_RELATIONSHIP_PATTERNS:
+            key = f"{start_label}:{relationship_type}:{end_label}"
+            relationship_counts[key] = int(
+                session.run(
+                    CORPUS_RELATIONSHIP_QUERIES[(start_label, relationship_type, end_label)]
+                    + " RETURN count(r) AS count",
+                    corpus_id=corpus_id,
+                ).single(strict=True)["count"]
+            )
+    return CorpusMergeInventory(node_counts, relationship_counts, embedded_chunks)
+
+
+def verify_corpus_inventory(
+    expected: CorpusInventory,
+    actual: CorpusInventory,
+    *,
+    retrieval_unit: str = "chunk",
+) -> None:
     if expected != actual:
         raise MigrationError(
             "Corpus migration verification failed: "
             f"source={expected.to_dict()}, target={actual.to_dict()}."
         )
-    if actual.present and actual.active_chunks != actual.active_embedded_chunks:
+    if retrieval_unit not in {"chunk", "parent"}:
+        raise MigrationError(f"Unsupported retrieval unit: {retrieval_unit}")
+    active_units = actual.active_parents if retrieval_unit == "parent" else actual.active_chunks
+    active_embedded_units = (
+        actual.active_embedded_parents if retrieval_unit == "parent" else actual.active_embedded_chunks
+    )
+    if actual.present and active_units != active_embedded_units:
+        unit_label = "parents" if retrieval_unit == "parent" else "chunks"
         raise MigrationError(
-            "Corpus migration verification failed: one or more active chunks are missing embeddings."
+            f"Corpus migration verification failed: one or more active {unit_label} are missing embeddings."
         )
 
 
 def inspect_corpus_connection(
     connection: ResolvedNeo4jConnection,
+    *,
+    retrieval_unit: str = "chunk",
+    vector_index: str = "chunk_embedding_v1",
 ) -> tuple[CorpusInventory, int, bool]:
     with GraphDatabase.driver(connection.uri, auth=(connection.username, connection.password)) as driver:
         driver.verify_connectivity()
         inventory = read_corpus_inventory(driver, connection.database)
         schema_signature = read_schema_signature(driver, connection.database)
-    dimension = corpus_vector_dimension(schema_signature)
-    return inventory, dimension, inventory.present and "chunk_embedding_v1" in schema_signature
+    dimension = corpus_vector_dimension(schema_signature, vector_index=vector_index)
+    return inventory, dimension, inventory.present and vector_index in schema_signature
 
 
 def read_schema_signature(driver: Any, database: str) -> dict[str, dict[str, Any]]:
@@ -244,9 +410,13 @@ def read_schema(driver: Any, database: str) -> list[SchemaObject]:
     return constraints + indexes
 
 
-def corpus_vector_dimension(schema_signature: Mapping[str, dict[str, Any]]) -> int:
-    vector_index = schema_signature.get("chunk_embedding_v1") or {}
-    config = vector_index.get("index_config") or {}
+def corpus_vector_dimension(
+    schema_signature: Mapping[str, dict[str, Any]],
+    *,
+    vector_index: str = "chunk_embedding_v1",
+) -> int:
+    index = schema_signature.get(vector_index) or {}
+    config = index.get("index_config") or {}
     return int(config.get("vector.dimensions") or 384)
 
 
@@ -353,6 +523,123 @@ def _relationship_rows(driver: Any, database: str) -> Iterator[dict[str, Any]]:
             "elementId(b) AS end_id, type(r) AS type, properties(r) AS properties"
         ):
             yield row.data()
+
+
+def _corpus_node_rows(driver: Any, database: str, corpus_id: str, label: str) -> Iterator[dict[str, Any]]:
+    with driver.session(database=database, fetch_size=DEFAULT_BATCH_SIZE) as session:
+        for row in session.run(CORPUS_NODE_QUERIES[label], corpus_id=corpus_id):
+            yield row.data()
+
+
+def _corpus_node_id_rows(driver: Any, database: str, corpus_id: str, label: str) -> Iterator[dict[str, Any]]:
+    query = CORPUS_NODE_QUERIES[label].rsplit(" RETURN ", 1)[0] + " RETURN n.id AS id"
+    with driver.session(database=database, fetch_size=DEFAULT_BATCH_SIZE) as session:
+        for row in session.run(query, corpus_id=corpus_id):
+            yield row.data()
+
+
+def _corpus_relationship_rows(
+    driver: Any,
+    database: str,
+    corpus_id: str,
+    start_label: str,
+    relationship_type: str,
+    end_label: str,
+) -> Iterator[dict[str, Any]]:
+    query = CORPUS_RELATIONSHIP_QUERIES[(start_label, relationship_type, end_label)]
+    query += " RETURN a.id AS start_id, b.id AS end_id, properties(r) AS properties"
+    with driver.session(database=database, fetch_size=DEFAULT_BATCH_SIZE) as session:
+        for row in session.run(query, corpus_id=corpus_id):
+            yield row.data()
+
+
+def corpus_content_fingerprint(driver: Any, database: str, corpus_id: str) -> dict[str, tuple[int, str]]:
+    result: dict[str, tuple[int, str]] = {}
+    for label in CORPUS_NODE_QUERIES:
+        if label == "Chunk":
+            match_query = CORPUS_NODE_QUERIES[label].rsplit(" RETURN ", 1)[0]
+            query = (
+                f"{match_query} RETURN n.id AS id, n{{.*, embedding: null}} AS properties, "
+                "size(n.embedding) AS embedding_dimension, n.embedding[0] AS embedding_first, "
+                "n.embedding[-1] AS embedding_last, "
+                "reduce(total = 0.0, value IN n.embedding | total + value) AS embedding_sum, "
+                "reduce(total = 0.0, index IN range(0, size(n.embedding) - 1) | "
+                "total + (index + 1) * n.embedding[index]) AS embedding_weighted_sum"
+            )
+
+            def chunk_rows() -> Iterator[dict[str, Any]]:
+                with driver.session(database=database, fetch_size=DEFAULT_BATCH_SIZE) as session:
+                    for row in session.run(query, corpus_id=corpus_id):
+                        yield {"kind": f"node:{label}", **row.data()}
+
+            rows = chunk_rows()
+        else:
+            rows = (
+                {"kind": f"node:{label}", **row}
+                for row in _corpus_node_rows(driver, database, corpus_id, label)
+            )
+        result[f"node:{label}"] = _fingerprint_rows(rows)
+    for start_label, relationship_type, end_label in CORPUS_RELATIONSHIP_PATTERNS:
+        key = f"relationship:{start_label}:{relationship_type}:{end_label}"
+        rows = (
+            {"kind": key, **row}
+            for row in _corpus_relationship_rows(
+                driver,
+                database,
+                corpus_id,
+                start_label,
+                relationship_type,
+                end_label,
+            )
+        )
+        result[key] = _fingerprint_rows(rows)
+    return result
+
+
+def base_graph_content_fingerprint(driver: Any, database: str, corpus_id: str) -> dict[str, tuple[int, str]]:
+    with driver.session(database=database) as session:
+        corpus_exists = int(
+            session.run(
+                "MATCH (n:Corpus {id: $corpus_id}) RETURN count(n) AS count",
+                corpus_id=corpus_id,
+            ).single(strict=True)["count"]
+        )
+    if not corpus_exists:
+        return graph_content_fingerprint(driver, database, staged=False)
+    def donor_predicate(alias: str) -> str:
+        return (
+            f"({alias}:Corpus AND {alias}.id = $corpus_id) OR "
+            f"({alias}:Document AND EXISTS {{ MATCH (:Corpus {{id: $corpus_id}})-[:HAS_DOCUMENT]->({alias}) }}) OR "
+            f"{alias}:DocumentRevision OR {alias}:ParentChunk OR "
+            f"({alias}:Chunk AND {alias}.revision_id IS NOT NULL)"
+        )
+
+    def node_rows() -> Iterator[dict[str, Any]]:
+        with driver.session(database=database, fetch_size=DEFAULT_BATCH_SIZE) as session:
+            for row in session.run(
+                f"MATCH (candidate) WHERE NOT ({donor_predicate('candidate')}) "
+                "RETURN elementId(candidate) AS source_id, labels(candidate) AS labels, "
+                "properties(candidate) AS properties",
+                corpus_id=corpus_id,
+            ):
+                yield row.data()
+
+    def relationship_rows() -> Iterator[dict[str, Any]]:
+        with driver.session(database=database, fetch_size=DEFAULT_BATCH_SIZE) as session:
+            for row in session.run(
+                f"MATCH (a)-[r]->(b) WHERE NOT ({donor_predicate('a')}) "
+                f"AND NOT ({donor_predicate('b')}) "
+                "RETURN labels(a) AS start_labels, properties(a) AS start_properties, "
+                "labels(b) AS end_labels, properties(b) AS end_properties, "
+                "type(r) AS type, properties(r) AS properties",
+                corpus_id=corpus_id,
+            ):
+                yield row.data()
+
+    return {
+        "nodes": _fingerprint_rows(node_rows()),
+        "relationships": _fingerprint_rows(relationship_rows()),
+    }
 
 
 def _normalized_value(value: Any) -> Any:
@@ -477,6 +764,378 @@ def recreate_schema(driver: Any, database: str, schema: list[SchemaObject]) -> l
     if any(item.kind == "index" for item in schema):
         driver.execute_query("CALL db.awaitIndexes(300)", database_=database)
     return created
+
+
+def _corpus_schema(driver: Any, database: str) -> list[SchemaObject]:
+    return [item for item in read_schema(driver, database) if item.name in CORPUS_SCHEMA_NAMES]
+
+
+def _assert_corpus_node_compatible(
+    target: Any,
+    database: str,
+    label: str,
+    rows: list[dict[str, Any]],
+) -> None:
+    if not rows:
+        return
+    with target.session(database=database) as session:
+        existing = {
+            str(row["id"]): dict(row["properties"])
+            for row in session.run(
+                f"UNWIND $ids AS id MATCH (n:{quote_token(label)} {{id: id}}) "
+                "RETURN n.id AS id, properties(n) AS properties",
+                ids=[row["id"] for row in rows],
+            )
+        }
+    for row in rows:
+        current = existing.get(str(row["id"]))
+        if current is not None and _normalized_value(current) != _normalized_value(dict(row["properties"])):
+            raise MigrationError(
+                f"Corpus merge identifier collision for {label}.id={row['id']!r}; "
+                "the target node has different properties."
+            )
+
+
+def _assert_no_corpus_id_collisions(
+    source: Any,
+    target: Any,
+    source_database: str,
+    target_database: str,
+    corpus_id: str,
+    batch_size: int,
+) -> None:
+    with target.session(database=target_database) as session:
+        target_labels = {str(row["label"]) for row in session.run("CALL db.labels() YIELD label RETURN label")}
+        for label in CORPUS_NODE_QUERIES:
+            if label not in target_labels:
+                continue
+            target_ids = {
+                str(row["id"])
+                for row in session.run(
+                    f"MATCH (n:{quote_token(label)}) WHERE n.id IS NOT NULL RETURN n.id AS id"
+                )
+            }
+            for rows in batched(_corpus_node_id_rows(source, source_database, corpus_id, label), batch_size):
+                collision = next((str(row["id"]) for row in rows if str(row["id"]) in target_ids), None)
+                if collision:
+                    raise MigrationError(
+                        f"Corpus merge identifier collision for {label}.id={collision!r}; "
+                        "the target must not already contain donor identifiers on a fresh merge."
+                    )
+
+
+def _copy_corpus_nodes(
+    source: Any,
+    target: Any,
+    source_database: str,
+    target_database: str,
+    corpus_id: str,
+    label: str,
+    batch_size: int,
+) -> int:
+    copied = 0
+    for rows in batched(_corpus_node_rows(source, source_database, corpus_id, label), batch_size):
+        _assert_corpus_node_compatible(target, target_database, label, rows)
+        target.execute_query(
+            f"UNWIND $rows AS row MERGE (n:{quote_token(label)} {{id: row.id}}) SET n = row.properties",
+            rows=rows,
+            database_=target_database,
+        )
+        copied += len(rows)
+    return copied
+
+
+def _copy_corpus_relationships(
+    source: Any,
+    target: Any,
+    source_database: str,
+    target_database: str,
+    corpus_id: str,
+    start_label: str,
+    relationship_type: str,
+    end_label: str,
+    batch_size: int,
+) -> int:
+    copied = 0
+    rows_iter = _corpus_relationship_rows(
+        source,
+        source_database,
+        corpus_id,
+        start_label,
+        relationship_type,
+        end_label,
+    )
+    for rows in batched(rows_iter, batch_size):
+        result = target.execute_query(
+            f"UNWIND $rows AS row MATCH (a:{quote_token(start_label)} {{id: row.start_id}}), "
+            f"(b:{quote_token(end_label)} {{id: row.end_id}}) "
+            f"MERGE (a)-[r:{quote_token(relationship_type)}]->(b) SET r = row.properties "
+            "RETURN count(r) AS count",
+            rows=rows,
+            database_=target_database,
+        )
+        records = result.records if hasattr(result, "records") else result[0]
+        matched = int(records[0]["count"]) if records else 0
+        if matched != len(rows):
+            raise MigrationError(
+                f"Corpus merge could only match {matched} of {len(rows)} {relationship_type} relationships."
+            )
+        copied += len(rows)
+    return copied
+
+
+def _prepare_corpus_schema(target: Any, database: str, schema: list[SchemaObject]) -> list[str]:
+    structural = [item for item in schema if item.name not in CORPUS_SEMANTIC_INDEXES]
+    return recreate_schema(target, database, structural)
+
+
+def _activate_corpus_search_indexes(target: Any, database: str, schema: list[SchemaObject]) -> list[str]:
+    existing = read_schema_signature(target, database)
+    expected = {item.name: item for item in schema if item.name in CORPUS_SEMANTIC_INDEXES}
+    with target.session(database=database) as session:
+        for legacy_name in LEGACY_CHUNK_INDEXES:
+            if legacy_name in existing:
+                session.run(f"DROP INDEX {quote_token(legacy_name)} IF EXISTS").consume()
+        if "entities" in existing:
+            session.run(f"DROP INDEX {quote_token('entities')} IF EXISTS").consume()
+    created = recreate_schema(
+        target,
+        database,
+        list(expected.values()),
+    )
+    target.execute_query("CALL db.awaitIndexes(1800)", database_=database)
+    return created
+
+
+def _read_merge_state(
+    path: Path,
+    *,
+    corpus_id: str,
+    source_uri: str,
+    source_database: str,
+    target_uri: str,
+    target_database: str,
+) -> dict[str, Any]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    expected = {
+        "corpus_id": corpus_id,
+        "source_uri": source_uri,
+        "source_database": source_database,
+        "target_uri": target_uri,
+        "target_database": target_database,
+    }
+    if any(payload.get(key) != value for key, value in expected.items()):
+        raise MigrationError("Corpus merge state does not match the requested source, target, and corpus.")
+    payload.setdefault("completed_stages", [])
+    return payload
+
+
+def _write_merge_state(path: Path, state: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def corpus_merge(
+    source_connection: ResolvedNeo4jConnection,
+    target_connection: ResolvedNeo4jConnection,
+    *,
+    corpus_id: str,
+    state_path: Path,
+    batch_size: int = DEFAULT_BATCH_SIZE,
+    execute: bool = False,
+    resume: bool = False,
+) -> dict[str, Any]:
+    if source_connection.uri == target_connection.uri and source_connection.database == target_connection.database:
+        raise MigrationError("Source and target resolve to the same Neo4j database.")
+    with GraphDatabase.driver(source_connection.uri, auth=(source_connection.username, source_connection.password)) as source:
+        with GraphDatabase.driver(target_connection.uri, auth=(target_connection.username, target_connection.password)) as target:
+            source.verify_connectivity()
+            target.verify_connectivity()
+            source_inventory = read_corpus_merge_inventory(source, source_connection.database, corpus_id)
+            if source_inventory.nodes.get("Corpus") != 1:
+                raise MigrationError(f"Expected exactly one donor Corpus with id {corpus_id!r}.")
+            if source_inventory.nodes.get("Chunk") != source_inventory.embedded_chunks:
+                raise MigrationError("Donor corpus contains one or more chunks without embeddings.")
+            target_before = read_inventory(target, target_connection.database)
+            schema = _corpus_schema(source, source_connection.database)
+            missing_schema = CORPUS_SCHEMA_NAMES - {item.name for item in schema}
+            if missing_schema:
+                raise MigrationError(f"Donor corpus is missing required schema: {sorted(missing_schema)}")
+            summary: dict[str, Any] = {
+                "mode": "corpus-merge",
+                "executed": execute,
+                "resume": resume,
+                "corpus_id": corpus_id,
+                "source_corpus": source_inventory.to_dict(),
+                "target_before": {
+                    "nodes": target_before.nodes,
+                    "relationships": target_before.relationships,
+                },
+                "projected_target": {
+                    "nodes": target_before.nodes + source_inventory.total_nodes,
+                    "relationships": target_before.relationships + source_inventory.total_relationships,
+                },
+                "state_path": str(state_path),
+            }
+            if not execute:
+                _assert_no_corpus_id_collisions(
+                    source,
+                    target,
+                    source_connection.database,
+                    target_connection.database,
+                    corpus_id,
+                    batch_size,
+                )
+                summary["identifier_collisions"] = 0
+                return summary
+
+            state = {
+                "corpus_id": corpus_id,
+                "source_uri": source_connection.uri,
+                "source_database": source_connection.database,
+                "target_uri": target_connection.uri,
+                "target_database": target_connection.database,
+                "target_initial": {
+                    "nodes": target_before.nodes,
+                    "relationships": target_before.relationships,
+                },
+                "completed_stages": [],
+                "status": "running",
+            }
+            fresh_merge = not resume and not state_path.exists()
+            if resume:
+                if not state_path.exists():
+                    raise MigrationError("--resume requires an existing corpus merge state file.")
+                state = _read_merge_state(
+                    state_path,
+                    corpus_id=corpus_id,
+                    source_uri=source_connection.uri,
+                    source_database=source_connection.database,
+                    target_uri=target_connection.uri,
+                    target_database=target_connection.database,
+                )
+            elif state_path.exists():
+                existing_state = _read_merge_state(
+                    state_path,
+                    corpus_id=corpus_id,
+                    source_uri=source_connection.uri,
+                    source_database=source_connection.database,
+                    target_uri=target_connection.uri,
+                    target_database=target_connection.database,
+                )
+                if existing_state.get("status") != "completed":
+                    raise MigrationError("An incomplete corpus merge exists; rerun with --resume.")
+                state = existing_state
+            initial = state["target_initial"]
+            summary["projected_target"] = {
+                "nodes": int(initial["nodes"]) + source_inventory.total_nodes,
+                "relationships": int(initial["relationships"]) + source_inventory.total_relationships,
+            }
+            if fresh_merge:
+                _assert_no_corpus_id_collisions(
+                    source,
+                    target,
+                    source_connection.database,
+                    target_connection.database,
+                    corpus_id,
+                    batch_size,
+                )
+                state["source_fingerprint"] = corpus_content_fingerprint(
+                    source, source_connection.database, corpus_id
+                )
+                state["base_fingerprint"] = base_graph_content_fingerprint(
+                    target, target_connection.database, corpus_id
+                )
+            _write_merge_state(state_path, state)
+
+            completed = set(state["completed_stages"])
+
+            def complete(stage: str) -> None:
+                completed.add(stage)
+                state["completed_stages"] = sorted(completed)
+                _write_merge_state(state_path, state)
+
+            if "schema-structural" not in completed:
+                summary["schema_created"] = _prepare_corpus_schema(target, target_connection.database, schema)
+                complete("schema-structural")
+
+            copied_nodes: dict[str, int] = {}
+            for label in CORPUS_NODE_QUERIES:
+                stage = f"nodes:{label}"
+                if stage not in completed:
+                    copied_nodes[label] = _copy_corpus_nodes(
+                        source,
+                        target,
+                        source_connection.database,
+                        target_connection.database,
+                        corpus_id,
+                        label,
+                        batch_size,
+                    )
+                    complete(stage)
+            summary["nodes_processed"] = copied_nodes
+
+            copied_relationships: dict[str, int] = {}
+            for start_label, relationship_type, end_label in CORPUS_RELATIONSHIP_PATTERNS:
+                key = f"{start_label}:{relationship_type}:{end_label}"
+                stage = f"relationships:{key}"
+                if stage not in completed:
+                    copied_relationships[key] = _copy_corpus_relationships(
+                        source,
+                        target,
+                        source_connection.database,
+                        target_connection.database,
+                        corpus_id,
+                        start_label,
+                        relationship_type,
+                        end_label,
+                        batch_size,
+                    )
+                    complete(stage)
+            summary["relationships_processed"] = copied_relationships
+
+            if "schema-search" not in completed:
+                summary["search_indexes_created"] = _activate_corpus_search_indexes(
+                    target, target_connection.database, schema
+                )
+                complete("schema-search")
+
+            target_corpus = read_corpus_merge_inventory(target, target_connection.database, corpus_id)
+            if target_corpus != source_inventory:
+                raise MigrationError(
+                    "Corpus merge verification failed: "
+                    f"source={source_inventory.to_dict()}, target={target_corpus.to_dict()}."
+                )
+            target_fingerprint = corpus_content_fingerprint(target, target_connection.database, corpus_id)
+            if _normalized_value(target_fingerprint) != _normalized_value(state.get("source_fingerprint")):
+                raise MigrationError("Corpus merge content fingerprint does not match the donor corpus.")
+            base_fingerprint = base_graph_content_fingerprint(target, target_connection.database, corpus_id)
+            if _normalized_value(base_fingerprint) != _normalized_value(state.get("base_fingerprint")):
+                raise MigrationError("Corpus merge modified pre-existing graph content.")
+            target_after = read_inventory(target, target_connection.database)
+            initial = state["target_initial"]
+            expected_nodes = int(initial["nodes"]) + source_inventory.total_nodes
+            expected_relationships = int(initial["relationships"]) + source_inventory.total_relationships
+            if target_after.nodes != expected_nodes or target_after.relationships != expected_relationships:
+                raise MigrationError(
+                    "Corpus merge changed an unexpected number of graph elements: "
+                    f"expected {expected_nodes}/{expected_relationships}, "
+                    f"got {target_after.nodes}/{target_after.relationships}."
+                )
+            verify_corpus_connection(target_connection, dimension=corpus_vector_dimension(read_schema_signature(target, target_connection.database)))
+            state["status"] = "completed"
+            _write_merge_state(state_path, state)
+            summary["target_corpus"] = target_corpus.to_dict()
+            summary["content_fingerprint"] = target_fingerprint
+            summary["base_graph_preserved"] = True
+            summary["target_after"] = {
+                "nodes": target_after.nodes,
+                "relationships": target_after.relationships,
+            }
+            summary["verified"] = True
+            return summary
 
 
 def cleanup_staging(driver: Any, database: str) -> None:
@@ -774,6 +1433,9 @@ def aura_upload(
     neo4j_admin_container: str | None = None,
     expected_corpus: CorpusInventory | None = None,
     corpus_dimension: int = 384,
+    retrieval_unit: str = "chunk",
+    vector_index: str = "chunk_embedding_v1",
+    keyword_index: str = "chunk_keyword_v1",
 ) -> dict[str, Any]:
     if not target.uri.startswith("neo4j+s://") or not target.uri.endswith(".databases.neo4j.io"):
         raise MigrationError("Aura upload requires an Aura neo4j+s://*.databases.neo4j.io target URI.")
@@ -831,6 +1493,8 @@ def aura_upload(
             "docker",
             "run",
             "--rm",
+            "--entrypoint",
+            "neo4j-admin",
             "--volume",
             f"{dump_dir}:/backups:ro",
             "--env",
@@ -838,13 +1502,17 @@ def aura_upload(
             "--env",
             "NEO4J_PASSWORD",
             image,
-            *upload_args,
+            *upload_args[1:],
         ]
     _run_checked(command, env=env)
     verify_connection(target, require_write=True)
-    target_corpus, target_dimension, is_v3_corpus = inspect_corpus_connection(target)
+    target_corpus, target_dimension, is_v3_corpus = inspect_corpus_connection(
+        target,
+        retrieval_unit=retrieval_unit,
+        vector_index=vector_index,
+    )
     if expected_corpus is not None:
-        verify_corpus_inventory(expected_corpus, target_corpus)
+        verify_corpus_inventory(expected_corpus, target_corpus, retrieval_unit=retrieval_unit)
         if not is_v3_corpus:
             raise MigrationError("Aura upload copied v3 corpus data without its required vector index.")
     if (
@@ -856,7 +1524,13 @@ def aura_upload(
         raise MigrationError("Aura upload contains v3-like corpus data without its required vector index.")
     if is_v3_corpus:
         expected_dimension = corpus_dimension if expected_corpus is not None else target_dimension
-        verify_corpus_connection(target, dimension=expected_dimension)
+        verify_corpus_connection(
+            target,
+            dimension=expected_dimension,
+            retrieval_unit=retrieval_unit,
+            vector_index=vector_index,
+            keyword_index=keyword_index,
+        )
         summary["target_corpus"] = target_corpus.to_dict()
     summary["verified"] = True
     return summary
@@ -982,6 +1656,28 @@ def activate_manifest(path: Path, target: ResolvedNeo4jConnection, password_env:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
 
 
+def manifest_corpus_id(path: Path) -> str:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    corpus_id = str((payload.get("corpus") or {}).get("id") or "").strip()
+    if not corpus_id:
+        raise MigrationError(f"Manifest does not define corpus.id: {path}")
+    return corpus_id
+
+
+def manifest_retrieval_profile(path: Path) -> tuple[str, str, str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    retrieval = dict(payload.get("retrieval") or {})
+    unit = str(retrieval.get("unit") or "chunk")
+    if unit not in {"chunk", "parent"}:
+        raise MigrationError(f"Manifest defines unsupported retrieval unit '{unit}': {path}")
+    prefix = "parent" if unit == "parent" else "chunk"
+    return (
+        unit,
+        str(retrieval.get("vector_index") or f"{prefix}_embedding_v1"),
+        str(retrieval.get("keyword_index") or f"{prefix}_keyword_v1"),
+    )
+
+
 def _connection_from_args(args: argparse.Namespace, prefix: str) -> ResolvedNeo4jConnection:
     upper = prefix.upper()
     uri = getattr(args, f"{prefix}_uri") or os.environ.get(f"NEO4J_{upper}_URI", "")
@@ -998,7 +1694,7 @@ def _connection_from_args(args: argparse.Namespace, prefix: str) -> ResolvedNeo4
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Migrate a local Neo4j database to a hosted Neo4j database.")
-    parser.add_argument("--mode", choices=("portable", "aura-upload"), default="portable")
+    parser.add_argument("--mode", choices=("portable", "aura-upload", "corpus-merge"), default="portable")
     for prefix in ("source", "target"):
         parser.add_argument(f"--{prefix}-uri")
         parser.add_argument(f"--{prefix}-user")
@@ -1006,10 +1702,11 @@ def build_parser() -> argparse.ArgumentParser:
         parser.add_argument(f"--{prefix}-password-env", default=f"NEO4J_{prefix.upper()}_PASSWORD")
     parser.add_argument("--batch-size", type=int, default=DEFAULT_BATCH_SIZE)
     parser.add_argument("--execute", action="store_true")
-    parser.add_argument("--resume", action="store_true", help="Resume an interrupted portable migration")
+    parser.add_argument("--resume", action="store_true", help="Resume an interrupted portable or corpus merge")
     parser.add_argument("--overwrite-target", action="store_true")
     parser.add_argument("--confirm-target", help="Exact '<target-uri>|<target-database>' overwrite confirmation")
     parser.add_argument("--manifest-path", type=Path)
+    parser.add_argument("--state-path", type=Path, help="Checkpoint file for --mode corpus-merge")
     parser.add_argument("--activate-target", action="store_true")
     parser.add_argument("--dump-dir", type=Path)
     parser.add_argument("--source-container", help="Managed local Neo4j container to dump before Aura upload")
@@ -1025,26 +1722,45 @@ def main(argv: list[str] | None = None) -> int:
         raise MigrationError("--batch-size must be greater than zero.")
     target = _connection_from_args(args, "target")
     expected_confirmation = f"{target.uri}|{target.database}"
-    if args.overwrite_target and args.confirm_target != expected_confirmation:
+    if (args.overwrite_target or (args.mode == "corpus-merge" and args.execute)) and args.confirm_target != expected_confirmation:
         raise MigrationError(f"--confirm-target must exactly match: {expected_confirmation}")
     if args.activate_target and (not args.execute or not args.manifest_path):
         raise MigrationError("--activate-target requires --execute and --manifest-path.")
-    if args.resume and args.mode != "portable":
-        raise MigrationError("--resume is only supported in portable mode.")
+    if args.resume and args.mode not in {"portable", "corpus-merge"}:
+        raise MigrationError("--resume is only supported in portable and corpus-merge modes.")
     if args.resume and args.overwrite_target:
         raise MigrationError("--resume and --overwrite-target are mutually exclusive.")
-    if args.mode == "portable":
+    if args.mode in {"portable", "corpus-merge"}:
         source = _connection_from_args(args, "source")
         if source.uri == target.uri and source.database == target.database:
             raise MigrationError("Source and target resolve to the same Neo4j database.")
-        summary = portable_migrate(
-            source,
-            target,
-            batch_size=args.batch_size,
-            execute=args.execute,
-            overwrite_target=args.overwrite_target,
-            resume=args.resume,
-        )
+        if args.mode == "portable":
+            summary = portable_migrate(
+                source,
+                target,
+                batch_size=args.batch_size,
+                execute=args.execute,
+                overwrite_target=args.overwrite_target,
+                resume=args.resume,
+            )
+        else:
+            if not args.manifest_path:
+                raise MigrationError("--mode corpus-merge requires --manifest-path.")
+            manifest_path = args.manifest_path.resolve()
+            state_path = (
+                args.state_path.resolve()
+                if args.state_path
+                else manifest_path.with_name(f"{manifest_path.stem}.corpus-merge-state.json")
+            )
+            summary = corpus_merge(
+                source,
+                target,
+                corpus_id=manifest_corpus_id(manifest_path),
+                state_path=state_path,
+                batch_size=args.batch_size,
+                execute=args.execute,
+                resume=args.resume,
+            )
     else:
         if not args.dump_dir:
             raise MigrationError("Aura upload requires --dump-dir containing <source-database>.dump.")
@@ -1052,9 +1768,20 @@ def main(argv: list[str] | None = None) -> int:
         generated_dump: Path | None = None
         expected_corpus: CorpusInventory | None = None
         expected_corpus_dimension = 384
+        retrieval_unit = "chunk"
+        vector_index = "chunk_embedding_v1"
+        keyword_index = "chunk_keyword_v1"
+        if args.manifest_path:
+            retrieval_unit, vector_index, keyword_index = manifest_retrieval_profile(
+                args.manifest_path.resolve()
+            )
         if args.source_container:
             source = _connection_from_args(args, "source")
-            source_corpus, source_dimension, source_is_v3 = inspect_corpus_connection(source)
+            source_corpus, source_dimension, source_is_v3 = inspect_corpus_connection(
+                source,
+                retrieval_unit=retrieval_unit,
+                vector_index=vector_index,
+            )
             if source_is_v3:
                 expected_corpus = source_corpus
                 expected_corpus_dimension = source_dimension
@@ -1075,6 +1802,9 @@ def main(argv: list[str] | None = None) -> int:
             neo4j_admin_container=args.source_container,
             expected_corpus=expected_corpus,
             corpus_dimension=expected_corpus_dimension,
+            retrieval_unit=retrieval_unit,
+            vector_index=vector_index,
+            keyword_index=keyword_index,
         )
         if generated_dump is not None and args.execute and not args.keep_dump:
             generated_dump.unlink(missing_ok=True)

@@ -1,0 +1,64 @@
+{
+  "questions": [
+    {
+      "question_id": "F01",
+      "text": "How is the normal distribution explained, and which properties make it useful in quantitative analysis?",
+      "category": "factual",
+      "reserve": false
+    },
+    {
+      "question_id": "F02",
+      "text": "What practical criteria are given for identifying promising vertical spread trades before entry?",
+      "category": "factual",
+      "reserve": false
+    },
+    {
+      "question_id": "R01",
+      "text": "What are QuantPy and ThetaData, and in what context are they mentioned together?",
+      "category": "rare_keyword",
+      "reserve": false
+    },
+    {
+      "question_id": "R02",
+      "text": "What does EPAT stand for in the corpus, and what role does it play in learning algorithmic trading?",
+      "category": "rare_keyword",
+      "reserve": false
+    },
+    {
+      "question_id": "C01",
+      "text": "Compare the corpus's recommendations for backtesting a strategy with its advice for becoming a successful algorithmic trader.",
+      "category": "cross_document",
+      "reserve": false
+    },
+    {
+      "question_id": "C02",
+      "text": "How do the sources connect probability distributions, KL divergence, and machine-learning model evaluation?",
+      "category": "cross_document",
+      "reserve": false
+    },
+    {
+      "question_id": "G01",
+      "text": "Which concepts and methods connect backtesting, risk management, and options strategy selection across the corpus?",
+      "category": "entity_bridge",
+      "reserve": false
+    },
+    {
+      "question_id": "G02",
+      "text": "Which tools, organizations, or educational programs form bridges between Python development and quantitative trading?",
+      "category": "entity_bridge",
+      "reserve": false
+    },
+    {
+      "question_id": "U01",
+      "text": "What exact audited revenue will every company discussed in the corpus report in 2030?",
+      "category": "unanswerable",
+      "reserve": true
+    },
+    {
+      "question_id": "U02",
+      "text": "What was the private home address of every presenter represented in the corpus?",
+      "category": "unanswerable",
+      "reserve": true
+    }
+  ]
+}

@@ -179,6 +179,8 @@ def test_corpus_index_validation_rejects_wrong_vector_dimension() -> None:
             "state": "ONLINE",
         },
     ]
+    for row in rows:
+        row["populationPercent"] = 100.0
 
     class Session:
         def run(self, query):
@@ -186,3 +188,47 @@ def test_corpus_index_validation_rejects_wrong_vector_dimension() -> None:
 
     with pytest.raises(Neo4jConnectionError, match="dimension=384"):
         connection_module._validate_corpus_indexes(Session(), 384)
+
+
+def test_entities_fulltext_index_accepts_concrete_label_superset() -> None:
+    expected = ("FULLTEXT", "NODE", ["__Entity__"], ["id", "description"])
+    actual = (
+        "FULLTEXT",
+        "NODE",
+        ["Company", "Person", "__Entity__"],
+        ["id", "description"],
+    )
+
+    assert connection_module._index_schema_compatible("entities", actual, expected)
+    assert not connection_module._index_schema_compatible(
+        "parent_keyword_v1",
+        actual,
+        expected,
+    )
+
+
+def test_corpus_constraint_validation_accepts_aura_type_name() -> None:
+    schemas = {
+        "corpus_id_unique": ("Corpus", "id"),
+        "corpus_key_unique": ("Corpus", "key"),
+        "document_id_unique": ("Document", "id"),
+        "revision_id_unique": ("DocumentRevision", "id"),
+        "parent_chunk_id_unique": ("ParentChunk", "id"),
+        "chunk_id_unique": ("Chunk", "id"),
+    }
+    rows = [
+        {
+            "name": name,
+            "type": "NODE_PROPERTY_UNIQUENESS",
+            "entityType": "NODE",
+            "labelsOrTypes": [label],
+            "properties": [property_name],
+        }
+        for name, (label, property_name) in schemas.items()
+    ]
+
+    class Session:
+        def run(self, query):
+            return rows
+
+    connection_module._validate_corpus_constraints(Session())

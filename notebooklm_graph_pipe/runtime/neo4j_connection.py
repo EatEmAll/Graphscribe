@@ -188,21 +188,48 @@ def _neo4j_version(server_agent: str) -> tuple[int, int, int]:
     return tuple(int(value or 0) for value in match.groups())
 
 
-def _validate_corpus_indexes(session: Any, dimension: int) -> None:
+def _index_schema_compatible(
+    name: str,
+    actual: tuple[str, str, list[str], list[str]],
+    expected: tuple[str, str, list[str], list[str]],
+) -> bool:
+    if name != "entities":
+        return actual == expected
+    return (
+        actual[:2] == expected[:2]
+        and set(expected[2]).issubset(actual[2])
+        and actual[3] == expected[3]
+    )
+
+
+def _validate_corpus_indexes(
+    session: Any,
+    dimension: int,
+    retrieval_unit: str = "chunk",
+    vector_index: str = "chunk_embedding_v1",
+    keyword_index: str = "chunk_keyword_v1",
+) -> None:
+    if retrieval_unit not in {"chunk", "parent"}:
+        raise Neo4jConnectionError(f"Unsupported retrieval unit: {retrieval_unit}")
+    if any(not re.fullmatch(r"[A-Za-z0-9_]+", name) for name in (vector_index, keyword_index)):
+        raise Neo4jConnectionError("Retrieval index names may contain only letters, digits, and underscores.")
+    retrieval_label = "ParentChunk" if retrieval_unit == "parent" else "Chunk"
     required = {
         "document_status": ("RANGE", "NODE", ["Document"], ["status"]),
         "revision_ready": ("RANGE", "NODE", ["DocumentRevision"], ["vector_ready", "graph_ready"]),
-        "chunk_parent_id": ("RANGE", "NODE", ["Chunk"], ["parent_id"]),
-        "chunk_keyword_v1": ("FULLTEXT", "NODE", ["Chunk"], ["text"]),
+        keyword_index: ("FULLTEXT", "NODE", [retrieval_label], ["text"]),
         "entities": ("FULLTEXT", "NODE", ["__Entity__"], ["id", "description"]),
         "community_keyword": ("FULLTEXT", "NODE", ["__Community__"], ["summary"]),
-        "chunk_embedding_v1": ("VECTOR", "NODE", ["Chunk"], ["embedding"]),
+        vector_index: ("VECTOR", "NODE", [retrieval_label], ["embedding"]),
     }
+    if retrieval_unit == "chunk":
+        required["chunk_parent_id"] = ("RANGE", "NODE", ["Chunk"], ["parent_id"])
     rows = {
         str(row["name"]): dict(row)
         for row in session.run(
-            "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, options, state "
-            "RETURN name, type, entityType, labelsOrTypes, properties, options, state"
+                "SHOW INDEXES YIELD name, type, entityType, labelsOrTypes, properties, options, state, "
+                "populationPercent RETURN name, type, entityType, labelsOrTypes, properties, options, state, "
+                "populationPercent"
         )
     }
     for name, expected in required.items():
@@ -219,13 +246,18 @@ def _validate_corpus_indexes(session: Any, dimension: int) -> None:
             [str(value) for value in row.get("properties") or []],
         )
         normalized_expected = (expected[0], expected[1], sorted(expected[2]), expected[3])
-        if actual != normalized_expected:
+        if not _index_schema_compatible(name, actual, normalized_expected):
             raise Neo4jConnectionError(
                 f"Corpus index '{name}' has incompatible schema: expected={normalized_expected}, actual={actual}."
             )
         if str(row.get("state")) != "ONLINE":
             raise Neo4jConnectionError(f"Corpus index '{name}' is not ONLINE (state={row.get('state')}).")
-        if name == "chunk_embedding_v1":
+        if float(row.get("populationPercent") or 0.0) != 100.0:
+            raise Neo4jConnectionError(
+                f"Corpus index '{name}' is not fully populated "
+                f"(populationPercent={row.get('populationPercent')})."
+            )
+        if name == vector_index:
             config = dict((dict(row.get("options") or {}).get("indexConfig") or {}))
             actual_dimension = int(config.get("vector.dimensions") or 0)
             similarity = str(config.get("vector.similarity_function") or "").lower()
@@ -256,8 +288,11 @@ def _validate_corpus_constraints(session: Any) -> None:
         row = rows.get(name)
         if row is None:
             raise Neo4jConnectionError(f"Required corpus constraint '{name}' was not created.")
+        constraint_type = str(row.get("type"))
+        if constraint_type == "NODE_PROPERTY_UNIQUENESS":
+            constraint_type = "UNIQUENESS"
         actual = (
-            str(row.get("type")),
+            constraint_type,
             str(row.get("entityType")),
             sorted(str(value) for value in row.get("labelsOrTypes") or []),
             [str(value) for value in row.get("properties") or []],
@@ -275,6 +310,9 @@ def verify_corpus_connection(
     dimension: int = 384,
     initialize_schema: bool = False,
     require_write: bool = False,
+    retrieval_unit: str = "chunk",
+    vector_index: str = "chunk_embedding_v1",
+    keyword_index: str = "chunk_keyword_v1",
 ) -> dict[str, str]:
     server = verify_connection(connection, require_write=require_write or initialize_schema)
     if _neo4j_version(server["agent"]) < (5, 23, 0):
@@ -287,17 +325,23 @@ def verify_corpus_connection(
         with driver.session(database=connection.database) as session:
             if initialize_schema:
                 session.run("CALL db.awaitIndexes(300)").consume()
-            _validate_corpus_indexes(session, dimension)
+            _validate_corpus_indexes(
+                session,
+                dimension,
+                retrieval_unit=retrieval_unit,
+                vector_index=vector_index,
+                keyword_index=keyword_index,
+            )
             _validate_corpus_constraints(session)
             query_vector = [0.0] * dimension
             query_vector[0] = 1.0
             session.run(
-                "CALL db.index.vector.queryNodes('chunk_embedding_v1', 1, $embedding) "
+                f"CALL db.index.vector.queryNodes('{vector_index}', 1, $embedding) "
                 "YIELD node RETURN node LIMIT 1",
                 embedding=query_vector,
             ).consume()
             session.run(
-                "CALL db.index.fulltext.queryNodes('chunk_keyword_v1', $search_text) "
+                f"CALL db.index.fulltext.queryNodes('{keyword_index}', $search_text) "
                 "YIELD node RETURN node LIMIT 1",
                 search_text="__lgp_preflight_no_match__",
             ).consume()

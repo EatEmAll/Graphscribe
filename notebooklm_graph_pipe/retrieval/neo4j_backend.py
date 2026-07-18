@@ -1,15 +1,60 @@
 from __future__ import annotations
 
+import re
 from typing import Any, Sequence
 
 from .models import Candidate
 
 
 class Neo4jRetrievalBackend:
-    def __init__(self, driver: Any, database: str, corpus_id: str):
+    def __init__(
+        self,
+        driver: Any,
+        database: str,
+        corpus_id: str,
+        *,
+        retrieval_unit: str = "chunk",
+        vector_index: str = "chunk_embedding_v1",
+        keyword_index: str = "chunk_keyword_v1",
+    ):
+        if retrieval_unit not in {"chunk", "parent"}:
+            raise ValueError(f"Unsupported retrieval unit: {retrieval_unit}")
+        if any(not re.fullmatch(r"[A-Za-z0-9_]+", name) for name in (vector_index, keyword_index)):
+            raise ValueError("Retrieval index names may contain only letters, digits, and underscores.")
         self.driver = driver
         self.database = database
         self.corpus_id = corpus_id
+        self.retrieval_unit = retrieval_unit
+        self.vector_index = vector_index
+        self.keyword_index = keyword_index
+
+    def _retrieval_match(self) -> str:
+        if self.retrieval_unit == "parent":
+            return (
+                "MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)"
+                "-[:ACTIVE_REVISION]->(revision:DocumentRevision)-[:HAS_PARENT]->(unit:ParentChunk)"
+            )
+        return (
+            "MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)"
+            "-[:ACTIVE_REVISION]->(revision:DocumentRevision)<-[:IN_REVISION]-(unit:Chunk)"
+        )
+
+    def _candidate_projection(self) -> str:
+        if self.retrieval_unit == "parent":
+            return (
+                "unit.id AS chunk_id, unit.id AS parent_id, unit.text AS text, "
+                "document.id AS document_id, document.title AS title, document.source_uri AS source_uri, "
+                "unit.page_start AS page_start, unit.page_end AS page_end, "
+                "unit.timestamp_start_ms AS timestamp_start_ms, "
+                "unit.timestamp_end_ms AS timestamp_end_ms, unit.section_path AS section_path"
+            )
+        return (
+            "unit.id AS chunk_id, unit.parent_id AS parent_id, unit.text AS text, "
+            "document.id AS document_id, document.title AS title, document.source_uri AS source_uri, "
+            "unit.page_start AS page_start, unit.page_end AS page_end, "
+            "unit.timestamp_start_ms AS timestamp_start_ms, "
+            "unit.timestamp_end_ms AS timestamp_end_ms, unit.section_path AS section_path"
+        )
 
     def _session(self):
         return self.driver.session(database=self.database)
@@ -46,26 +91,23 @@ class Neo4jRetrievalBackend:
         filters: dict[str, Any] | None = None,
     ) -> list[Candidate]:
         filter_values = self._filters(filters)
+        retrieval_match = self._retrieval_match()
+        projection = self._candidate_projection()
         with self._session() as session:
             query_limit = max(limit * 3, limit)
             total_indexed: int | None = None
             while True:
                 rows = list(
                     session.run(
-                        """
-                        CALL db.index.vector.queryNodes('chunk_embedding_v1', $query_limit, $embedding)
-                        YIELD node AS chunk, score
-                        MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)-[:ACTIVE_REVISION]->(revision:DocumentRevision)<-[:IN_REVISION]-(chunk)
+                        f"""
+                        CALL db.index.vector.queryNodes('{self.vector_index}', $query_limit, $embedding)
+                        YIELD node AS unit, score
+                        {retrieval_match}
                         WHERE revision.vector_ready = true AND document.status = 'READY'
                           AND ($document_ids = [] OR document.id IN $document_ids)
                           AND ($source_types = [] OR document.source_type IN $source_types)
                           AND ($language IS NULL OR document.language = $language)
-                        RETURN chunk.id AS chunk_id, chunk.parent_id AS parent_id, chunk.text AS text,
-                               document.id AS document_id, document.title AS title, document.source_uri AS source_uri,
-                               chunk.page_start AS page_start, chunk.page_end AS page_end,
-                               chunk.timestamp_start_ms AS timestamp_start_ms,
-                               chunk.timestamp_end_ms AS timestamp_end_ms,
-                               chunk.section_path AS section_path, score
+                        RETURN {projection}, score
                         ORDER BY score DESC
                         LIMIT $limit
                         """,
@@ -81,7 +123,8 @@ class Neo4jRetrievalBackend:
                     return candidates
                 if total_indexed is None:
                     count_row = session.run(
-                        "MATCH (n:Chunk) WHERE n.embedding IS NOT NULL RETURN count(n) AS count"
+                        f"MATCH (n:{'ParentChunk' if self.retrieval_unit == 'parent' else 'Chunk'}) "
+                        "WHERE n.embedding IS NOT NULL RETURN count(n) AS count"
                     ).single()
                     if count_row is None:
                         return candidates
@@ -92,26 +135,23 @@ class Neo4jRetrievalBackend:
 
     def lexical_search(self, query: str, limit: int, filters: dict[str, Any] | None = None) -> list[Candidate]:
         filter_values = self._filters(filters)
+        retrieval_match = self._retrieval_match()
+        projection = self._candidate_projection()
         with self._session() as session:
             query_limit = max(limit * 3, limit)
             total_indexed: int | None = None
             while True:
                 rows = list(
                     session.run(
-                        """
-                        CALL db.index.fulltext.queryNodes('chunk_keyword_v1', $search_text, {limit: $query_limit})
-                        YIELD node AS chunk, score
-                        MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)-[:ACTIVE_REVISION]->(revision:DocumentRevision)<-[:IN_REVISION]-(chunk)
+                        f"""
+                        CALL db.index.fulltext.queryNodes('{self.keyword_index}', $search_text, {{limit: $query_limit}})
+                        YIELD node AS unit, score
+                        {retrieval_match}
                         WHERE revision.vector_ready = true AND document.status = 'READY'
                           AND ($document_ids = [] OR document.id IN $document_ids)
                           AND ($source_types = [] OR document.source_type IN $source_types)
                           AND ($language IS NULL OR document.language = $language)
-                        RETURN chunk.id AS chunk_id, chunk.parent_id AS parent_id, chunk.text AS text,
-                               document.id AS document_id, document.title AS title, document.source_uri AS source_uri,
-                               chunk.page_start AS page_start, chunk.page_end AS page_end,
-                               chunk.timestamp_start_ms AS timestamp_start_ms,
-                               chunk.timestamp_end_ms AS timestamp_end_ms,
-                               chunk.section_path AS section_path, score
+                        RETURN {projection}, score
                         ORDER BY score DESC
                         LIMIT $limit
                         """,
@@ -127,7 +167,8 @@ class Neo4jRetrievalBackend:
                     return candidates
                 if total_indexed is None:
                     count_row = session.run(
-                        "MATCH (n:Chunk) WHERE n.text IS NOT NULL RETURN count(n) AS count"
+                        f"MATCH (n:{'ParentChunk' if self.retrieval_unit == 'parent' else 'Chunk'}) "
+                        "WHERE n.text IS NOT NULL RETURN count(n) AS count"
                     ).single()
                     if count_row is None:
                         return candidates
@@ -146,15 +187,41 @@ class Neo4jRetrievalBackend:
         if hops not in {1, 2}:
             raise ValueError("Graph expansion supports one or two hops.")
         max_path = hops
+        if self.retrieval_unit == "parent":
+            seed_match = (
+                "MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(seed_document:Document)"
+                "-[:ACTIVE_REVISION]->(seed_revision:DocumentRevision)-[:HAS_PARENT]->"
+                "(seed_parent:ParentChunk {id: seed_id})"
+            )
+            evidence_match = (
+                "MATCH (reached)<-[:HAS_ENTITY]-(unit:ParentChunk)"
+                "<-[:HAS_PARENT]-(revision:DocumentRevision)<-[:ACTIVE_REVISION]-(document:Document)"
+                "<-[:HAS_DOCUMENT]-(corpus)"
+            )
+            candidate_projection = self._candidate_projection().replace("unit.", "unit.")
+            seed_exclusion = "NOT unit.id IN $seed_ids"
+        else:
+            seed_match = (
+                "MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(seed_document:Document)"
+                "-[:ACTIVE_REVISION]->(seed_revision:DocumentRevision)<-[:IN_REVISION]-"
+                "(seed:Chunk {id: seed_id})\n"
+                "MATCH (seed)<-[:HAS_CHILD]-(seed_parent:ParentChunk)"
+            )
+            evidence_match = (
+                "MATCH (reached)<-[:HAS_ENTITY]-(evidence_parent:ParentChunk)-[:HAS_CHILD]->(unit:Chunk)\n"
+                "MATCH (corpus)-[:HAS_DOCUMENT]->(document:Document)-[:ACTIVE_REVISION]->"
+                "(revision:DocumentRevision)<-[:IN_REVISION]-(unit)"
+            )
+            candidate_projection = self._candidate_projection()
+            seed_exclusion = "NOT unit.id IN $seed_ids"
         query = f"""
             UNWIND $seed_ids AS seed_id
-            MATCH (corpus:Corpus {{id: $corpus_id}})-[:HAS_DOCUMENT]->(seed_document:Document)-[:ACTIVE_REVISION]->(seed_revision:DocumentRevision)<-[:IN_REVISION]-(seed:Chunk {{id: seed_id}})
-            MATCH (seed:Chunk {{id: seed_id}})<-[:HAS_CHILD]-(seed_parent:ParentChunk)-[:HAS_ENTITY]->(origin:__Entity__)
+            {seed_match}
+            MATCH (seed_parent)-[:HAS_ENTITY]->(origin:__Entity__)
             WHERE COUNT {{ (origin)<-[:HAS_ENTITY]-(:ParentChunk) }} <= $max_entity_degree
             MATCH path=(origin)-[*0..{max_path}]-(reached:__Entity__)
-            MATCH (reached)<-[:HAS_ENTITY]-(evidence_parent:ParentChunk)-[:HAS_CHILD]->(chunk:Chunk)
-            MATCH (corpus)-[:HAS_DOCUMENT]->(document:Document)-[:ACTIVE_REVISION]->(revision:DocumentRevision)<-[:IN_REVISION]-(chunk)
-            WHERE revision.graph_ready = true AND document.status = 'READY' AND NOT chunk.id IN $seed_ids
+            {evidence_match}
+            WHERE revision.graph_ready = true AND document.status = 'READY' AND {seed_exclusion}
               AND ($document_ids = [] OR document.id IN $document_ids)
               AND ($source_types = [] OR document.source_type IN $source_types)
               AND ($language IS NULL OR document.language = $language)
@@ -164,12 +231,7 @@ class Neo4jRetrievalBackend:
                     AND any(parent_id IN coalesce(rel.source_parent_ids, []) WHERE EXISTS {{
                         MATCH (source_parent:ParentChunk {{id: parent_id}})<-[:HAS_PARENT]-(source_revision:DocumentRevision)<-[:ACTIVE_REVISION]-(:Document)<-[:HAS_DOCUMENT]-(corpus)
                     }}))
-            RETURN DISTINCT chunk.id AS chunk_id, chunk.parent_id AS parent_id, chunk.text AS text,
-                   document.id AS document_id, document.title AS title, document.source_uri AS source_uri,
-                   chunk.page_start AS page_start, chunk.page_end AS page_end,
-                   chunk.timestamp_start_ms AS timestamp_start_ms,
-                   chunk.timestamp_end_ms AS timestamp_end_ms,
-                   chunk.section_path AS section_path, origin.id AS origin_entity,
+            RETURN DISTINCT {candidate_projection}, origin.id AS origin_entity,
                    reached.id AS reached_entity, length(path) AS hops
             ORDER BY hops ASC
             LIMIT $limit

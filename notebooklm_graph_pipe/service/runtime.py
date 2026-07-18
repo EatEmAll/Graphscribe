@@ -38,8 +38,20 @@ class RuntimeFactory:
         self._signatures: dict[str, tuple[Any, ...]] = {}
 
     @staticmethod
+    def _retrieval_profile(entry: CorpusRegistryEntry) -> tuple[str, str, str]:
+        manifest = entry.manifest
+        unit = str(getattr(manifest, "retrieval_unit", "chunk"))
+        prefix = "parent" if unit == "parent" else "chunk"
+        return (
+            unit,
+            str(getattr(manifest, "retrieval_vector_index", f"{prefix}_embedding_v1")),
+            str(getattr(manifest, "retrieval_keyword_index", f"{prefix}_keyword_v1")),
+        )
+
+    @staticmethod
     def _signature(entry: CorpusRegistryEntry, connection: ResolvedNeo4jConnection) -> tuple[Any, ...]:
         neo4j = entry.manifest.neo4j
+        retrieval_profile = RuntimeFactory._retrieval_profile(entry)
         return (
             entry.manifest.corpus_id,
             connection.uri,
@@ -51,10 +63,12 @@ class RuntimeFactory:
             entry.manifest.embedding_model,
             entry.manifest.embedding_dimension,
             entry.manifest.embedding_normalized,
+            *retrieval_profile,
         )
 
     def get(self, entry: CorpusRegistryEntry) -> CorpusRuntime:
         connection = resolve_connection_mapping(entry.manifest.neo4j)
+        retrieval_unit, vector_index, keyword_index = self._retrieval_profile(entry)
         signature = self._signature(entry, connection)
         if entry.key in self._runtimes and self._signatures.get(entry.key) == signature:
             return self._runtimes[entry.key]
@@ -72,9 +86,22 @@ class RuntimeFactory:
                 "The corpus embedding metadata is incompatible with the configured retrieval embedder. "
                 "Use a blue-green rebuild for embedding changes."
             )
-        verify_corpus_connection(connection, dimension=entry.manifest.embedding_dimension)
+        verify_corpus_connection(
+            connection,
+            dimension=entry.manifest.embedding_dimension,
+            retrieval_unit=retrieval_unit,
+            vector_index=vector_index,
+            keyword_index=keyword_index,
+        )
         driver = GraphDatabase.driver(connection.uri, auth=(connection.username, connection.password))
-        backend = Neo4jRetrievalBackend(driver, connection.database, entry.manifest.corpus_id)
+        backend = Neo4jRetrievalBackend(
+            driver,
+            connection.database,
+            entry.manifest.corpus_id,
+            retrieval_unit=retrieval_unit,
+            vector_index=vector_index,
+            keyword_index=keyword_index,
+        )
         retriever = HybridRetriever(
             backend,
             MiniLMEmbedder(),

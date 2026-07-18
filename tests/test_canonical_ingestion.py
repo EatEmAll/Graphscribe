@@ -186,6 +186,32 @@ def test_manifest_v3_round_trip(tmp_path: Path) -> None:
 
     assert loaded is not None
     assert loaded.to_dict() == manifest.to_dict()
+    assert loaded.retrieval_unit == "chunk"
+    assert loaded.retrieval_vector_index == "chunk_embedding_v1"
+
+
+def test_manifest_v3_parent_retrieval_profile_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    manifest = CorpusManifest(
+        corpus_id=corpus_id("compact"),
+        corpus_key="compact",
+        title="Compact",
+        neo4j={"uri": "bolt://127.0.0.1:7687"},
+        retrieval_unit="parent",
+        retrieval_vector_index="parent_embedding_v1",
+        retrieval_keyword_index="parent_keyword_v1",
+    )
+    save_manifest(path, manifest)
+
+    loaded = load_manifest(path)
+
+    assert loaded is not None
+    assert loaded.retrieval_unit == "parent"
+    assert loaded.to_dict()["retrieval"] == {
+        "unit": "parent",
+        "vector_index": "parent_embedding_v1",
+        "keyword_index": "parent_keyword_v1",
+    }
 
 
 @pytest.mark.parametrize(

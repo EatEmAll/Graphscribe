@@ -18,6 +18,12 @@ from openai import OpenAI
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 CLI_JSON_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
+CODEX_CLI_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {"payload": {"type": "string"}},
+    "required": ["payload"],
+    "additionalProperties": False,
+}
 DEFAULT_CLI_TIMEOUT_SECONDS = 120.0
 
 
@@ -298,12 +304,17 @@ def _generate_cli_response(
     system_instruction: str,
     reasoning_effort: str | None,
 ) -> CliResponse:
-    combined_prompt = (
-        f"{system_instruction.strip()}\n\n"
-        "Return only one JSON object that satisfies the supplied JSON schema.\n\n"
-        f"{prompt.strip()}"
-    )
-    schema_json = json.dumps(CLI_JSON_SCHEMA, separators=(",", ":"))
+    if client.name == "codex":
+        response_instruction = (
+            "Return only one object matching the supplied schema. Serialize the requested JSON object "
+            "as a JSON string in the payload field."
+        )
+        schema = CODEX_CLI_JSON_SCHEMA
+    else:
+        response_instruction = "Return only one JSON object that satisfies the supplied JSON schema."
+        schema = CLI_JSON_SCHEMA
+    combined_prompt = f"{system_instruction.strip()}\n\n{response_instruction}\n\n{prompt.strip()}"
+    schema_json = json.dumps(schema, separators=(",", ":"))
 
     with tempfile.TemporaryDirectory(prefix=f"llm-{client.name}-") as temp_dir:
         temp_path = Path(temp_dir)
@@ -335,7 +346,15 @@ def _generate_cli_response(
             _run_cli(args, prompt=combined_prompt, cwd=temp_path, timeout_seconds=client.timeout_seconds)
             if not output_path.exists():
                 raise RuntimeError("Codex CLI did not write its final response.")
-            return CliResponse(output_text=output_path.read_text(encoding="utf-8").strip())
+            output_text = output_path.read_text(encoding="utf-8").strip()
+            try:
+                envelope = json.loads(output_text)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError("Codex CLI returned an invalid JSON envelope.") from exc
+            payload = envelope.get("payload") if isinstance(envelope, dict) else None
+            if not isinstance(payload, str):
+                raise RuntimeError("Codex CLI response did not contain a JSON payload string.")
+            return CliResponse(output_text=payload.strip())
 
         args = [
             client.executable,

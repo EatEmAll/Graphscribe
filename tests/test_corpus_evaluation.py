@@ -3,7 +3,15 @@ from __future__ import annotations
 import json
 
 from notebooklm_graph_pipe.runtime.llm_routing import PromptRoleConfig
-from scripts.run_corpus_evaluation import EvaluationModel, citation_validity, evaluate, load_questions
+from scripts.run_corpus_evaluation import (
+    EvaluationModel,
+    EvaluationQuestion,
+    citation_validity,
+    evaluate,
+    load_completed_rows,
+    load_questions,
+    write_report,
+)
 
 
 class Service:
@@ -23,11 +31,31 @@ def test_load_questions_accepts_wrapped_payload(tmp_path) -> None:
 
 
 def test_evaluation_compares_text_and_graph_hybrid() -> None:
-    from scripts.run_corpus_evaluation import EvaluationQuestion
-
     report = evaluate(Service(), "demo", [EvaluationQuestion("Q1", "Question?")])
     assert report["conditions"] == ["hybrid", "graph_hybrid"]
     assert report["summary"]["mean_citation_validity"] == {"hybrid": 1.0, "graph_hybrid": 1.0}
+
+
+def test_evaluation_checkpoints_and_resumes_completed_questions(tmp_path) -> None:
+    output = tmp_path / "evaluation.json"
+    questions = [EvaluationQuestion("Q1", "First?"), EvaluationQuestion("Q2", "Second?")]
+    first = evaluate(
+        Service(),
+        "demo",
+        questions[:1],
+        lambda *_: {"total_score": 10},
+        checkpoint=lambda report: write_report(output, report),
+    )
+    completed = load_completed_rows(output, "demo", questions)
+    report = evaluate(
+        Service(),
+        "demo",
+        questions,
+        lambda *_: {"total_score": 10},
+        completed_rows=completed,
+    )
+    assert first["summary"]["question_count"] == 1
+    assert [row["question_id"] for row in report["questions"]] == ["Q1", "Q2"]
 
 
 def test_citation_validity_rejects_incomplete_targets() -> None:

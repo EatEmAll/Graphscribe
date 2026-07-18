@@ -40,7 +40,7 @@ def test_runtime_is_rebuilt_when_registry_target_changes(monkeypatch) -> None:
             closed.append(self.uri)
 
     monkeypatch.setattr(runtime_module.GraphDatabase, "driver", lambda uri, auth: Driver(uri))
-    monkeypatch.setattr(runtime_module, "Neo4jRetrievalBackend", lambda driver, database, corpus_id: object())
+    monkeypatch.setattr(runtime_module, "Neo4jRetrievalBackend", lambda *args, **kwargs: object())
     monkeypatch.setattr(runtime_module, "MiniLMEmbedder", lambda: object())
     monkeypatch.setattr(runtime_module, "CrossEncoderReranker", lambda: object())
     monkeypatch.setattr(runtime_module, "load_minilm_tokenizer", lambda: object())

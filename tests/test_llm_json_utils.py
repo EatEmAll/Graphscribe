@@ -26,8 +26,10 @@ def test_codex_cli_uses_read_only_structured_noninteractive_execution(
 
     def fake_run(args, *, prompt, cwd, timeout_seconds):
         captured.update(args=args, prompt=prompt, cwd=cwd, timeout_seconds=timeout_seconds)
+        schema_path = Path(args[args.index("--output-schema") + 1])
+        captured["schema"] = json.loads(schema_path.read_text(encoding="utf-8"))
         output_path = Path(args[args.index("--output-last-message") + 1])
-        output_path.write_text('{"verdict":"SAME"}', encoding="utf-8")
+        output_path.write_text('{"payload":"{\\"verdict\\":\\"SAME\\"}"}', encoding="utf-8")
         return subprocess.CompletedProcess(args, 0, "", "")
 
     monkeypatch.setattr(utils, "_run_cli", fake_run)
@@ -44,6 +46,7 @@ def test_codex_cli_uses_read_only_structured_noninteractive_execution(
     assert args[:5] == ["codex.exe", "--ask-for-approval", "never", "--sandbox", "read-only"]
     assert "--ephemeral" in args
     assert "--output-schema" in args
+    assert captured["schema"] == utils.CODEX_CLI_JSON_SCHEMA
     assert 'model_reasoning_effort="medium"' in args
     assert args[-1] == "-"
     assert response.output_text == '{"verdict":"SAME"}'

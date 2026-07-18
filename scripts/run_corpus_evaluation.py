@@ -35,6 +35,7 @@ class EvaluationQuestion:
     id: str
     text: str
     reserve: bool = False
+    category: str = "general"
 
 
 def load_questions(path: Path) -> list[EvaluationQuestion]:
@@ -47,6 +48,7 @@ def load_questions(path: Path) -> list[EvaluationQuestion]:
             id=str(item.get("question_id") or item.get("id") or f"Q{index:02d}"),
             text=str(item["text"]).strip(),
             reserve=bool(item.get("reserve", False)),
+            category=str(item.get("category") or "general"),
         )
         for index, item in enumerate(raw, 1)
     ]
@@ -120,7 +122,8 @@ class EvaluationModel:
         prompt = (
             "Create exactly 10 corpus-grounded evaluation questions. The first 8 are primary and the last 2 are reserves. "
             "Mix fact lookup, paraphrase, rare keyword, cross-document synthesis, entity bridge, disagreement, and unanswerable/coverage questions. "
-            "Return JSON with a questions array; each item has question_id, text, and reserve.\n\n"
+            "Return JSON with a questions array; each item has question_id, text, reserve, and category. "
+            "Use factual, rare_keyword, cross_document, entity_bridge, or unanswerable as category.\n\n"
             + "\n\n".join(context_parts[:16])
         )
         payload, error = self.generator(
@@ -131,6 +134,7 @@ class EvaluationModel:
             system_instruction="Design difficult but answerable source-grounded retrieval evaluations.",
             max_output_tokens=4096,
             temperature=0.0,
+            reasoning_effort=self.question_role.reasoning_effort,
             max_attempts=2,
         )
         if payload is None:
@@ -143,6 +147,7 @@ class EvaluationModel:
                 id=f"Q{index:02d}",
                 text=str(item.get("text") or "").strip(),
                 reserve=index > 8,
+                category=str(item.get("category") or "general"),
             )
             for index, item in enumerate(raw, 1)
         ]
@@ -165,6 +170,7 @@ class EvaluationModel:
             system_instruction="You are a strict retrieval evaluation judge. Use no outside knowledge.",
             max_output_tokens=2048,
             temperature=0.0,
+            reasoning_effort=self.judge_role.reasoning_effort,
             max_attempts=2,
         )
         if payload is None:
@@ -192,9 +198,15 @@ def evaluate(
     corpus_key: str,
     questions: list[EvaluationQuestion],
     judge: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
+    *,
+    completed_rows: list[dict[str, Any]] | None = None,
+    checkpoint: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
-    rows: list[dict[str, Any]] = []
+    rows = list(completed_rows or [])
+    completed_ids = {str(row.get("question_id")) for row in rows}
     for question in questions:
+        if question.id in completed_ids:
+            continue
         answers: dict[str, dict[str, Any]] = {}
         for mode in (TEXT_HYBRID, GRAPH_HYBRID):
             answer = service.answer(corpus_key, {"question": question.text, "mode": mode, "graph_hops": 1})
@@ -203,6 +215,7 @@ def evaluate(
             "question_id": question.id,
             "question": question.text,
             "reserve": question.reserve,
+            "category": question.category,
             "answers": answers,
             "citation_validity": {
                 mode: citation_validity(answer) for mode, answer in answers.items()
@@ -213,8 +226,14 @@ def evaluate(
                 mode: judge(question.text, mode, answer) for mode, answer in answers.items()
             }
         rows.append(row)
+        if checkpoint:
+            checkpoint(build_report(corpus_key, rows, judge is not None))
+    return build_report(corpus_key, rows, judge is not None)
+
+
+def build_report(corpus_key: str, rows: list[dict[str, Any]], judged: bool) -> dict[str, Any]:
     wins = {TEXT_HYBRID: 0, GRAPH_HYBRID: 0, "tie": 0}
-    if judge:
+    if judged:
         for row in rows:
             left = row["judgments"][TEXT_HYBRID]["total_score"]
             right = row["judgments"][GRAPH_HYBRID]["total_score"]
@@ -236,6 +255,34 @@ def evaluate(
     }
 
 
+def write_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    temporary.replace(path)
+
+
+def load_completed_rows(
+    path: Path,
+    corpus_key: str,
+    questions: list[EvaluationQuestion],
+) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    report = json.loads(path.read_text(encoding="utf-8"))
+    if report.get("corpus_key") != corpus_key:
+        raise ValueError(f"Checkpoint corpus mismatch in {path}")
+    expected = {question.id: question for question in questions}
+    rows = report.get("questions") or []
+    for row in rows:
+        question = expected.get(str(row.get("question_id")))
+        if question is None or row.get("question") != question.text or row.get("category") != question.category:
+            raise ValueError(f"Checkpoint question mismatch in {path}")
+        if set((row.get("judgments") or {}).keys()) != {TEXT_HYBRID, GRAPH_HYBRID}:
+            raise ValueError(f"Checkpoint contains an incomplete question in {path}")
+    return rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare text-hybrid and graph-hybrid retrieval on a v3 corpus.")
     parser.add_argument("--manifest-path", required=True)
@@ -251,15 +298,25 @@ def main() -> int:
     )
     if entry is None:
         parser.error("Manifest must live under a registered corpus directory.")
+    output = Path(args.output).resolve() if args.output else manifest_path.parent / "evaluation.json"
     service = CorpusService(registry, RuntimeFactory(args.llm_routing_config), CorpusJobManager(registry, REPO_ROOT))
     try:
         model = EvaluationModel.from_routing_config(args.llm_routing_config)
         questions = load_questions(Path(args.questions_file)) if args.questions_file else model.generate_questions(service, entry.key)
-        report = evaluate(service, entry.key, questions, model.judge)
+        completed_rows = load_completed_rows(output, entry.key, questions)
+        if completed_rows:
+            print(f"Resuming after {len(completed_rows)} completed questions from {output}")
+        report = evaluate(
+            service,
+            entry.key,
+            questions,
+            model.judge,
+            completed_rows=completed_rows,
+            checkpoint=lambda current: write_report(output, current),
+        )
     finally:
         service.close()
-    output = Path(args.output).resolve() if args.output else manifest_path.parent / "evaluation.json"
-    output.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+    write_report(output, report)
     print(output)
     return 0
 

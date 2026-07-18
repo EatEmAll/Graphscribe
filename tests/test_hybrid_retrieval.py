@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from notebooklm_graph_pipe.retrieval.answering import GroundedAnswerer
 from notebooklm_graph_pipe.retrieval.hybrid import HybridRetriever, SearchRequest
 from notebooklm_graph_pipe.retrieval.models import Candidate
@@ -212,3 +214,62 @@ def test_graph_backend_uses_neo4j_5_compatible_variable_paths() -> None:
     assert all(":!HAS_ENTITY" not in query for query, _ in calls)
     assert all("all(rel IN relationships(path)" in query for query, _ in calls)
     assert all(parameters["corpus_id"] == "corpus-id" for _, parameters in calls)
+
+
+def test_parent_backend_uses_declared_indexes_and_parent_paths() -> None:
+    calls = []
+
+    class Result(list):
+        def single(self):
+            return {"count": 1}
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            if "queryNodes" in query:
+                return Result(
+                    [
+                        {
+                            "chunk_id": "parent-1",
+                            "parent_id": "parent-1",
+                            "document_id": "doc-1",
+                            "text": "parent evidence",
+                            "title": "Document",
+                            "source_uri": "doc.md",
+                        }
+                    ]
+                )
+            return Result()
+
+    class Driver:
+        def session(self, **kwargs):
+            return Session()
+
+    backend = Neo4jRetrievalBackend(
+        Driver(),
+        "neo4j",
+        "corpus-id",
+        retrieval_unit="parent",
+        vector_index="parent_embedding_v1",
+        keyword_index="parent_keyword_v1",
+    )
+    result = backend.vector_search([1.0, 0.0], 1)
+    backend.graph_expand(["parent-1"], 1, 5)
+
+    assert result[0].chunk_id == result[0].parent_id == "parent-1"
+    assert "queryNodes('parent_embedding_v1'" in calls[0][0]
+    assert "-[:HAS_PARENT]->(unit:ParentChunk)" in calls[0][0]
+    graph_query = calls[1][0]
+    assert "(seed_parent:ParentChunk {id: seed_id})" in graph_query
+    assert "coalesce(rel.source_parent_ids, [])" in graph_query
+
+
+def test_backend_rejects_unsafe_index_names() -> None:
+    with pytest.raises(ValueError, match="index names"):
+        Neo4jRetrievalBackend(object(), "neo4j", "corpus", vector_index="bad-name")

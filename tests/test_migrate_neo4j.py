@@ -85,6 +85,25 @@ def test_verify_corpus_inventory_rejects_missing_active_embedding() -> None:
         migration.verify_corpus_inventory(inventory, inventory)
 
 
+def test_verify_corpus_inventory_supports_parent_retrieval() -> None:
+    inventory = migration.CorpusInventory(
+        1,
+        1,
+        1,
+        0,
+        0,
+        0,
+        0,
+        parents=2,
+        embedded_parents=1,
+        active_parents=2,
+        active_embedded_parents=1,
+    )
+
+    with pytest.raises(migration.MigrationError, match="active parents are missing embeddings"):
+        migration.verify_corpus_inventory(inventory, inventory, retrieval_unit="parent")
+
+
 def test_complete_staging_resume_skips_recopy_only_for_exact_staged_state() -> None:
     source = migration.GraphInventory(2, 1, {"Document": 2}, {"LINKS": 1})
     target = migration.GraphInventory(2, 1, {"Document": 2, "__LGP_MIGRATION__": 2}, {"LINKS": 1})
@@ -156,6 +175,103 @@ def test_activate_corpus_manifest_preserves_corpus_and_embedding_metadata(tmp_pa
     assert "old-secret" not in path.read_text(encoding="utf-8")
 
 
+def test_manifest_corpus_id_requires_v3_corpus_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_text(json.dumps({"corpus": {"id": "corpus-id"}}), encoding="utf-8")
+    assert migration.manifest_corpus_id(path) == "corpus-id"
+
+    path.write_text(json.dumps({"version": 3}), encoding="utf-8")
+    with pytest.raises(migration.MigrationError, match="corpus.id"):
+        migration.manifest_corpus_id(path)
+
+
+def test_manifest_retrieval_profile_supports_parent_indexes(tmp_path: Path) -> None:
+    path = tmp_path / "manifest.json"
+    path.write_text(
+        json.dumps(
+            {
+                "retrieval": {
+                    "unit": "parent",
+                    "vector_index": "parent_embedding_v1",
+                    "keyword_index": "parent_keyword_v1",
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert migration.manifest_retrieval_profile(path) == (
+        "parent",
+        "parent_embedding_v1",
+        "parent_keyword_v1",
+    )
+    assert migration.corpus_vector_dimension(
+        {"parent_embedding_v1": {"index_config": {"vector.dimensions": 768}}},
+        vector_index="parent_embedding_v1",
+    ) == 768
+
+
+def test_corpus_merge_inventory_totals() -> None:
+    inventory = migration.CorpusMergeInventory(
+        {"Corpus": 1, "Document": 2, "Chunk": 3},
+        {"Corpus:HAS_DOCUMENT:Document": 2, "Chunk:PART_OF:Document": 3},
+        3,
+    )
+    assert inventory.total_nodes == 6
+    assert inventory.total_relationships == 5
+    assert inventory.to_dict()["embedded_chunks"] == 3
+
+
+def test_read_merge_state_rejects_different_target(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "corpus_id": "corpus-id",
+                "source_uri": "bolt://source:7687",
+                "source_database": "neo4j",
+                "target_uri": "bolt://other:7687",
+                "target_database": "neo4j",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(migration.MigrationError, match="does not match"):
+        migration._read_merge_state(
+            path,
+            corpus_id="corpus-id",
+            source_uri="bolt://source:7687",
+            source_database="neo4j",
+            target_uri="bolt://target:7687",
+            target_database="neo4j",
+        )
+
+
+def test_read_merge_state_rejects_different_database(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "corpus_id": "corpus-id",
+                "source_uri": "bolt://source:7687",
+                "source_database": "neo4j",
+                "target_uri": "bolt://target:7687",
+                "target_database": "other",
+            }
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(migration.MigrationError, match="does not match"):
+        migration._read_merge_state(
+            path,
+            corpus_id="corpus-id",
+            source_uri="bolt://source:7687",
+            source_database="neo4j",
+            target_uri="bolt://target:7687",
+            target_database="neo4j",
+        )
+
+
 def test_portable_dry_run_rejects_non_empty_target_without_overwrite(monkeypatch) -> None:
     class Driver:
         def __enter__(self):
@@ -200,6 +316,28 @@ def test_main_requires_exact_overwrite_confirmation(monkeypatch) -> None:
                 "--overwrite-target",
                 "--confirm-target",
                 "wrong",
+            ]
+        )
+
+
+def test_main_requires_exact_corpus_merge_confirmation(tmp_path: Path, monkeypatch) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(json.dumps({"corpus": {"id": "corpus-id"}}), encoding="utf-8")
+    monkeypatch.setenv("NEO4J_TARGET_PASSWORD", "secret")
+    monkeypatch.setenv("NEO4J_SOURCE_PASSWORD", "secret")
+
+    with pytest.raises(migration.MigrationError, match="must exactly match"):
+        migration.main(
+            [
+                "--mode",
+                "corpus-merge",
+                "--source-uri",
+                "bolt://source:7687",
+                "--target-uri",
+                "bolt://target:7687",
+                "--manifest-path",
+                str(manifest),
+                "--execute",
             ]
         )
 
@@ -298,7 +436,12 @@ def test_aura_container_upload_keeps_password_out_of_command(tmp_path: Path, mon
     )
 
     assert summary["verified"] is True
-    assert "secret" not in " ".join(captured["command"])
+    command = captured["command"]
+    assert "secret" not in " ".join(command)
+    entrypoint = command.index("--entrypoint")
+    assert command[entrypoint + 1] == "neo4j-admin"
+    image = command.index("neo4j:5.26.7")
+    assert command[image + 1 : image + 3] == ["database", "upload"]
     assert captured["env"]["NEO4J_PASSWORD"] == "secret"
 
 
