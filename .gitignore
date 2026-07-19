@@ -10,3 +10,4 @@ models/local_model/
 data/corpora/
 data/migrations/
 data/notebooklm_exports/
+docs/
