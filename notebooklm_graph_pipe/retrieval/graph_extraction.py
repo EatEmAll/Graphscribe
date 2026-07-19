@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
@@ -16,6 +16,10 @@ from notebooklm_graph_pipe.runtime.llm_routing import (
 
 class GraphTransformer(Protocol):
     async def transform(self, text: str, parent_id: str) -> Any: ...
+
+
+class GraphCapacityError(RuntimeError):
+    pass
 
 
 class LangChainGraphTransformer:
@@ -71,16 +75,22 @@ class LangChainGraphTransformer:
 class GraphExtractionWorker:
     store: Any
     transformer: GraphTransformer
+    capacity_guard: Callable[[int, int], None] | None = None
 
     @classmethod
-    def from_routing_config(cls, store: Any, config_path: str | None) -> "GraphExtractionWorker":
+    def from_routing_config(
+        cls,
+        store: Any,
+        config_path: str | None,
+        capacity_guard: Callable[[int, int], None] | None = None,
+    ) -> "GraphExtractionWorker":
         role = resolve_prompt_role(
             config_path,
             GRAPH_EXTRACTION_ROLE,
             default_client="genai",
             default_model="gemini-2.5-flash",
         )
-        return cls(store, LangChainGraphTransformer(role))
+        return cls(store, LangChainGraphTransformer(role), capacity_guard)
 
     async def run_batch(self, limit: int = 100) -> dict[str, int]:
         completed = 0
@@ -89,8 +99,17 @@ class GraphExtractionWorker:
         for parent in parents:
             try:
                 graph_document = await self.transformer.transform(parent["text"], parent["parent_id"])
-                self.store.persist_parent_graph(parent["parent_id"], parent["child_ids"], graph_document)
+                if self.capacity_guard is not None:
+                    self.capacity_guard(len(graph_document.nodes), len(graph_document.relationships))
+                self.store.persist_parent_graph(
+                    parent["parent_id"],
+                    parent["child_ids"],
+                    graph_document,
+                    revision_id=parent.get("revision_id"),
+                )
                 completed += 1
+            except GraphCapacityError:
+                raise
             except Exception as exc:
                 self.store.fail_parent_graph(parent["parent_id"], str(exc))
                 failed += 1

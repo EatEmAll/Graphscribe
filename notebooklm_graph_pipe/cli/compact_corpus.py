@@ -16,6 +16,7 @@ from typing import Any, Iterable, Iterator, Mapping, Sequence
 
 from neo4j import GraphDatabase
 
+from notebooklm_graph_pipe.ingestion.embeddings import EmbeddingError, weighted_parent_embedding as _weighted_parent_embedding
 from notebooklm_graph_pipe.ingestion.manifest import CorpusManifest, load_manifest, save_manifest
 from notebooklm_graph_pipe.runtime.neo4j_connection import (
     Neo4jConnectionSpec,
@@ -51,6 +52,13 @@ class CompactCorpusGateError(CompactCorpusError):
     def __init__(self, message: str, report: dict[str, Any]):
         super().__init__(message)
         self.report = report
+
+
+def weighted_parent_embedding(children: Iterable[Mapping[str, Any]]) -> list[float]:
+    try:
+        return _weighted_parent_embedding(children)
+    except EmbeddingError as exc:
+        raise CompactCorpusError(str(exc)) from exc
 
 
 @dataclass(frozen=True)
@@ -163,35 +171,6 @@ def match_parent_text(
         if (best.coverage, best.similarity) == (runner_up.coverage, runner_up.similarity):
             return None
     return best
-
-
-def weighted_parent_embedding(children: Iterable[Mapping[str, Any]]) -> list[float]:
-    totals: list[float] | None = None
-    total_weight = 0.0
-    seen_text: set[str] = set()
-    for child in children:
-        normalized = normalize_text(str(child.get("text") or ""))
-        if normalized in seen_text:
-            continue
-        seen_text.add(normalized)
-        embedding = [float(value) for value in child.get("embedding") or []]
-        if not embedding:
-            continue
-        if totals is None:
-            totals = [0.0] * len(embedding)
-        if len(embedding) != len(totals):
-            raise CompactCorpusError("Child embeddings within one parent have inconsistent dimensions.")
-        weight = max(1.0, float(child.get("token_count") or 1.0))
-        for index, value in enumerate(embedding):
-            totals[index] += value * weight
-        total_weight += weight
-    if totals is None or not total_weight:
-        raise CompactCorpusError("Cannot create a parent embedding without embedded child text.")
-    averaged = [value / total_weight for value in totals]
-    norm = math.sqrt(sum(value * value for value in averaged))
-    if not norm:
-        raise CompactCorpusError("Cannot normalize a zero parent embedding.")
-    return [value / norm for value in averaged]
 
 
 def _batches(values: Sequence[Any], size: int) -> Iterator[Sequence[Any]]:

@@ -323,6 +323,11 @@ def test_parent_graph_mentions_are_not_copied_to_every_child() -> None:
     )
     assert "$parent_id" in relationship_query
     assert relationship_parameters["parent_id"] == "parent"
+    node_query = next(query for query, _ in calls if "MERGE (node:__Entity__" in query)
+    assert "ON CREATE SET" in node_query
+    assert "SET node.last_seen_revision" in node_query
+    assert "SET node:" not in node_query.split("ON CREATE SET", 1)[0]
+    assert "ON CREATE SET rel += row.properties" in relationship_query
 
 
 def test_graph_types_are_normalized_to_safe_cypher_identifiers() -> None:

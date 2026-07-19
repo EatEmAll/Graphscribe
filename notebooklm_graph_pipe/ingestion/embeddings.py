@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 import math
+import re
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -16,6 +17,38 @@ class EmbeddingConfig:
 
 class EmbeddingError(RuntimeError):
     pass
+
+
+def weighted_parent_embedding(children: Iterable[Mapping[str, Any]]) -> list[float]:
+    """Token-weighted, text-deduplicated, L2-normalized child embedding mean."""
+    totals: list[float] | None = None
+    total_weight = 0.0
+    seen_text: set[str] = set()
+    for child in children:
+        normalized = " ".join(
+            re.findall(r"\w+", str(child.get("text") or "").casefold(), flags=re.UNICODE)
+        )
+        if normalized in seen_text:
+            continue
+        seen_text.add(normalized)
+        embedding = [float(value) for value in child.get("embedding") or []]
+        if not embedding:
+            continue
+        if totals is None:
+            totals = [0.0] * len(embedding)
+        if len(embedding) != len(totals):
+            raise EmbeddingError("Child embeddings within one parent have inconsistent dimensions.")
+        weight = max(1.0, float(child.get("token_count") or 1.0))
+        for index, value in enumerate(embedding):
+            totals[index] += value * weight
+        total_weight += weight
+    if totals is None or not total_weight:
+        raise EmbeddingError("Cannot create a parent embedding without embedded child text.")
+    averaged = [value / total_weight for value in totals]
+    norm = math.sqrt(sum(value * value for value in averaged))
+    if not norm:
+        raise EmbeddingError("Cannot normalize a zero parent embedding.")
+    return [value / norm for value in averaged]
 
 
 class MiniLMEmbedder:

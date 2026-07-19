@@ -414,10 +414,18 @@ def _resolve_client(clients: dict[str, Any] | Any, client_name: str) -> Any:
     return clients
 
 
-def fetch_concept_only_nodes(session, max_nodes: int | None) -> list[dict[str, Any]]:
+def fetch_concept_only_nodes(
+    session,
+    max_nodes: int | None,
+    scope_revision_ids: list[str] | None = None,
+) -> list[dict[str, Any]]:
     query = """
         MATCH (n:__Entity__:Concept)
         WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+          AND ($scope_revision_ids IS NULL OR EXISTS {
+              MATCH (n)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(revision:DocumentRevision)
+              WHERE revision.id IN $scope_revision_ids
+          })
         OPTIONAL MATCH (n)-[r]-(m)
         OPTIONAL MATCH (n)-[tax:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A]->()
         WITH n,
@@ -440,9 +448,9 @@ def fetch_concept_only_nodes(session, max_nodes: int | None) -> list[dict[str, A
     """
     if max_nodes is not None:
         query += "\nLIMIT $max_nodes"
-        result = session.run(query, max_nodes=max_nodes)
+        result = session.run(query, max_nodes=max_nodes, scope_revision_ids=scope_revision_ids)
     else:
-        result = session.run(query)
+        result = session.run(query, scope_revision_ids=scope_revision_ids)
     return [
         {
             "eid": row["eid"],
@@ -507,6 +515,7 @@ def run(
     cache_file: str = DEFAULT_CACHE_FILE,
     summary_json: str | None = None,
     llm_routing_config: str | None = None,
+    scope_revision_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     primary_role_config = resolve_prompt_role(
         llm_routing_config,
@@ -534,7 +543,15 @@ def run(
     try:
         with driver.session(database=neo4j_database) as session:
             print("Fetching Concept-only nodes...")
-            nodes = fetch_concept_only_nodes(session, max_nodes=max_nodes)
+            nodes = (
+                fetch_concept_only_nodes(
+                    session,
+                    max_nodes=max_nodes,
+                    scope_revision_ids=scope_revision_ids,
+                )
+                if scope_revision_ids is not None
+                else fetch_concept_only_nodes(session, max_nodes=max_nodes)
+            )
             print(f"  Found {len(nodes)} Concept-only nodes")
 
             reclassified = 0

@@ -21,7 +21,7 @@ def test_weighted_parent_embedding_deduplicates_text_and_normalizes() -> None:
     result = weighted_parent_embedding(
         [
             {"text": "alpha", "token_count": 2, "embedding": [1.0, 0.0]},
-            {"text": "alpha", "token_count": 50, "embedding": [0.0, 1.0]},
+            {"text": "ALPHA!", "token_count": 50, "embedding": [0.0, 1.0]},
             {"text": "beta", "token_count": 1, "embedding": [0.0, 1.0]},
         ]
     )

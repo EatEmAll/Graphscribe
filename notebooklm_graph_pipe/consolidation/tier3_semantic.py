@@ -470,7 +470,7 @@ def _resolve_client(clients: dict[str, Any] | Any, client_name: str) -> Any:
     return clients
 
 
-def fetch_entities(session) -> list[dict[str, Any]]:
+def fetch_entities(session, scope_revision_ids: list[str] | None = None) -> list[dict[str, Any]]:
     result = session.run(
         """
         MATCH (n:__Entity__)
@@ -489,8 +489,13 @@ def fetch_entities(session) -> list[dict[str, Any]]:
             degree,
             relation_types,
             neighbor_label_sets,
-            taxonomy_neighbor_eids
-        """
+            taxonomy_neighbor_eids,
+            CASE WHEN $scope_revision_ids IS NULL THEN true ELSE EXISTS {
+                MATCH (n)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(revision:DocumentRevision)
+                WHERE revision.id IN $scope_revision_ids
+            } END AS in_scope
+        """,
+        scope_revision_ids=scope_revision_ids,
     )
     return [
         {
@@ -508,6 +513,7 @@ def fetch_entities(session) -> list[dict[str, Any]]:
                 if label and label != "__Entity__"
             ][:8],
             "taxonomy_neighbor_eids": [value for value in row["taxonomy_neighbor_eids"] if value],
+            "in_scope": bool(row["in_scope"]),
         }
         for row in result
     ]
@@ -579,6 +585,7 @@ def run(
     neo4j_database: str = DEFAULT_NEO4J_DATABASE,
     summary_json: str | None = None,
     llm_routing_config: str | None = None,
+    scope_revision_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     embedding_role_config = resolve_embedding_role(
@@ -612,7 +619,13 @@ def run(
     try:
         with driver.session(database=neo4j_database) as session:
             print("Fetching all __Entity__ nodes...")
-            entities = fetch_entities(session)
+            entities = (
+                fetch_entities(session, scope_revision_ids)
+                if scope_revision_ids is not None
+                else fetch_entities(session)
+            )
+            for entity in entities:
+                entity.setdefault("in_scope", True)
             print(f"  Total: {len(entities)}")
 
             if not entities:
@@ -677,33 +690,63 @@ def run(
             filtered_out = 0
             total = len(entities)
             row_candidate_limit = max(1, min(NEIGHBORS_PER_ENTITY, max_candidates))
-            for left_index in range(total):
-                similarities = emb_norm[left_index] @ emb_norm[left_index + 1 :].T
-                if similarities.size == 0:
-                    continue
-                candidate_offsets = np.flatnonzero(similarities >= threshold)
-                if candidate_offsets.size == 0:
-                    continue
-                if candidate_offsets.size > row_candidate_limit:
-                    top_local = np.argpartition(similarities[candidate_offsets], -row_candidate_limit)[-row_candidate_limit:]
-                    candidate_offsets = candidate_offsets[top_local]
-                ordered_offsets = candidate_offsets[np.argsort(similarities[candidate_offsets])[::-1]]
-                for offset in ordered_offsets:
-                    similarity = float(similarities[offset])
-                    right_index = left_index + 1 + offset
-                    entity_a = entities[left_index]
-                    entity_b = entities[right_index]
-                    if _should_skip_pair(entity_a, entity_b):
-                        filtered_out += 1
-                        continue
-                    candidates_all.append(
-                        (
-                            left_index,
-                            right_index,
-                            float(similarity),
-                            _alias_priority(entity_a, entity_b),
+            if scope_revision_ids is None:
+                for left_index in range(total):
+                    similarities = emb_norm[left_index] @ emb_norm[left_index + 1 :].T
+                    candidate_offsets = np.flatnonzero(similarities >= threshold)
+                    if candidate_offsets.size > row_candidate_limit:
+                        top_local = np.argpartition(
+                            similarities[candidate_offsets], -row_candidate_limit
+                        )[-row_candidate_limit:]
+                        candidate_offsets = candidate_offsets[top_local]
+                    ordered_offsets = candidate_offsets[np.argsort(similarities[candidate_offsets])[::-1]]
+                    for offset in ordered_offsets:
+                        right_index = left_index + 1 + int(offset)
+                        entity_a = entities[left_index]
+                        entity_b = entities[right_index]
+                        if _should_skip_pair(entity_a, entity_b):
+                            filtered_out += 1
+                            continue
+                        candidates_all.append(
+                            (
+                                left_index,
+                                right_index,
+                                float(similarities[offset]),
+                                _alias_priority(entity_a, entity_b),
+                            )
                         )
-                    )
+            else:
+                scoped_indices = [index for index, entity in enumerate(entities) if entity["in_scope"]]
+                seen_pairs: set[tuple[int, int]] = set()
+                for scoped_index in scoped_indices:
+                    similarities = emb_norm[scoped_index] @ emb_norm.T
+                    candidate_indices = np.flatnonzero(similarities >= threshold)
+                    candidate_indices = candidate_indices[candidate_indices != scoped_index]
+                    if candidate_indices.size > row_candidate_limit:
+                        top_local = np.argpartition(
+                            similarities[candidate_indices], -row_candidate_limit
+                        )[-row_candidate_limit:]
+                        candidate_indices = candidate_indices[top_local]
+                    ordered_indices = candidate_indices[np.argsort(similarities[candidate_indices])[::-1]]
+                    for candidate_index in ordered_indices:
+                        left_index, right_index = sorted((scoped_index, int(candidate_index)))
+                        pair = (left_index, right_index)
+                        if pair in seen_pairs:
+                            continue
+                        seen_pairs.add(pair)
+                        entity_a = entities[left_index]
+                        entity_b = entities[right_index]
+                        if _should_skip_pair(entity_a, entity_b):
+                            filtered_out += 1
+                            continue
+                        candidates_all.append(
+                            (
+                                left_index,
+                                right_index,
+                                float(similarities[candidate_index]),
+                                _alias_priority(entity_a, entity_b),
+                            )
+                        )
 
             candidates_sorted = sorted(candidates_all, key=lambda item: (-item[3], -item[2]))
             candidates = candidates_sorted[:max_candidates]
@@ -723,6 +766,8 @@ def run(
             for left_index, right_index, similarity, _priority in candidates:
                 entity_a = entities[left_index]
                 entity_b = entities[right_index]
+                if entity_a["in_scope"] and not entity_b["in_scope"]:
+                    entity_a, entity_b = entity_b, entity_a
                 if entity_a["eid"] in merged_eids or entity_b["eid"] in merged_eids:
                     continue
 

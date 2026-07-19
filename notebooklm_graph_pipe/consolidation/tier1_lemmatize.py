@@ -48,14 +48,22 @@ def canonical(name: str) -> str:
     return " ".join(words)
 
 
-def fetch_entities(session) -> list[dict[str, Any]]:
+def fetch_entities(session, scope_revision_ids: list[str] | None = None) -> list[dict[str, Any]]:
     result = session.run(
         """
         MATCH (n:__Entity__)
-        RETURN elementId(n) AS eid, n.id AS name, labels(n) AS labels
-        """
+        RETURN elementId(n) AS eid, n.id AS name, labels(n) AS labels,
+               CASE WHEN $scope_revision_ids IS NULL THEN true ELSE EXISTS {
+                   MATCH (n)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(revision:DocumentRevision)
+                   WHERE revision.id IN $scope_revision_ids
+               } END AS in_scope
+        """,
+        scope_revision_ids=scope_revision_ids,
     )
-    return [{"eid": row["eid"], "name": row["name"], "labels": row["labels"]} for row in result]
+    return [
+        {"eid": row["eid"], "name": row["name"], "labels": row["labels"], "in_scope": bool(row["in_scope"])}
+        for row in result
+    ]
 
 
 def merge_group(session, eids: list[str], canonical_name: str, dry_run: bool) -> None:
@@ -88,12 +96,17 @@ def run(
     neo4j_user: str,
     neo4j_password: str,
     neo4j_database: str,
+    scope_revision_ids: list[str] | None = None,
 ) -> None:
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     try:
         with driver.session(database=neo4j_database) as session:
             print("Fetching all __Entity__ nodes...")
-            entities = fetch_entities(session)
+            entities = (
+                fetch_entities(session, scope_revision_ids)
+                if scope_revision_ids is not None
+                else fetch_entities(session)
+            )
             print(f"  Total entities: {len(entities)}")
 
             groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
@@ -104,7 +117,11 @@ def run(
                 key = canonical(name)
                 groups[key].append(entity)
 
-            merge_candidates = {key: members for key, members in groups.items() if len(members) > 1}
+            merge_candidates = {
+                key: sorted(members, key=lambda member: member["in_scope"])
+                for key, members in groups.items()
+                if len(members) > 1 and any(member["in_scope"] for member in members)
+            }
             print(f"  Merge candidate groups: {len(merge_candidates)}")
 
             if not merge_candidates:

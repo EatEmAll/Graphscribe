@@ -1,0 +1,4 @@
+interface:
+  display_name: "Update Aura Compact Corpus"
+  short_description: "Safely add sources and consolidate graph deltas"
+  default_prompt: "Use $update-aura-compact-corpus to update the Aura-authoritative parent corpus with new sources and validate the graph delta."

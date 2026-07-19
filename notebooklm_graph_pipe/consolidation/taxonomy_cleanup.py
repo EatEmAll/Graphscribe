@@ -226,15 +226,22 @@ def fetch_taxonomy_candidates(
     *,
     seed_eids: list[str],
     max_nodes: int,
+    scope_revision_ids: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     query = """
         MATCH (n:__Entity__)
         WHERE
             (
+                (
                 n:Concept
                 AND ALL(label IN labels(n) WHERE label IN ['__Entity__', 'Concept'])
+                )
+                OR elementId(n) IN $seed_eids
             )
-            OR elementId(n) IN $seed_eids
+            AND ($scope_revision_ids IS NULL OR EXISTS {
+            MATCH (n)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(revision:DocumentRevision)
+            WHERE revision.id IN $scope_revision_ids
+            })
         OPTIONAL MATCH (n)-[r]-(m)
         OPTIONAL MATCH (n)-[tax:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A]->(tax_target)
         WITH n,
@@ -265,7 +272,11 @@ def fetch_taxonomy_candidates(
             degree DESC,
             toLower(toString(n.id)) ASC
     """
-    result = session.run(query, seed_eids=seed_eids)
+    result = session.run(
+        query,
+        seed_eids=seed_eids,
+        scope_revision_ids=scope_revision_ids,
+    )
     return [
         {
             "eid": row["eid"],
@@ -1058,6 +1069,7 @@ def run(
     summary_json: str | None,
     decisions_jsonl: str | None,
     llm_routing_config: str | None = None,
+    scope_revision_ids: list[str] | None = None,
 ) -> dict[str, Any]:
     primary_role_config = resolve_prompt_role(
         llm_routing_config,
@@ -1092,10 +1104,16 @@ def run(
             tier2_seed_eids = _seed_eids_from_tier2(tier2_decisions)
             carry_forward_seed_eids = _seed_eids_from_prior_taxonomy(prior_taxonomy_decisions)
             review_focus_names = _review_focus_name_set(prior_review)
-            raw_nodes = fetch_taxonomy_candidates(
-                session,
-                seed_eids=list(dict.fromkeys(tier2_seed_eids + carry_forward_seed_eids)),
-                max_nodes=max_nodes,
+            seed_eids = list(dict.fromkeys(tier2_seed_eids + carry_forward_seed_eids))
+            raw_nodes = (
+                fetch_taxonomy_candidates(
+                    session,
+                    seed_eids=seed_eids,
+                    max_nodes=max_nodes,
+                    scope_revision_ids=scope_revision_ids,
+                )
+                if scope_revision_ids is not None
+                else fetch_taxonomy_candidates(session, seed_eids=seed_eids, max_nodes=max_nodes)
             )
             nodes, residual_seed_count, carry_forward_seed_count, review_focus_seed_count = _prioritize_taxonomy_nodes(
                 raw_nodes,

@@ -33,6 +33,14 @@ OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimension)}, `vector.similari
 """.strip()
 
 
+def parent_vector_index_query(dimension: int) -> str:
+    return f"""
+CREATE VECTOR INDEX parent_embedding_v1 IF NOT EXISTS
+FOR (n:ParentChunk) ON (n.embedding)
+OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimension)}, `vector.similarity_function`: 'cosine'}}}}
+""".strip()
+
+
 def _cypher_identifier(value: str, fallback: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
     if not normalized:
@@ -67,6 +75,18 @@ class Neo4jCorpusStore:
             for query in SCHEMA_QUERIES:
                 session.run(query).consume()
             session.run(vector_index_query(dimension)).consume()
+
+    def ensure_parent_retrieval_schema(self, dimension: int = 384) -> None:
+        """Create the shared corpus schema plus compact parent retrieval indexes."""
+        with self._session() as session:
+            for query in SCHEMA_QUERIES:
+                if "chunk_keyword_v1" not in query:
+                    session.run(query).consume()
+            session.run(
+                "CREATE FULLTEXT INDEX parent_keyword_v1 IF NOT EXISTS "
+                "FOR (n:ParentChunk) ON EACH [n.text]"
+            ).consume()
+            session.run(parent_vector_index_query(dimension)).consume()
 
     def assert_embedding_fingerprint(self, corpus_key: str, fingerprint: str) -> None:
         with self._session() as session:
@@ -170,6 +190,7 @@ class Neo4jCorpusStore:
                     revision_id=document.revision_id,
                     rows=rows,
                 ).consume()
+
         for rows in _batches(child_rows, self.batch_size):
             with self._session() as session:
                 session.run(
@@ -206,6 +227,144 @@ class Neo4jCorpusStore:
                     rows=rows,
                 ).consume()
 
+    def begin_compact_revision(
+        self,
+        *,
+        corpus_key: str,
+        corpus_title: str,
+        embedding_fingerprint: str,
+        document: CanonicalDocument,
+        chunks: ChunkingResult,
+        parent_embeddings: Sequence[Sequence[float]],
+    ) -> None:
+        """Persist a parent-only revision; child chunks remain transient."""
+        if len(chunks.parents) != len(parent_embeddings):
+            raise ValueError("Every parent chunk must have exactly one embedding.")
+        with self._session() as session:
+            session.run(
+                """
+                MERGE (corpus:Corpus {id: $corpus_id})
+                SET corpus.key = $corpus_key,
+                    corpus.title = $corpus_title,
+                    corpus.schema_version = 3,
+                    corpus.embedding_fingerprint = $embedding_fingerprint
+                MERGE (document:Document {id: $document_id})
+                WITH corpus, document
+                OPTIONAL MATCH (document)-[:ACTIVE_REVISION]->(active_revision:DocumentRevision)
+                SET document.source_type = $source_type,
+                    document.source_uri = $source_uri,
+                    document.relative_path = $relative_path,
+                    document.title = $title,
+                    document.language = $language,
+                    document.status = CASE WHEN active_revision IS NULL THEN 'BUILDING' ELSE 'READY' END
+                WITH corpus, document
+                MERGE (corpus)-[:HAS_DOCUMENT]->(document)
+                MERGE (revision:DocumentRevision {id: $revision_id})
+                SET revision.checksum = $checksum,
+                    revision.extractor = $extractor,
+                    revision.extractor_version = $extractor_version,
+                    revision.status = 'BUILDING',
+                    revision.vector_ready = false,
+                    revision.graph_ready = false,
+                    revision.retrieval_unit = 'parent',
+                    revision.created_at = datetime()
+                MERGE (document)-[:HAS_REVISION]->(revision)
+                """,
+                corpus_id=document.corpus_id,
+                corpus_key=corpus_key,
+                corpus_title=corpus_title,
+                embedding_fingerprint=embedding_fingerprint,
+                document_id=document.document_id,
+                source_type=document.source_type,
+                source_uri=document.source_uri,
+                relative_path=document.relative_path,
+                title=document.title,
+                language=document.language,
+                revision_id=document.revision_id,
+                checksum=document.source_checksum,
+                extractor=document.extractor,
+                extractor_version=document.extractor_version,
+            ).consume()
+
+        parent_rows = []
+        for parent, embedding in zip(chunks.parents, parent_embeddings, strict=True):
+            parent_rows.append(
+                {
+                    **asdict(parent),
+                    "section_path": list(parent.section_path),
+                    "block_ids": list(parent.block_ids),
+                    "embedding": list(embedding),
+                }
+            )
+        for rows in _batches(parent_rows, self.batch_size):
+            with self._session() as session:
+                session.run(
+                    """
+                    MATCH (revision:DocumentRevision {id: $revision_id})
+                    UNWIND $rows AS row
+                    MERGE (parent:ParentChunk {id: row.id})
+                    SET parent += row,
+                        parent.graph_status = 'PENDING',
+                        parent.graph_attempts = 0
+                    MERGE (revision)-[:HAS_PARENT]->(parent)
+                    """,
+                    revision_id=document.revision_id,
+                    rows=rows,
+                ).consume()
+
+    def activate_compact_revision(self, document_id: str, revision_id: str, expected_parents: int) -> None:
+        with self._session() as session:
+            result = session.run(
+                """
+                MATCH (document:Document {id: $document_id})-[:HAS_REVISION]->(revision:DocumentRevision {id: $revision_id})
+                MATCH (revision)-[:HAS_PARENT]->(parent:ParentChunk)
+                WITH document, revision, count(parent) AS actual,
+                     count(parent.embedding) AS embedded
+                WHERE actual = $expected AND embedded = $expected
+                OPTIONAL MATCH (document)-[old:ACTIVE_REVISION]->(previous:DocumentRevision)
+                DELETE old
+                FOREACH (_ IN CASE WHEN previous IS NULL THEN [] ELSE [1] END |
+                    SET previous.status = 'INACTIVE', previous.deactivated_at = datetime())
+                MERGE (document)-[:ACTIVE_REVISION]->(revision)
+                SET revision.status = 'ACTIVE', revision.vector_ready = true,
+                    document.status = 'READY'
+                RETURN actual
+                """,
+                document_id=document_id,
+                revision_id=revision_id,
+                expected=expected_parents,
+            ).single()
+            if not result:
+                raise RuntimeError(
+                    "Compact revision activation failed because stored parent/embedding counts "
+                    f"did not equal {expected_parents}."
+                )
+
+    def assert_existing_corpus(self, corpus_id: str, corpus_key: str) -> None:
+        with self._session() as session:
+            row = session.run(
+                "MATCH (c:Corpus {id: $corpus_id, key: $corpus_key}) RETURN c.id AS id",
+                corpus_id=corpus_id,
+                corpus_key=corpus_key,
+            ).single()
+            if not row:
+                raise ValueError(
+                    f"Target does not contain expected corpus id={corpus_id!r}, key={corpus_key!r}."
+                )
+
+    def active_revision_for_document(self, document_id: str) -> dict[str, Any] | None:
+        with self._session() as session:
+            row = session.run(
+                """
+                MATCH (document:Document {id: $document_id})-[:ACTIVE_REVISION]->(revision:DocumentRevision)
+                RETURN revision.id AS revision_id, revision.checksum AS checksum,
+                       revision.extractor AS extractor,
+                       revision.extractor_version AS extractor_version,
+                       revision.graph_ready AS graph_ready
+                """,
+                document_id=document_id,
+            ).single()
+            return dict(row) if row else None
     def activate_revision(self, document_id: str, revision_id: str, expected_chunks: int) -> None:
         with self._session() as session:
             result = session.run(
@@ -217,7 +376,7 @@ class Neo4jCorpusStore:
                 OPTIONAL MATCH (document)-[old:ACTIVE_REVISION]->(previous:DocumentRevision)
                 DELETE old
                 FOREACH (_ IN CASE WHEN previous IS NULL THEN [] ELSE [1] END |
-                    SET previous.status = 'INACTIVE')
+                    SET previous.status = 'INACTIVE', previous.deactivated_at = datetime())
                 MERGE (document)-[:ACTIVE_REVISION]->(revision)
                 SET revision.status = 'ACTIVE', revision.vector_ready = true,
                     document.status = 'READY'
@@ -265,7 +424,13 @@ class Neo4jCorpusStore:
             )
             return [dict(row) for row in rows]
 
-    def persist_parent_graph(self, parent_id: str, child_ids: Sequence[str], graph_document: Any) -> None:
+    def persist_parent_graph(
+        self,
+        parent_id: str,
+        child_ids: Sequence[str],
+        graph_document: Any,
+        revision_id: str | None = None,
+    ) -> None:
         node_rows = [
             {
                 "id": str(node.id),
@@ -303,18 +468,29 @@ class Neo4jCorpusStore:
                 WHERE $parent_id IN coalesce(relation.source_parent_ids, [])
                 SET relation.source_parent_ids = [id IN relation.source_parent_ids WHERE id <> $parent_id]
                 WITH collect(DISTINCT relation) AS relations
-                FOREACH (relation IN [item IN relations WHERE size(item.source_parent_ids) = 0] | DELETE relation)
+                FOREACH (relation IN [
+                    item IN relations
+                    WHERE size(item.source_parent_ids) = 0
+                      AND item.created_in_revision = $revision_id
+                ] | DELETE relation)
                 """,
                 parent_id=parent_id,
+                revision_id=revision_id,
             ).consume()
             for label, rows in nodes_by_label.items():
                 session.run(
                     f"""
                     UNWIND $nodes AS row
                     MERGE (node:__Entity__ {{id: row.id}})
-                    SET node:{label}, node += row.properties, node.entity_type = row.type
+                    ON CREATE SET node:{label},
+                                  node += row.properties,
+                                  node.entity_type = row.type,
+                                  node.created_in_revision = $revision_id,
+                                  node.created_at = datetime()
+                    SET node.last_seen_revision = $revision_id
                     """,
                     nodes=rows,
+                    revision_id=revision_id,
                 ).consume()
             for relationship_type, rows in relationships_by_type.items():
                 session.run(
@@ -323,15 +499,17 @@ class Neo4jCorpusStore:
                     MATCH (source:__Entity__ {{id: row.source_id}})
                     MATCH (target:__Entity__ {{id: row.target_id}})
                     MERGE (source)-[rel:{relationship_type}]->(target)
-                    SET rel += row.properties,
-                        rel.extracted_type = row.type,
-                        rel.source_parent_ids = CASE
+                    ON CREATE SET rel += row.properties,
+                                  rel.extracted_type = row.type,
+                                  rel.created_in_revision = $revision_id
+                    SET rel.source_parent_ids = CASE
                             WHEN $parent_id IN coalesce(rel.source_parent_ids, []) THEN rel.source_parent_ids
                             ELSE coalesce(rel.source_parent_ids, []) + [$parent_id]
                         END
                     """,
                     relationships=rows,
                     parent_id=parent_id,
+                    revision_id=revision_id,
                 ).consume()
             session.run(
                 """
@@ -428,27 +606,42 @@ class Neo4jCorpusStore:
                 message=message[:2000],
             ).consume()
 
-    def garbage_collect(self) -> dict[str, int]:
+    def garbage_collect(
+        self,
+        document_ids: Sequence[str] | None = None,
+        *,
+        revision_ids: Sequence[str] | None = None,
+    ) -> dict[str, int]:
         with self._session() as session:
             relationship_row = session.run(
                 """
-                MATCH (revision:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk)
+                MATCH (document:Document)-[:HAS_REVISION]->(revision:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk)
                 WHERE revision.status IN ['INACTIVE', 'FAILED']
                   AND NOT (:Document)-[:ACTIVE_REVISION]->(revision)
+                  AND ($document_ids IS NULL OR document.id IN $document_ids)
+                  AND ($revision_ids IS NULL OR revision.id IN $revision_ids)
                 MATCH ()-[relation]->()
                 WHERE parent.id IN coalesce(relation.source_parent_ids, [])
                 SET relation.source_parent_ids = [id IN relation.source_parent_ids WHERE id <> parent.id]
                 WITH collect(DISTINCT relation) AS relations
-                WITH relations, [relation IN relations WHERE size(relation.source_parent_ids) = 0] AS retired
+                WITH relations, [
+                    relation IN relations
+                    WHERE size(relation.source_parent_ids) = 0
+                      AND ($revision_ids IS NULL OR relation.created_in_revision IN $revision_ids)
+                ] AS retired
                 FOREACH (relation IN retired | DELETE relation)
                 RETURN size(retired) AS relationships
-                """
+                """,
+                document_ids=list(document_ids) if document_ids is not None else None,
+                revision_ids=list(revision_ids) if revision_ids is not None else None,
             ).single()
             row = session.run(
                 """
-                MATCH (revision:DocumentRevision)
+                MATCH (document:Document)-[:HAS_REVISION]->(revision:DocumentRevision)
                 WHERE revision.status IN ['INACTIVE', 'FAILED']
                   AND NOT (:Document)-[:ACTIVE_REVISION]->(revision)
+                  AND ($document_ids IS NULL OR document.id IN $document_ids)
+                  AND ($revision_ids IS NULL OR revision.id IN $revision_ids)
                 OPTIONAL MATCH (revision)<-[:IN_REVISION]-(chunk:Chunk)
                 OPTIONAL MATCH (revision)-[:HAS_PARENT]->(parent:ParentChunk)
                 WITH collect(DISTINCT revision) AS revisions,
@@ -458,18 +651,35 @@ class Neo4jCorpusStore:
                 FOREACH (node IN parents | DETACH DELETE node)
                 FOREACH (node IN revisions | DETACH DELETE node)
                 RETURN size(revisions) AS revisions, size(chunks) AS chunks, size(parents) AS parents
-                """
+                """,
+                document_ids=list(document_ids) if document_ids is not None else None,
+                revision_ids=list(revision_ids) if revision_ids is not None else None,
             ).single()
-            entity_row = session.run(
-                """
-                MATCH (entity:__Entity__)
-                WHERE NOT (entity)<-[:HAS_ENTITY]-(:ParentChunk)
-                  AND NOT (entity)--(:__Entity__)
-                WITH collect(entity) AS entities
-                FOREACH (entity IN entities | DETACH DELETE entity)
-                RETURN size(entities) AS entities
-                """
-            ).single()
+            entity_row = None
+            if revision_ids is not None:
+                entity_row = session.run(
+                    """
+                    MATCH (entity:__Entity__)
+                    WHERE entity.created_in_revision IN $revision_ids
+                      AND NOT (entity)<-[:HAS_ENTITY]-(:ParentChunk)
+                      AND NOT (entity)--(:__Entity__)
+                    WITH collect(entity) AS entities
+                    FOREACH (entity IN entities | DETACH DELETE entity)
+                    RETURN size(entities) AS entities
+                    """,
+                    revision_ids=list(revision_ids),
+                ).single()
+            elif document_ids is None:
+                entity_row = session.run(
+                    """
+                    MATCH (entity:__Entity__)
+                    WHERE NOT (entity)<-[:HAS_ENTITY]-(:ParentChunk)
+                      AND NOT (entity)--(:__Entity__)
+                    WITH collect(entity) AS entities
+                    FOREACH (entity IN entities | DETACH DELETE entity)
+                    RETURN size(entities) AS entities
+                    """
+                ).single()
             result = dict(row) if row else {"revisions": 0, "chunks": 0, "parents": 0}
             result["relationships"] = int(relationship_row["relationships"]) if relationship_row else 0
             result["entities"] = int(entity_row["entities"]) if entity_row else 0
