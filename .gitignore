@@ -8,3 +8,5 @@ config/benchmark_dataset_registry.json
 models/local_model/
 .local/
 data/corpora/
+data/migrations/
+data/notebooklm_exports/
