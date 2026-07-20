@@ -1,6 +1,6 @@
-# notebooklm-graph-pipe
+# Graphscribe
 
-`notebooklm-graph-pipe` is a self-hosted corpus ingestion, vector RAG, and GraphRAG pipeline built on Neo4j. Its primary v3 workflow ingests local text, Markdown, PDF, and YouTube transcripts without NotebookLM, creates hierarchical retrieval chunks and native Neo4j vector/full-text indexes, extracts a knowledge graph, and exposes cited research through REST and MCP.
+`graphscribe` is a self-hosted corpus ingestion, vector RAG, and GraphRAG pipeline built on Neo4j. Its primary v3 workflow ingests local text, Markdown, PDF, and YouTube transcripts without NotebookLM, creates hierarchical retrieval chunks and native Neo4j vector/full-text indexes, extracts a knowledge graph, and exposes cited research through REST and MCP.
 
 See [Local Neo4j Corpus RAG](docs/LOCAL_CORPUS_RAG.md) for the primary setup, migration, API, MCP, and operations guide.
 
@@ -57,7 +57,7 @@ flowchart LR
 
 ```bash
 git clone --recurse-submodules <repo-url>
-cd llm-graph-builder-scripts
+cd graphscribe
 python -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
