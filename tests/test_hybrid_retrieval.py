@@ -190,6 +190,44 @@ def test_vector_backend_widens_global_query_until_corpus_results_are_found() -> 
     assert query_limits == [3, 12, 48, 192, 768, 1000]
 
 
+def test_community_backend_widens_global_indexes_until_active_corpus_results_are_found() -> None:
+    overfetch_values = []
+
+    class Result(list):
+        def __init__(self, values=(), single_value=None):
+            super().__init__(values)
+            self.single_value = single_value
+
+        def single(self):
+            return self.single_value
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query_text, **parameters):
+            if "RETURN count(report) AS count" in query_text:
+                return Result(single_value={"count": 500})
+            overfetch_values.append(parameters["overfetch"])
+            if parameters["overfetch"] < 500:
+                return Result()
+            return Result([{"report_id": "target", "findings": []}])
+
+    class Driver:
+        def session(self, **kwargs):
+            return Session()
+
+    reports = Neo4jRetrievalBackend(Driver(), "neo4j", "corpus-id").search_community_reports(
+        "question", [1.0, 0.0], limit=1
+    )
+
+    assert reports[0]["report_id"] == "target"
+    assert overfetch_values == [4, 16, 64, 256, 500]
+
+
 def test_graph_backend_uses_neo4j_5_compatible_variable_paths() -> None:
     calls = []
 

@@ -159,11 +159,31 @@ def test_corpus_index_validation_rejects_wrong_vector_dimension() -> None:
             "state": "ONLINE",
         },
         {
-            "name": "community_keyword",
+            "name": "community_report_keyword_v1",
             "type": "FULLTEXT",
             "entityType": "NODE",
-            "labelsOrTypes": ["__Community__"],
-            "properties": ["summary"],
+            "labelsOrTypes": ["CommunityReport"],
+            "properties": ["summary", "full_content"],
+            "options": {},
+            "state": "ONLINE",
+        },
+        {
+            "name": "community_report_embedding_v1",
+            "type": "VECTOR",
+            "entityType": "NODE",
+            "labelsOrTypes": ["CommunityReport"],
+            "properties": ["embedding"],
+            "options": {
+                "indexConfig": {"vector.dimensions": 1536, "vector.similarity_function": "cosine"}
+            },
+            "state": "ONLINE",
+        },
+        {
+            "name": "claim_keyword_v1",
+            "type": "FULLTEXT",
+            "entityType": "NODE",
+            "labelsOrTypes": ["Claim"],
+            "properties": ["subject", "predicate", "object"],
             "options": {},
             "state": "ONLINE",
         },
@@ -215,6 +235,11 @@ def test_corpus_constraint_validation_accepts_aura_type_name() -> None:
         "revision_id_unique": ("DocumentRevision", "id"),
         "parent_chunk_id_unique": ("ParentChunk", "id"),
         "chunk_id_unique": ("Chunk", "id"),
+        "community_build_id_unique": ("CommunityBuild", "id"),
+        "community_id_unique": ("Community", "id"),
+        "community_report_id_unique": ("CommunityReport", "id"),
+        "community_finding_id_unique": ("CommunityFinding", "id"),
+        "claim_id_unique": ("Claim", "id"),
     }
     rows = [
         {
