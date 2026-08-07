@@ -106,6 +106,7 @@ class HybridRetriever:
         context_tokenizer: Any,
         context_budget: int = 12000,
         max_parents: int = 8,
+        vector_retriever: Any | None = None,
     ):
         self.backend = backend
         self.embedder = embedder
@@ -113,11 +114,14 @@ class HybridRetriever:
         self.context_tokenizer = context_tokenizer
         self.context_budget = context_budget
         self.max_parents = max_parents
+        self.vector_retriever = vector_retriever or backend
 
     def search(self, request: SearchRequest) -> SearchResult:
         channels: dict[str, Sequence[Candidate]] = {}
         if request.mode in {"vector", "hybrid", "graph_hybrid"}:
-            channels["vector"] = self.backend.vector_search(self.embedder.embed_query(request.query), 50, request.filters)
+            channels["vector"] = self.vector_retriever.vector_search(
+                self.embedder.embed_query(request.query), 50, request.filters
+            )
         if request.mode in {"lexical", "hybrid", "graph_hybrid"}:
             channels["lexical"] = self.backend.lexical_search(request.query, 50, request.filters)
         fused = reciprocal_rank_fusion(channels)[:50]

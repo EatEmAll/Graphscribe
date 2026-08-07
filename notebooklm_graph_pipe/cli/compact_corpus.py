@@ -18,6 +18,7 @@ from neo4j import GraphDatabase
 
 from notebooklm_graph_pipe.ingestion.embeddings import EmbeddingError, weighted_parent_embedding as _weighted_parent_embedding
 from notebooklm_graph_pipe.ingestion.manifest import CorpusManifest, load_manifest, save_manifest
+from notebooklm_graph_pipe.ingestion.neo4j_store import GRAPH_SCHEMA_VERSION
 from notebooklm_graph_pipe.runtime.neo4j_connection import (
     Neo4jConnectionSpec,
     ResolvedNeo4jConnection,
@@ -37,10 +38,18 @@ STRUCTURAL_SCHEMA = (
     "CREATE CONSTRAINT revision_id_unique IF NOT EXISTS FOR (n:DocumentRevision) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT parent_chunk_id_unique IF NOT EXISTS FOR (n:ParentChunk) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (n:Chunk) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_build_id_unique IF NOT EXISTS FOR (n:CommunityBuild) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_id_unique IF NOT EXISTS FOR (n:Community) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_report_id_unique IF NOT EXISTS FOR (n:CommunityReport) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_finding_id_unique IF NOT EXISTS FOR (n:CommunityFinding) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT claim_id_unique IF NOT EXISTS FOR (n:Claim) REQUIRE n.id IS UNIQUE",
     "CREATE INDEX document_status IF NOT EXISTS FOR (n:Document) ON (n.status)",
     "CREATE INDEX revision_ready IF NOT EXISTS FOR (n:DocumentRevision) ON (n.vector_ready, n.graph_ready)",
     "CREATE FULLTEXT INDEX entities IF NOT EXISTS FOR (n:__Entity__) ON EACH [n.id, n.description]",
-    "CREATE FULLTEXT INDEX community_keyword IF NOT EXISTS FOR (n:__Community__) ON EACH [n.summary]",
+    "CREATE FULLTEXT INDEX community_report_keyword_v1 IF NOT EXISTS "
+    "FOR (n:CommunityReport) ON EACH [n.summary, n.full_content]",
+    "CREATE FULLTEXT INDEX claim_keyword_v1 IF NOT EXISTS "
+    "FOR (n:Claim) ON EACH [n.subject, n.predicate, n.object]",
 )
 
 
@@ -555,6 +564,17 @@ def _ensure_schema(target: Any, database: str, dimension: int) -> None:
             OPTIONS {{indexConfig: {{`vector.dimensions`: {dimension}, `vector.similarity_function`: 'cosine'}}}}
             """
         ).consume()
+        session.run(
+            f"""
+            CREATE VECTOR INDEX community_report_embedding_v1 IF NOT EXISTS
+            FOR (n:CommunityReport) ON n.embedding
+            OPTIONS {{indexConfig: {{
+                `vector.dimensions`: {dimension},
+                `vector.similarity_function`: 'cosine'
+            }}}}
+            """
+        ).consume()
+        session.run("DROP INDEX community_keyword IF EXISTS").consume()
         session.run("CALL db.awaitIndexes(1800)").consume()
 
 
@@ -727,6 +747,7 @@ def compact_corpus(
                 "projection": "parent",
                 "projection_of_corpus_id": manifest.corpus_id,
                 "projection_of_corpus_key": manifest.corpus_key,
+                "schema_version": GRAPH_SCHEMA_VERSION,
             }
             document_ids = {str(row["document_id"]) for row in source_rows}
             parent_ids = [str(row["parent_id"]) for row in source_rows]

@@ -143,7 +143,7 @@ def test_activate_manifest_writes_non_secret_target(tmp_path: Path) -> None:
     migration.activate_manifest(path, connection(), "NEO4J_TARGET_PASSWORD")
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["version"] == 3
+    assert payload["version"] == 4
     assert payload["neo4j"] == {
         "deployment": "external",
         "uri": "neo4j+s://target.databases.neo4j.io",
@@ -152,6 +152,59 @@ def test_activate_manifest_writes_non_secret_target(tmp_path: Path) -> None:
         "password_env": "NEO4J_TARGET_PASSWORD",
     }
     assert "old-secret" not in path.read_text(encoding="utf-8")
+    assert payload["community"]["enabled"] is False
+    assert payload["retrieval"]["vector_provider"] == "neo4j"
+
+
+def test_upgrade_in_place_requires_exact_source_confirmation_and_backup(tmp_path: Path) -> None:
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "version": 3,
+                "corpus": {"id": "corpus-id", "key": "demo", "title": "Demo"},
+                "embedding": {
+                    "provider": "sentence-transformer",
+                    "model": "all-MiniLM-L6-v2",
+                    "dimension": 384,
+                    "normalized": True,
+                },
+                "neo4j": {"uri": "bolt://source"},
+                "sources": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    source = connection("bolt://source")
+
+    with pytest.raises(migration.MigrationError, match="--confirm-source"):
+        migration.upgrade_in_place(
+            source,
+            manifest_path=manifest,
+            backup_file=None,
+            execute=True,
+            confirm_source="wrong",
+        )
+
+    with pytest.raises(migration.MigrationError, match="requires --backup-file"):
+        migration.upgrade_in_place(
+            source,
+            manifest_path=manifest,
+            backup_file=None,
+            execute=True,
+            confirm_source=f"{source.uri}|{source.database}",
+        )
+
+
+def test_migration_parser_exposes_in_place_upgrade() -> None:
+    args = migration.build_parser().parse_args(["--mode", "upgrade-in-place"])
+    assert args.mode == "upgrade-in-place"
+
+
+def test_upgrade_in_place_can_redact_its_source_connection() -> None:
+    source = connection("bolt://source")
+
+    assert migration.redacted_connection(source) == "bolt://source (user=neo4j, database=neo4j)"
 
 
 def test_activate_corpus_manifest_preserves_corpus_and_embedding_metadata(tmp_path: Path) -> None:

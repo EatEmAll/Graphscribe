@@ -208,6 +208,7 @@ def _validate_corpus_indexes(
     retrieval_unit: str = "chunk",
     vector_index: str = "chunk_embedding_v1",
     keyword_index: str = "chunk_keyword_v1",
+    require_retrieval_vector: bool = True,
 ) -> None:
     if retrieval_unit not in {"chunk", "parent"}:
         raise Neo4jConnectionError(f"Unsupported retrieval unit: {retrieval_unit}")
@@ -219,9 +220,22 @@ def _validate_corpus_indexes(
         "revision_ready": ("RANGE", "NODE", ["DocumentRevision"], ["vector_ready", "graph_ready"]),
         keyword_index: ("FULLTEXT", "NODE", [retrieval_label], ["text"]),
         "entities": ("FULLTEXT", "NODE", ["__Entity__"], ["id", "description"]),
-        "community_keyword": ("FULLTEXT", "NODE", ["__Community__"], ["summary"]),
-        vector_index: ("VECTOR", "NODE", [retrieval_label], ["embedding"]),
+        "community_report_keyword_v1": (
+            "FULLTEXT",
+            "NODE",
+            ["CommunityReport"],
+            ["summary", "full_content"],
+        ),
+        "community_report_embedding_v1": (
+            "VECTOR",
+            "NODE",
+            ["CommunityReport"],
+            ["embedding"],
+        ),
+        "claim_keyword_v1": ("FULLTEXT", "NODE", ["Claim"], ["subject", "predicate", "object"]),
     }
+    if require_retrieval_vector:
+        required[vector_index] = ("VECTOR", "NODE", [retrieval_label], ["embedding"])
     if retrieval_unit == "chunk":
         required["chunk_parent_id"] = ("RANGE", "NODE", ["Chunk"], ["parent_id"])
     rows = {
@@ -257,7 +271,7 @@ def _validate_corpus_indexes(
                 f"Corpus index '{name}' is not fully populated "
                 f"(populationPercent={row.get('populationPercent')})."
             )
-        if name == vector_index:
+        if name in {vector_index, "community_report_embedding_v1"}:
             config = dict((dict(row.get("options") or {}).get("indexConfig") or {}))
             actual_dimension = int(config.get("vector.dimensions") or 0)
             similarity = str(config.get("vector.similarity_function") or "").lower()
@@ -276,6 +290,11 @@ def _validate_corpus_constraints(session: Any) -> None:
         "revision_id_unique": (["DocumentRevision"], ["id"]),
         "parent_chunk_id_unique": (["ParentChunk"], ["id"]),
         "chunk_id_unique": (["Chunk"], ["id"]),
+        "community_build_id_unique": (["CommunityBuild"], ["id"]),
+        "community_id_unique": (["Community"], ["id"]),
+        "community_report_id_unique": (["CommunityReport"], ["id"]),
+        "claim_id_unique": (["Claim"], ["id"]),
+        "community_finding_id_unique": (["CommunityFinding"], ["id"]),
     }
     rows = {
         str(row["name"]): dict(row)
@@ -313,6 +332,7 @@ def verify_corpus_connection(
     retrieval_unit: str = "chunk",
     vector_index: str = "chunk_embedding_v1",
     keyword_index: str = "chunk_keyword_v1",
+    require_retrieval_vector: bool = True,
 ) -> dict[str, str]:
     server = verify_connection(connection, require_write=require_write or initialize_schema)
     if _neo4j_version(server["agent"]) < (5, 23, 0):
@@ -331,15 +351,17 @@ def verify_corpus_connection(
                 retrieval_unit=retrieval_unit,
                 vector_index=vector_index,
                 keyword_index=keyword_index,
+                require_retrieval_vector=require_retrieval_vector,
             )
             _validate_corpus_constraints(session)
-            query_vector = [0.0] * dimension
-            query_vector[0] = 1.0
-            session.run(
-                f"CALL db.index.vector.queryNodes('{vector_index}', 1, $embedding) "
-                "YIELD node RETURN node LIMIT 1",
-                embedding=query_vector,
-            ).consume()
+            if require_retrieval_vector:
+                query_vector = [0.0] * dimension
+                query_vector[0] = 1.0
+                session.run(
+                    f"CALL db.index.vector.queryNodes('{vector_index}', 1, $embedding) "
+                    "YIELD node RETURN node LIMIT 1",
+                    embedding=query_vector,
+                ).consume()
             session.run(
                 f"CALL db.index.fulltext.queryNodes('{keyword_index}', $search_text) "
                 "YIELD node RETURN node LIMIT 1",

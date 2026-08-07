@@ -11,6 +11,7 @@ if str(REPO_ROOT_PATH) not in sys.path:
 
 from notebooklm_graph_pipe.paths import REPO_ROOT
 from notebooklm_graph_pipe.service.core import CorpusService
+from notebooklm_graph_pipe.service.conversation import ConversationStore
 from notebooklm_graph_pipe.service.jobs import CorpusJobManager
 from notebooklm_graph_pipe.service.mcp_server import create_mcp_server
 from notebooklm_graph_pipe.service.registry import CorpusRegistry
@@ -23,7 +24,12 @@ def main() -> None:
     parser.add_argument("--llm-routing-config")
     args = parser.parse_args()
     registry = CorpusRegistry(Path(args.registry_root))
-    service = CorpusService(registry, RuntimeFactory(args.llm_routing_config), CorpusJobManager(registry, REPO_ROOT))
+    service = CorpusService(
+        registry,
+        RuntimeFactory(args.llm_routing_config),
+        CorpusJobManager(registry, REPO_ROOT),
+        ConversationStore(REPO_ROOT / ".local" / "conversations.sqlite3"),
+    )
     create_mcp_server(service).run(transport="stdio")
 
 

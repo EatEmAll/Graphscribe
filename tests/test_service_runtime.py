@@ -7,7 +7,7 @@ import pytest
 from notebooklm_graph_pipe.service.runtime import CorpusRuntime, RuntimeFactory
 
 
-def test_answerer_is_created_lazily(monkeypatch) -> None:
+def test_answerer_is_created_lazily(monkeypatch, tmp_path) -> None:
     runtime = CorpusRuntime(driver=object(), backend=object(), retriever=object())
     factory = RuntimeFactory()
     monkeypatch.setattr(factory, "get", lambda entry: runtime)
@@ -18,9 +18,12 @@ def test_answerer_is_created_lazily(monkeypatch) -> None:
     monkeypatch.setattr(
         runtime_module.GroundedAnswerer,
         "from_routing_config",
-        lambda retriever, config: calls.append((retriever, config)) or object(),
+        lambda retriever, config, **kwargs: calls.append((retriever, config, kwargs)) or object(),
     )
-    entry = object()
+    entry = SimpleNamespace(
+        manifest=SimpleNamespace(execution={}),
+        manifest_path=tmp_path / "manifest.json",
+    )
     first = factory.get_answerer(entry)
     second = factory.get_answerer(entry)
     assert first is second
