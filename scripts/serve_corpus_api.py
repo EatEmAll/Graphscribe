@@ -14,6 +14,7 @@ if str(REPO_ROOT_PATH) not in sys.path:
 from notebooklm_graph_pipe.paths import REPO_ROOT
 from notebooklm_graph_pipe.service.api import create_app
 from notebooklm_graph_pipe.service.core import CorpusService
+from notebooklm_graph_pipe.service.conversation import ConversationStore
 from notebooklm_graph_pipe.service.jobs import CorpusJobManager
 from notebooklm_graph_pipe.service.registry import CorpusRegistry
 from notebooklm_graph_pipe.service.runtime import RuntimeFactory
@@ -28,7 +29,12 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     registry = CorpusRegistry(Path(args.registry_root))
-    service = CorpusService(registry, RuntimeFactory(args.llm_routing_config), CorpusJobManager(registry, REPO_ROOT))
+    service = CorpusService(
+        registry,
+        RuntimeFactory(args.llm_routing_config),
+        CorpusJobManager(registry, REPO_ROOT),
+        ConversationStore(REPO_ROOT / ".local" / "conversations.sqlite3"),
+    )
     app = create_app(service, load_or_create_token(Path(args.token_path)))
     uvicorn.run(app, host="127.0.0.1", port=args.port)
 

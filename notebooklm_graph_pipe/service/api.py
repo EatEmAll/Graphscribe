@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import secrets
+import json
 from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 from .core import CorpusService
@@ -23,6 +25,7 @@ class AnswerBody(BaseModel):
     question: str
     mode: str = "graph_hybrid"
     graph_hops: int = Field(1, ge=1, le=2)
+    conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
 def create_app(service: CorpusService, token: str) -> FastAPI:
@@ -65,6 +68,17 @@ def create_app(service: CorpusService, token: str) -> FastAPI:
     @app.post("/v1/corpora/{corpus_key}/answer", dependencies=[Depends(authorize)])
     def answer(corpus_key: str, body: AnswerBody):
         return _call(service.answer, corpus_key, body.model_dump())
+
+    @app.post("/v1/corpora/{corpus_key}/answer/stream", dependencies=[Depends(authorize)])
+    def answer_stream(corpus_key: str, body: AnswerBody):
+        def events():
+            try:
+                for event in service.answer_stream(corpus_key, body.model_dump()):
+                    yield f"event: {event['event']}\ndata: {json.dumps(event['data'], ensure_ascii=False)}\n\n"
+            except (KeyError, ValueError, RuntimeError) as exc:
+                yield f"event: error\ndata: {json.dumps({'detail': str(exc)})}\n\n"
+
+        return StreamingResponse(events(), media_type="text/event-stream")
 
     @app.get("/v1/corpora/{corpus_key}/documents", dependencies=[Depends(authorize)])
     def documents(corpus_key: str):

@@ -8,6 +8,8 @@ from notebooklm_graph_pipe.runtime.llm_json_utils import (
     build_single_prompt_clients,
     generate_json_payload,
 )
+from notebooklm_graph_pipe.runtime.model_adapters import RoutedJsonAdapter
+from notebooklm_graph_pipe.runtime.model_executor import ExecutionPolicy, ModelExecutor, ModelRequest
 from notebooklm_graph_pipe.runtime.llm_routing import (
     ANSWER_ROLE,
     PromptRoleConfig,
@@ -16,6 +18,15 @@ from notebooklm_graph_pipe.runtime.llm_routing import (
 
 from .hybrid import HybridRetriever, SearchRequest
 
+ANSWER_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "required": ["answer", "citation_ids"],
+    "properties": {
+        "answer": {"type": "string"},
+        "citation_ids": {"type": "array", "items": {"type": "string"}},
+    },
+}
+
 
 @dataclass
 class GroundedAnswerer:
@@ -23,9 +34,18 @@ class GroundedAnswerer:
     role: PromptRoleConfig
     client: Any
     generator: Callable[..., tuple[dict[str, Any] | None, str]] = generate_json_payload
+    executor: ModelExecutor | None = None
 
     @classmethod
-    def from_routing_config(cls, retriever: HybridRetriever, config_path: str | None) -> "GroundedAnswerer":
+    def from_routing_config(
+        cls,
+        retriever: HybridRetriever,
+        config_path: str | None,
+        *,
+        cache_path: str | None = None,
+        metrics_path: str | None = None,
+        max_concurrency: int = 4,
+    ) -> "GroundedAnswerer":
         role = resolve_prompt_role(
             config_path,
             ANSWER_ROLE,
@@ -33,7 +53,14 @@ class GroundedAnswerer:
             default_model="gemini-2.5-flash",
         )
         client = build_single_prompt_clients(role.client)[role.client]
-        return cls(retriever, role, client)
+        executor = ModelExecutor(
+            {ANSWER_ROLE: RoutedJsonAdapter(role, client)},
+            {ANSWER_ROLE: ANSWER_ROLE},
+            policies={ANSWER_ROLE: ExecutionPolicy(max_concurrency=max_concurrency, max_attempts=2)},
+            cache_path=cache_path,
+            metrics_path=metrics_path,
+        )
+        return cls(retriever, role, client, executor=executor)
 
     def answer(self, question: str, *, mode: str = "graph_hybrid", graph_hops: int = 1) -> dict[str, Any]:
         result = self.retriever.search(
@@ -55,17 +82,33 @@ class GroundedAnswerer:
             "Return JSON with keys answer and citation_ids.\n\n"
             f"Question: {question}\n\nContext:\n{context_text}"
         )
-        payload, error = self.generator(
-            self.client,
-            client_name=self.role.client,
-            model_name=self.role.model,
-            prompt=prompt,
-            system_instruction="You are a source-grounded research assistant. Never invent citations.",
-            max_output_tokens=4096,
-            temperature=0.0,
-            reasoning_effort=self.role.reasoning_effort,
-            max_attempts=2,
-        )
+        if self.executor is not None:
+            try:
+                payload = self.executor.execute_json(
+                    ModelRequest(
+                        role=ANSWER_ROLE,
+                        prompt=prompt,
+                        system_instruction="You are a source-grounded research assistant. Never invent citations.",
+                        response_schema=ANSWER_SCHEMA,
+                        max_output_tokens=4096,
+                        cache_namespace="grounded-answer",
+                    )
+                ).payload
+                error = ""
+            except Exception as exc:
+                payload, error = None, f"{type(exc).__name__}: {exc}"
+        else:
+            payload, error = self.generator(
+                self.client,
+                client_name=self.role.client,
+                model_name=self.role.model,
+                prompt=prompt,
+                system_instruction="You are a source-grounded research assistant. Never invent citations.",
+                max_output_tokens=4096,
+                temperature=0.0,
+                reasoning_effort=self.role.reasoning_effort,
+                max_attempts=2,
+            )
         warnings: list[str] = []
         if payload is None:
             return {

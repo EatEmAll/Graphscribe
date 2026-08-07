@@ -59,6 +59,20 @@ class Neo4jRetrievalBackend:
     def _session(self):
         return self.driver.session(database=self.database)
 
+    def active_revision_ids(self) -> list[str]:
+        with self._session() as session:
+            return [
+                str(row["revision_id"])
+                for row in session.run(
+                    """
+                    MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)
+                          -[:ACTIVE_REVISION]->(revision:DocumentRevision)
+                    RETURN DISTINCT revision.id AS revision_id ORDER BY revision_id
+                    """,
+                    corpus_id=self.corpus_id,
+                )
+            ]
+
     @staticmethod
     def _candidate(row: dict[str, Any]) -> Candidate:
         return Candidate(
@@ -194,7 +208,7 @@ class Neo4jRetrievalBackend:
                 "(seed_parent:ParentChunk {id: seed_id})"
             )
             evidence_match = (
-                "MATCH (reached)<-[:HAS_ENTITY]-(unit:ParentChunk)"
+                "MATCH (reached)<-[evidence_mention:HAS_ENTITY]-(unit:ParentChunk)"
                 "<-[:HAS_PARENT]-(revision:DocumentRevision)<-[:ACTIVE_REVISION]-(document:Document)"
                 "<-[:HAS_DOCUMENT]-(corpus)"
             )
@@ -208,7 +222,7 @@ class Neo4jRetrievalBackend:
                 "MATCH (seed)<-[:HAS_CHILD]-(seed_parent:ParentChunk)"
             )
             evidence_match = (
-                "MATCH (reached)<-[:HAS_ENTITY]-(evidence_parent:ParentChunk)-[:HAS_CHILD]->(unit:Chunk)\n"
+                "MATCH (reached)<-[evidence_mention:HAS_ENTITY]-(evidence_parent:ParentChunk)-[:HAS_CHILD]->(unit:Chunk)\n"
                 "MATCH (corpus)-[:HAS_DOCUMENT]->(document:Document)-[:ACTIVE_REVISION]->"
                 "(revision:DocumentRevision)<-[:IN_REVISION]-(unit)"
             )
@@ -217,18 +231,21 @@ class Neo4jRetrievalBackend:
         query = f"""
             UNWIND $seed_ids AS seed_id
             {seed_match}
-            MATCH (seed_parent)-[:HAS_ENTITY]->(origin:__Entity__)
-            WHERE COUNT {{ (origin)<-[:HAS_ENTITY]-(:ParentChunk) }} <= $max_entity_degree
+            MATCH (seed_parent)-[seed_mention:HAS_ENTITY]->(origin:__Entity__)
+            WHERE coalesce(seed_mention.extraction_state, 'VERIFIED') = 'VERIFIED'
+              AND COUNT {{ (origin)<-[:HAS_ENTITY]-(:ParentChunk) }} <= $max_entity_degree
             MATCH path=(origin)-[*0..{max_path}]-(reached:__Entity__)
             {evidence_match}
             WHERE revision.graph_ready = true AND document.status = 'READY' AND {seed_exclusion}
+              AND coalesce(evidence_mention.extraction_state, 'VERIFIED') = 'VERIFIED'
               AND ($document_ids = [] OR document.id IN $document_ids)
               AND ($source_types = [] OR document.source_type IN $source_types)
               AND ($language IS NULL OR document.language = $language)
               AND COUNT {{ (reached)<-[:HAS_ENTITY]-(:ParentChunk) }} <= $max_entity_degree
               AND all(rel IN relationships(path)
                   WHERE NOT type(rel) IN $excluded_relationships
-                    AND any(parent_id IN coalesce(rel.source_parent_ids, []) WHERE EXISTS {{
+                    AND any(parent_id IN coalesce(rel.source_parent_ids, [])
+                            WHERE NOT parent_id IN coalesce(rel.provisional_parent_ids, []) AND EXISTS {{
                         MATCH (source_parent:ParentChunk {{id: parent_id}})<-[:HAS_PARENT]-(source_revision:DocumentRevision)<-[:ACTIVE_REVISION]-(:Document)<-[:HAS_DOCUMENT]-(corpus)
                     }}))
             RETURN DISTINCT {candidate_projection}, origin.id AS origin_entity,
@@ -293,20 +310,112 @@ class Neo4jRetrievalBackend:
             )
             return {str(row["parent_id"]): dict(row) for row in rows}
 
+    def community_reports(self, limit: int = 200) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("Community report limit must be between 1 and 1000.")
+        with self._session() as session:
+            rows = session.run(
+                """
+                MATCH (:Corpus {id: $corpus_id})-[:ACTIVE_COMMUNITY_BUILD]->(build:CommunityBuild)
+                      -[:HAS_COMMUNITY]->(community:Community)-[:HAS_REPORT]->(report:CommunityReport)
+                WITH build, min(community.level) AS broadest_level
+                MATCH (build)-[:HAS_COMMUNITY]->(community:Community {level: broadest_level})
+                      -[:HAS_REPORT]->(report:CommunityReport)
+                OPTIONAL MATCH (report)-[:HAS_FINDING]->(finding:CommunityFinding)
+                      -[:GROUNDED_IN]->(parent:ParentChunk)
+                RETURN report.id AS report_id, community.id AS community_id,
+                       report.title AS title, report.summary AS summary,
+                       report.full_content AS full_content, report.rank AS rank,
+                       collect(DISTINCT {summary: finding.summary,
+                                         explanation: finding.explanation,
+                                         confidence: finding.confidence,
+                                         parent_id: parent.id}) AS findings
+                ORDER BY rank DESC, report_id
+                LIMIT $limit
+                """,
+                corpus_id=self.corpus_id,
+                limit=limit,
+            )
+            return [dict(row) for row in rows]
+
+    def search_community_reports(
+        self,
+        query: str,
+        embedding: Sequence[float],
+        limit: int = 12,
+    ) -> list[dict[str, Any]]:
+        if not 1 <= limit <= 50:
+            raise ValueError("Community report search limit must be between 1 and 50.")
+        with self._session() as session:
+            overfetch = max(limit * 4, limit)
+            total_indexed: int | None = None
+            while True:
+                rows = list(
+                    session.run(
+                        """
+                        CALL {
+                            CALL db.index.vector.queryNodes(
+                                'community_report_embedding_v1', $overfetch, $embedding
+                            ) YIELD node AS report, score
+                            RETURN report, score, 'vector' AS channel
+                            UNION ALL
+                            CALL db.index.fulltext.queryNodes(
+                                'community_report_keyword_v1', $query, {limit: $overfetch}
+                            ) YIELD node AS report, score
+                            RETURN report, score, 'lexical' AS channel
+                        }
+                        MATCH (:Corpus {id: $corpus_id})-[:ACTIVE_COMMUNITY_BUILD]->(:CommunityBuild)
+                              -[:HAS_COMMUNITY]->(community:Community)-[:HAS_REPORT]->(report)
+                        WITH report, community, collect(DISTINCT channel) AS channels, max(score) AS score
+                        OPTIONAL MATCH (report)-[:HAS_FINDING]->(finding:CommunityFinding)
+                              -[:GROUNDED_IN]->(parent:ParentChunk)
+                        RETURN report.id AS report_id, community.id AS community_id,
+                               report.title AS title, report.summary AS summary,
+                               report.full_content AS full_content, report.rank AS rank,
+                               channels, score,
+                               collect(DISTINCT {summary: finding.summary,
+                                                 explanation: finding.explanation,
+                                                 confidence: finding.confidence,
+                                                 parent_id: parent.id}) AS findings
+                        ORDER BY score DESC, rank DESC, report_id
+                        LIMIT $limit
+                        """,
+                        corpus_id=self.corpus_id,
+                        query=query,
+                        embedding=list(embedding),
+                        overfetch=overfetch,
+                        limit=limit,
+                    )
+                )
+                reports = [dict(row) for row in rows]
+                if len(reports) >= limit:
+                    return reports
+                if total_indexed is None:
+                    count_row = session.run(
+                        "MATCH (report:CommunityReport) RETURN count(report) AS count"
+                    ).single()
+                    total_indexed = int(count_row["count"]) if count_row else 0
+                if overfetch >= total_indexed:
+                    return reports
+                overfetch = min(total_indexed, overfetch * 4)
+
     def graph_neighbors(self, entity_id: str, hops: int = 1, limit: int = 50) -> list[dict[str, Any]]:
         if hops not in {1, 2}:
             raise ValueError("Graph neighbor exploration supports one or two hops.")
         if not 1 <= limit <= 200:
             raise ValueError("Graph neighbor limit must be between 1 and 200.")
         query = f"""
-            MATCH (corpus:Corpus {{id: $corpus_id}})-[:HAS_DOCUMENT]->(:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)-[:HAS_PARENT]->(:ParentChunk)-[:HAS_ENTITY]->(origin:__Entity__ {{id: $entity_id}})
+            MATCH (corpus:Corpus {{id: $corpus_id}})-[:HAS_DOCUMENT]->(:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)-[:HAS_PARENT]->(:ParentChunk)-[origin_mention:HAS_ENTITY]->(origin:__Entity__ {{id: $entity_id}})
+            WHERE coalesce(origin_mention.extraction_state, 'VERIFIED') = 'VERIFIED'
             MATCH path=(origin)-[*1..{hops}]-(neighbor:__Entity__)
             WHERE EXISTS {{
-                MATCH (corpus)-[:HAS_DOCUMENT]->(:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)-[:HAS_PARENT]->(:ParentChunk)-[:HAS_ENTITY]->(neighbor)
+                MATCH (corpus)-[:HAS_DOCUMENT]->(:Document)-[:ACTIVE_REVISION]->(:DocumentRevision)-[:HAS_PARENT]->(:ParentChunk)-[neighbor_mention:HAS_ENTITY]->(neighbor)
+                WHERE coalesce(neighbor_mention.extraction_state, 'VERIFIED') = 'VERIFIED'
             }}
               AND all(rel IN relationships(path)
                   WHERE NOT type(rel) IN $excluded_relationships
-                    AND any(parent_id IN coalesce(rel.source_parent_ids, []) WHERE EXISTS {{
+                    AND any(parent_id IN coalesce(rel.source_parent_ids, [])
+                            WHERE NOT parent_id IN coalesce(rel.provisional_parent_ids, []) AND EXISTS {{
                         MATCH (source_parent:ParentChunk {{id: parent_id}})<-[:HAS_PARENT]-(source_revision:DocumentRevision)<-[:ACTIVE_REVISION]-(:Document)<-[:HAS_DOCUMENT]-(corpus)
                     }}))
             RETURN DISTINCT neighbor.id AS entity_id, labels(neighbor) AS labels,

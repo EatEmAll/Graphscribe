@@ -43,11 +43,17 @@ def create_mcp_server(service: CorpusService):
         question: str,
         mode: str = "graph_hybrid",
         graph_hops: int = 1,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """Answer a corpus-grounded question with validated source citations."""
         return service.answer(
             corpus_key,
-            {"question": question, "mode": mode, "graph_hops": graph_hops},
+            {
+                "question": question,
+                "mode": mode,
+                "graph_hops": graph_hops,
+                "conversation_id": conversation_id,
+            },
         )
 
     @server.tool()

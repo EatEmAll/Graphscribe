@@ -10,15 +10,23 @@ from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
 from notebooklm_graph_pipe.retrieval.hybrid import SearchRequest
 
 from .jobs import CorpusJobManager
+from .conversation import ConversationStore, contextualize_question
 from .registry import CorpusRegistry
 from .runtime import RuntimeFactory
 
 
 class CorpusService:
-    def __init__(self, registry: CorpusRegistry, runtimes: RuntimeFactory, jobs: CorpusJobManager):
+    def __init__(
+        self,
+        registry: CorpusRegistry,
+        runtimes: RuntimeFactory,
+        jobs: CorpusJobManager,
+        conversations: ConversationStore | None = None,
+    ):
         self.registry = registry
         self.runtimes = runtimes
         self.jobs = jobs
+        self.conversations = conversations
 
     def list_corpora(self) -> list[dict[str, Any]]:
         return [
@@ -67,11 +75,57 @@ class CorpusService:
 
     def answer(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
         entry = self.registry.get(key)
-        return self.runtimes.get_answerer(entry).answer(
-            str(payload["question"]),
-            mode=str(payload.get("mode") or "graph_hybrid"),
-            graph_hops=int(payload.get("graph_hops") or 1),
+        question = str(payload["question"])
+        conversation_id = str(payload.get("conversation_id") or "").strip() or None
+        history = (
+            self.conversations.history(conversation_id, entry.manifest.corpus_id)
+            if conversation_id and self.conversations
+            else []
         )
+        contextualized = contextualize_question(question, history)
+        mode = str(payload.get("mode") or "graph_hybrid")
+        if mode == "global":
+            result = self.runtimes.get_community_answerer(entry).global_answer(contextualized)
+        elif mode == "drift":
+            result = self.runtimes.get_community_answerer(entry).drift_answer(
+                contextualized,
+                graph_hops=int(payload.get("graph_hops") or 1),
+            )
+        else:
+            result = self.runtimes.get_answerer(entry).answer(
+                contextualized,
+                mode=mode,
+                graph_hops=int(payload.get("graph_hops") or 1),
+            )
+        if conversation_id and self.conversations:
+            self.conversations.append_exchange(
+                conversation_id,
+                entry.manifest.corpus_id,
+                question,
+                str(result.get("answer") or ""),
+                list(result.get("citations") or []),
+            )
+            result["conversation_id"] = conversation_id
+            result["conversation_turns_used"] = len(history)
+        return result
+
+    def answer_stream(self, key: str, payload: dict[str, Any]):
+        yield {"event": "started", "data": {"mode": str(payload.get("mode") or "graph_hybrid")}}
+        result = self.answer(key, payload)
+        for chunk in _text_chunks(str(result.get("answer") or "")):
+            yield {"event": "answer_delta", "data": {"text": chunk}}
+        yield {"event": "citations", "data": result.get("citations") or []}
+        yield {
+            "event": "diagnostics",
+            "data": {
+                "retrieval": result.get("retrieval") or {},
+                "warnings": result.get("warnings") or [],
+                "conversation_id": result.get("conversation_id"),
+                "cost_usd": result.get("cost_usd"),
+                "cancellation": "cooperative_between_sse_events",
+            },
+        }
+        yield {"event": "done", "data": {"cancelled": False}}
 
     def list_documents(self, key: str) -> list[dict[str, Any]]:
         entry = self.registry.get(key)
@@ -139,3 +193,8 @@ class CorpusService:
     def close(self) -> None:
         self.jobs.close()
         self.runtimes.close()
+
+
+def _text_chunks(text: str, size: int = 80):
+    for start in range(0, len(text), size):
+        yield text[start : start + size]

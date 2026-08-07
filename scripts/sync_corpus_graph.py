@@ -145,6 +145,7 @@ def _run_sync(args: argparse.Namespace, dataset_dir: Path, key: str, export_dir:
         dimension=manifest.embedding_dimension,
         initialize_schema=True,
         require_write=True,
+        require_retrieval_vector=manifest.retrieval_vector_provider == "neo4j",
     )
     driver = GraphDatabase.driver(runtime.uri, auth=(runtime.username, runtime.password))
     store = Neo4jCorpusStore(driver, runtime.database, corpus_id=manifest.corpus_id)

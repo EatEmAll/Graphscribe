@@ -67,6 +67,7 @@ def main(argv: list[str] | None = None) -> int:
         retrieval_unit=manifest.retrieval_unit,
         vector_index=manifest.retrieval_vector_index,
         keyword_index=manifest.retrieval_keyword_index,
+        require_retrieval_vector=manifest.retrieval_vector_provider == "neo4j",
     )
 
     driver = GraphDatabase.driver(runtime.uri, auth=(runtime.username, runtime.password))

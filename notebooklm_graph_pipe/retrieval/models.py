@@ -42,6 +42,7 @@ class ContextItem:
     def citation_payload(self) -> dict[str, Any]:
         return {
             "id": self.citation_id,
+            "parent_id": self.parent_id,
             "document_id": self.document_id,
             "title": self.title,
             "source_uri": self.source_uri,

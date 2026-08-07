@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
@@ -53,7 +53,10 @@ def weighted_parent_embedding(children: Iterable[Mapping[str, Any]]) -> list[flo
 
 class MiniLMEmbedder:
     def __init__(self, config: EmbeddingConfig | None = None, model: Any | None = None):
-        self.config = config or EmbeddingConfig()
+        resolved = config or EmbeddingConfig()
+        if resolved.model == "all-MiniLM-L6-v2":
+            resolved = replace(resolved, model="sentence-transformers/all-MiniLM-L6-v2")
+        self.config = resolved
         self._model = model
 
     @property

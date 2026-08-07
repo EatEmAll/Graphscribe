@@ -47,6 +47,7 @@ def main() -> int:
         retrieval_unit=manifest.retrieval_unit,
         vector_index=manifest.retrieval_vector_index,
         keyword_index=manifest.retrieval_keyword_index,
+        require_retrieval_vector=manifest.retrieval_vector_provider == "neo4j",
     )
     driver = GraphDatabase.driver(runtime.uri, auth=(runtime.username, runtime.password))
     store = Neo4jCorpusStore(
@@ -79,6 +80,9 @@ def main() -> int:
             store,
             args.llm_routing_config,
             capacity_guard=capacity_guard,
+            cache_path=str(Path(args.manifest_path).resolve().parent / str(manifest.execution["cache_path"])),
+            metrics_path=str(Path(args.manifest_path).resolve().parent / str(manifest.execution["metrics_path"])),
+            max_concurrency=int(manifest.execution["default_max_concurrency"]),
         )
         summary = asyncio.run(worker.run_batch(args.limit))
     finally:

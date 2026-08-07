@@ -8,6 +8,7 @@ from typing import Any, Iterable, Sequence
 from .chunking import ChunkingResult
 from .models import CanonicalDocument
 
+GRAPH_SCHEMA_VERSION = 4
 
 SCHEMA_QUERIES = (
     "CREATE CONSTRAINT corpus_id_unique IF NOT EXISTS FOR (n:Corpus) REQUIRE n.id IS UNIQUE",
@@ -16,12 +17,20 @@ SCHEMA_QUERIES = (
     "CREATE CONSTRAINT revision_id_unique IF NOT EXISTS FOR (n:DocumentRevision) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT parent_chunk_id_unique IF NOT EXISTS FOR (n:ParentChunk) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT chunk_id_unique IF NOT EXISTS FOR (n:Chunk) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_build_id_unique IF NOT EXISTS FOR (n:CommunityBuild) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_id_unique IF NOT EXISTS FOR (n:Community) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_report_id_unique IF NOT EXISTS FOR (n:CommunityReport) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT community_finding_id_unique IF NOT EXISTS FOR (n:CommunityFinding) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT claim_id_unique IF NOT EXISTS FOR (n:Claim) REQUIRE n.id IS UNIQUE",
     "CREATE INDEX document_status IF NOT EXISTS FOR (n:Document) ON (n.status)",
     "CREATE INDEX revision_ready IF NOT EXISTS FOR (n:DocumentRevision) ON (n.vector_ready, n.graph_ready)",
     "CREATE INDEX chunk_parent_id IF NOT EXISTS FOR (n:Chunk) ON (n.parent_id)",
     "CREATE FULLTEXT INDEX chunk_keyword_v1 IF NOT EXISTS FOR (n:Chunk) ON EACH [n.text]",
     "CREATE FULLTEXT INDEX entities IF NOT EXISTS FOR (n:__Entity__) ON EACH [n.id, n.description]",
-    "CREATE FULLTEXT INDEX community_keyword IF NOT EXISTS FOR (n:__Community__) ON EACH [n.summary]",
+    "CREATE FULLTEXT INDEX community_report_keyword_v1 IF NOT EXISTS "
+    "FOR (n:CommunityReport) ON EACH [n.summary, n.full_content]",
+    "CREATE FULLTEXT INDEX claim_keyword_v1 IF NOT EXISTS "
+    "FOR (n:Claim) ON EACH [n.subject, n.predicate, n.object]",
 )
 
 
@@ -37,6 +46,14 @@ def parent_vector_index_query(dimension: int) -> str:
     return f"""
 CREATE VECTOR INDEX parent_embedding_v1 IF NOT EXISTS
 FOR (n:ParentChunk) ON (n.embedding)
+OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimension)}, `vector.similarity_function`: 'cosine'}}}}
+""".strip()
+
+
+def community_report_vector_index_query(dimension: int) -> str:
+    return f"""
+CREATE VECTOR INDEX community_report_embedding_v1 IF NOT EXISTS
+FOR (n:CommunityReport) ON (n.embedding)
 OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimension)}, `vector.similarity_function`: 'cosine'}}}}
 """.strip()
 
@@ -75,6 +92,8 @@ class Neo4jCorpusStore:
             for query in SCHEMA_QUERIES:
                 session.run(query).consume()
             session.run(vector_index_query(dimension)).consume()
+            session.run(community_report_vector_index_query(dimension)).consume()
+            session.run("DROP INDEX community_keyword IF EXISTS").consume()
 
     def ensure_parent_retrieval_schema(self, dimension: int = 384) -> None:
         """Create the shared corpus schema plus compact parent retrieval indexes."""
@@ -87,6 +106,8 @@ class Neo4jCorpusStore:
                 "FOR (n:ParentChunk) ON EACH [n.text]"
             ).consume()
             session.run(parent_vector_index_query(dimension)).consume()
+            session.run(community_report_vector_index_query(dimension)).consume()
+            session.run("DROP INDEX community_keyword IF EXISTS").consume()
 
     def assert_embedding_fingerprint(self, corpus_key: str, fingerprint: str) -> None:
         with self._session() as session:
@@ -118,7 +139,7 @@ class Neo4jCorpusStore:
                 MERGE (corpus:Corpus {id: $corpus_id})
                 SET corpus.key = $corpus_key,
                     corpus.title = $corpus_title,
-                    corpus.schema_version = 3,
+                    corpus.schema_version = $schema_version,
                     corpus.embedding_fingerprint = $embedding_fingerprint
                 MERGE (document:Document {id: $document_id})
                 WITH corpus, document
@@ -145,6 +166,7 @@ class Neo4jCorpusStore:
                 corpus_key=corpus_key,
                 corpus_title=corpus_title,
                 embedding_fingerprint=embedding_fingerprint,
+                schema_version=GRAPH_SCHEMA_VERSION,
                 document_id=document.document_id,
                 source_type=document.source_type,
                 source_uri=document.source_uri,
@@ -246,7 +268,7 @@ class Neo4jCorpusStore:
                 MERGE (corpus:Corpus {id: $corpus_id})
                 SET corpus.key = $corpus_key,
                     corpus.title = $corpus_title,
-                    corpus.schema_version = 3,
+                    corpus.schema_version = $schema_version,
                     corpus.embedding_fingerprint = $embedding_fingerprint
                 MERGE (document:Document {id: $document_id})
                 WITH corpus, document
@@ -274,6 +296,7 @@ class Neo4jCorpusStore:
                 corpus_key=corpus_key,
                 corpus_title=corpus_title,
                 embedding_fingerprint=embedding_fingerprint,
+                schema_version=GRAPH_SCHEMA_VERSION,
                 document_id=document.document_id,
                 source_type=document.source_type,
                 source_uri=document.source_uri,
@@ -410,12 +433,12 @@ class Neo4jCorpusStore:
                 f"""
                 {scope}
                 WHERE revision.vector_ready = true AND revision.graph_ready = false
-                  AND parent.graph_status IN ['PENDING', 'FAILED']
+                  AND parent.graph_status IN ['PENDING', 'FAILED', 'PROVISIONAL']
                 OPTIONAL MATCH (parent)-[:HAS_CHILD]->(chunk:Chunk)
                 RETURN revision.id AS revision_id, parent.id AS parent_id, parent.text AS text,
                        collect(chunk.id) AS child_ids, parent.graph_status AS graph_status,
                        revision.created_at AS revision_created_at, parent.position AS parent_position
-                ORDER BY CASE graph_status WHEN 'PENDING' THEN 0 ELSE 1 END,
+                ORDER BY CASE graph_status WHEN 'PENDING' THEN 0 WHEN 'FAILED' THEN 1 ELSE 2 END,
                          revision_created_at, parent_position
                 LIMIT $limit
                 """,
@@ -430,7 +453,10 @@ class Neo4jCorpusStore:
         child_ids: Sequence[str],
         graph_document: Any,
         revision_id: str | None = None,
+        extraction_state: str = "VERIFIED",
     ) -> None:
+        if extraction_state not in {"VERIFIED", "PROVISIONAL"}:
+            raise ValueError("extraction_state must be VERIFIED or PROVISIONAL.")
         node_rows = [
             {
                 "id": str(node.id),
@@ -467,6 +493,9 @@ class Neo4jCorpusStore:
                 MATCH ()-[relation]->()
                 WHERE $parent_id IN coalesce(relation.source_parent_ids, [])
                 SET relation.source_parent_ids = [id IN relation.source_parent_ids WHERE id <> $parent_id]
+                SET relation.provisional_parent_ids = [
+                    id IN coalesce(relation.provisional_parent_ids, []) WHERE id <> $parent_id
+                ]
                 WITH collect(DISTINCT relation) AS relations
                 FOREACH (relation IN [
                     item IN relations
@@ -505,11 +534,20 @@ class Neo4jCorpusStore:
                     SET rel.source_parent_ids = CASE
                             WHEN $parent_id IN coalesce(rel.source_parent_ids, []) THEN rel.source_parent_ids
                             ELSE coalesce(rel.source_parent_ids, []) + [$parent_id]
+                        END,
+                        rel.provisional_parent_ids = CASE
+                            WHEN $extraction_state = 'PROVISIONAL'
+                                 AND NOT $parent_id IN coalesce(rel.provisional_parent_ids, [])
+                            THEN coalesce(rel.provisional_parent_ids, []) + [$parent_id]
+                            WHEN $extraction_state = 'VERIFIED'
+                            THEN [id IN coalesce(rel.provisional_parent_ids, []) WHERE id <> $parent_id]
+                            ELSE coalesce(rel.provisional_parent_ids, [])
                         END
                     """,
                     relationships=rows,
                     parent_id=parent_id,
                     revision_id=revision_id,
+                    extraction_state=extraction_state,
                 ).consume()
             session.run(
                 """
@@ -517,14 +555,19 @@ class Neo4jCorpusStore:
                 UNWIND $entity_ids AS entity_id
                 MATCH (entity:__Entity__ {id: entity_id})
                 MERGE (parent)-[mention:HAS_ENTITY]->(entity)
-                SET mention.extraction_scope = 'parent'
+                SET mention.extraction_scope = 'parent', mention.extraction_state = $extraction_state
                 """,
                 parent_id=parent_id,
                 entity_ids=[row["id"] for row in node_rows],
+                extraction_state=extraction_state,
             ).consume()
             session.run(
-                "MATCH (parent:ParentChunk {id: $parent_id}) SET parent.graph_status = 'COMPLETED', parent.graph_error = null",
+                "MATCH (parent:ParentChunk {id: $parent_id}) "
+                "SET parent.graph_status = CASE WHEN $extraction_state = 'PROVISIONAL' "
+                "THEN 'PROVISIONAL' ELSE 'COMPLETED' END, parent.graph_error = null, "
+                "parent.graph_extraction_state = $extraction_state",
                 parent_id=parent_id,
+                extraction_state=extraction_state,
             ).consume()
 
     def fail_parent_graph(self, parent_id: str, message: str) -> None:
@@ -535,6 +578,107 @@ class Neo4jCorpusStore:
                 SET parent.graph_status = 'FAILED', parent.graph_error = $message,
                     parent.graph_attempts = coalesce(parent.graph_attempts, 0) + 1
                 """,
+                parent_id=parent_id,
+                message=message[:2000],
+            ).consume()
+
+    def pending_claim_parents(
+        self,
+        limit: int,
+        extraction_fingerprint: str,
+    ) -> list[dict[str, Any]]:
+        if not self.corpus_id:
+            raise ValueError("Claim batching requires a corpus-scoped store.")
+        if limit <= 0 or not extraction_fingerprint:
+            raise ValueError("Claim batching requires a positive limit and extraction fingerprint.")
+        with self._session() as session:
+            return [
+                dict(row)
+                for row in session.run(
+                    """
+                    MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)
+                          -[:ACTIVE_REVISION]->(revision:DocumentRevision)-[:HAS_PARENT]->
+                          (parent:ParentChunk)
+                    WHERE parent.claim_status IS NULL OR parent.claim_status = 'FAILED'
+                       OR coalesce(parent.claim_extraction_fingerprint, '') <> $extraction_fingerprint
+                    RETURN parent.id AS parent_id, parent.text AS text,
+                           revision.id AS revision_id
+                    ORDER BY revision.id, parent.position, parent.id
+                    LIMIT $limit
+                    """,
+                    corpus_id=self.corpus_id,
+                    extraction_fingerprint=extraction_fingerprint,
+                    limit=limit,
+                )
+            ]
+
+    def persist_parent_claims(
+        self,
+        parent_id: str,
+        claims: Sequence[dict[str, Any]],
+        *,
+        extraction_fingerprint: str | None = None,
+    ) -> None:
+        for claim in claims:
+            if str(claim.get("source_parent_id") or "") != parent_id:
+                raise ValueError("Every claim must identify the parent being persisted.")
+            if claim.get("stance") not in {"SUPPORTS", "CONTRADICTS"}:
+                raise ValueError("Claim stance must be SUPPORTS or CONTRADICTS.")
+        scope = (
+            "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
+            "(:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk {id: $parent_id})"
+            if self.corpus_id
+            else "MATCH (parent:ParentChunk {id: $parent_id})"
+        )
+        with self._session() as session:
+            result = session.run(
+                f"""
+                {scope}
+                OPTIONAL MATCH (parent)-[old:SUPPORTS|CONTRADICTS]->(:Claim)
+                WITH parent, collect(old) AS old_evidence
+                FOREACH (evidence IN old_evidence | DELETE evidence)
+                CALL {{
+                    WITH parent
+                    UNWIND $rows AS row
+                    MERGE (claim:Claim {{id: row.id}})
+                    ON CREATE SET claim.subject = row.subject, claim.predicate = row.predicate,
+                                  claim.object = row.object, claim.valid_from = row.valid_from,
+                                  claim.valid_to = row.valid_to, claim.created_at = datetime()
+                    FOREACH (_ IN CASE WHEN row.stance = 'SUPPORTS' THEN [1] ELSE [] END |
+                        MERGE (parent)-[supported:SUPPORTS]->(claim)
+                        SET supported.extraction_confidence = row.extraction_confidence)
+                    FOREACH (_ IN CASE WHEN row.stance = 'CONTRADICTS' THEN [1] ELSE [] END |
+                        MERGE (parent)-[contradicted:CONTRADICTS]->(claim)
+                        SET contradicted.extraction_confidence = row.extraction_confidence)
+                    RETURN count(row) AS persisted
+                }}
+                SET parent.claim_status = 'COMPLETED',
+                    parent.claim_extraction_fingerprint = $extraction_fingerprint,
+                    parent.claim_error = null
+                RETURN persisted
+                """,
+                corpus_id=self.corpus_id,
+                parent_id=parent_id,
+                rows=[dict(claim) for claim in claims],
+                extraction_fingerprint=extraction_fingerprint,
+            )
+            if result.single() is None:
+                raise ValueError(f"Parent is not part of the selected corpus: {parent_id}")
+
+    def fail_parent_claims(self, parent_id: str, message: str) -> None:
+        scope = (
+            "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:ACTIVE_REVISION]->"
+            "(:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk {id: $parent_id})"
+            if self.corpus_id
+            else "MATCH (parent:ParentChunk {id: $parent_id})"
+        )
+        with self._session() as session:
+            session.run(
+                f"""
+                {scope}
+                SET parent.claim_status = 'FAILED', parent.claim_error = $message
+                """,
+                corpus_id=self.corpus_id,
                 parent_id=parent_id,
                 message=message[:2000],
             ).consume()

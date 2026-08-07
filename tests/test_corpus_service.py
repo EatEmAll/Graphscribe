@@ -37,6 +37,10 @@ class Service:
     def answer(self, key, payload):
         return {"answer": payload["question"], "citations": []}
 
+    def answer_stream(self, key, payload):
+        yield {"event": "answer_delta", "data": {"text": payload["question"]}}
+        yield {"event": "done", "data": {"cancelled": False}}
+
     def list_documents(self, key):
         return []
 
@@ -66,6 +70,37 @@ def test_search_endpoint_validates_and_delegates() -> None:
     response = client.post("/v1/corpora/demo/search", headers=headers, json={"query": "hello"})
     assert response.status_code == 200
     assert response.json() == {"key": "demo", "query": "hello"}
+
+
+def test_answer_endpoint_accepts_global_mode() -> None:
+    client = TestClient(create_app(Service(), "x" * 32))
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    response = client.post(
+        "/v1/corpora/demo/answer",
+        headers=headers,
+        json={"question": "themes", "mode": "global"},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "themes"
+
+
+def test_answer_stream_endpoint_emits_sse_events() -> None:
+    client = TestClient(create_app(Service(), "x" * 32))
+    headers = {"Authorization": f"Bearer {'x' * 32}"}
+
+    response = client.post(
+        "/v1/corpora/demo/answer/stream",
+        headers=headers,
+        json={"question": "stream me"},
+    )
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert "event: answer_delta" in response.text
+    assert '"text": "stream me"' in response.text
+    assert "event: done" in response.text
 
 
 def test_registry_reads_manifests_and_validates_root(tmp_path: Path) -> None:

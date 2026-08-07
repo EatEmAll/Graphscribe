@@ -17,9 +17,18 @@ from urllib.parse import urlsplit, urlunsplit
 
 from neo4j import GraphDatabase
 
+from notebooklm_graph_pipe.ingestion.manifest import (
+    DEFAULT_COMMUNITY_CONFIG,
+    DEFAULT_EXECUTION_CONFIG,
+    DEFAULT_GRAPH_CONFIG,
+    load_manifest,
+    save_manifest,
+)
+from notebooklm_graph_pipe.ingestion.neo4j_store import GRAPH_SCHEMA_VERSION, Neo4jCorpusStore
 from notebooklm_graph_pipe.runtime.neo4j_connection import (
     Neo4jConnectionSpec,
     ResolvedNeo4jConnection,
+    redacted_connection,
     resolve_connection,
     validate_neo4j_uri,
     verify_connection,
@@ -91,7 +100,7 @@ CORPUS_RELATIONSHIP_QUERIES = {
         "(:DocumentRevision)<-[:IN_REVISION]-(a:Chunk)-[r:NEXT_CHUNK]->(b:Chunk)"
     ),
 }
-CORPUS_SCHEMA_NAMES = {
+CORPUS_SCHEMA_REQUIRED = {
     "chunk_embedding_v1",
     "chunk_id_unique",
     "chunk_keyword_v1",
@@ -101,12 +110,31 @@ CORPUS_SCHEMA_NAMES = {
     "document_id_unique",
     "document_status",
     "entities",
-    "community_keyword",
     "parent_chunk_id_unique",
     "revision_id_unique",
     "revision_ready",
 }
-CORPUS_SEMANTIC_INDEXES = {"chunk_embedding_v1", "chunk_keyword_v1", "entities", "community_keyword"}
+CORPUS_COMMUNITY_SCHEMA_NAMES = {
+    "community_keyword",
+    "community_report_keyword_v1",
+    "community_report_embedding_v1",
+    "community_build_id_unique",
+    "community_id_unique",
+    "community_report_id_unique",
+    "community_finding_id_unique",
+    "claim_id_unique",
+    "claim_keyword_v1",
+}
+CORPUS_SCHEMA_NAMES = CORPUS_SCHEMA_REQUIRED | CORPUS_COMMUNITY_SCHEMA_NAMES
+CORPUS_SEMANTIC_INDEXES = {
+    "chunk_embedding_v1",
+    "chunk_keyword_v1",
+    "entities",
+    "community_report_keyword_v1",
+    "community_report_embedding_v1",
+    "community_keyword",
+    "claim_keyword_v1",
+}
 LEGACY_CHUNK_INDEXES = {"vector", "keyword"}
 
 
@@ -596,6 +624,24 @@ def corpus_content_fingerprint(driver: Any, database: str, corpus_id: str) -> di
     return result
 
 
+def corpus_upgrade_fingerprint(driver: Any, database: str, corpus_id: str) -> dict[str, tuple[int, str]]:
+    """Fingerprint corpus content while ignoring schema-upgrade metadata."""
+    result = corpus_content_fingerprint(driver, database, corpus_id)
+
+    def corpus_rows() -> Iterator[dict[str, Any]]:
+        for row in _corpus_node_rows(driver, database, corpus_id, "Corpus"):
+            normalized = dict(row)
+            properties = dict(normalized.get("properties") or {})
+            properties.pop("schema_version", None)
+            properties.pop("migration_run_id", None)
+            properties.pop("migrated_at", None)
+            normalized["properties"] = properties
+            yield {"kind": "node:Corpus", **normalized}
+
+    result["node:Corpus"] = _fingerprint_rows(corpus_rows())
+    return result
+
+
 def base_graph_content_fingerprint(driver: Any, database: str, corpus_id: str) -> dict[str, tuple[int, str]]:
     with driver.session(database=database) as session:
         corpus_exists = int(
@@ -960,7 +1006,10 @@ def corpus_merge(
                 raise MigrationError("Donor corpus contains one or more chunks without embeddings.")
             target_before = read_inventory(target, target_connection.database)
             schema = _corpus_schema(source, source_connection.database)
-            missing_schema = CORPUS_SCHEMA_NAMES - {item.name for item in schema}
+            schema_names = {item.name for item in schema}
+            missing_schema = CORPUS_SCHEMA_REQUIRED - schema_names
+            if not {"community_keyword", "community_report_keyword_v1"}.intersection(schema_names):
+                missing_schema.add("community report full-text index")
             if missing_schema:
                 raise MigrationError(f"Donor corpus is missing required schema: {sorted(missing_schema)}")
             summary: dict[str, Any] = {
@@ -1102,6 +1151,11 @@ def corpus_merge(
                 )
                 complete("schema-search")
 
+            if "schema-v4" not in completed:
+                dimension = corpus_vector_dimension(read_schema_signature(target, target_connection.database))
+                Neo4jCorpusStore(target, target_connection.database, corpus_id=corpus_id).ensure_schema(dimension)
+                complete("schema-v4")
+
             target_corpus = read_corpus_merge_inventory(target, target_connection.database, corpus_id)
             if target_corpus != source_inventory:
                 raise MigrationError(
@@ -1124,7 +1178,10 @@ def corpus_merge(
                     f"expected {expected_nodes}/{expected_relationships}, "
                     f"got {target_after.nodes}/{target_after.relationships}."
                 )
-            verify_corpus_connection(target_connection, dimension=corpus_vector_dimension(read_schema_signature(target, target_connection.database)))
+            verify_corpus_connection(
+                target_connection,
+                dimension=corpus_vector_dimension(read_schema_signature(target, target_connection.database)),
+            )
             state["status"] = "completed"
             _write_merge_state(state_path, state)
             summary["target_corpus"] = target_corpus.to_dict()
@@ -1644,8 +1701,10 @@ def create_container_dump(
 
 
 def activate_manifest(path: Path, target: ResolvedNeo4jConnection, password_env: str) -> None:
+    if not path.exists():
+        raise MigrationError(f"Manifest does not exist: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    payload["version"] = max(int(payload.get("version") or 1), 3)
+    payload["version"] = GRAPH_SCHEMA_VERSION
     payload["neo4j"] = {
         "deployment": "external",
         "uri": target.uri,
@@ -1653,7 +1712,117 @@ def activate_manifest(path: Path, target: ResolvedNeo4jConnection, password_env:
         "database": target.database,
         "password_env": password_env,
     }
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    payload.setdefault("execution", DEFAULT_EXECUTION_CONFIG)
+    payload.setdefault("graph", DEFAULT_GRAPH_CONFIG)
+    payload.setdefault("community", DEFAULT_COMMUNITY_CONFIG)
+    retrieval = payload.setdefault("retrieval", {})
+    retrieval.setdefault("vector_provider", "neo4j")
+    retrieval.setdefault("vector_location", None)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+    temporary.replace(path)
+
+
+def _backup_checksum(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while block := stream.read(1024 * 1024):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def upgrade_in_place(
+    connection: ResolvedNeo4jConnection,
+    *,
+    manifest_path: Path,
+    backup_file: Path | None,
+    execute: bool = False,
+    confirm_source: str | None = None,
+    migration_run_id: str | None = None,
+) -> dict[str, Any]:
+    manifest = load_manifest(manifest_path)
+    if manifest is None:
+        raise MigrationError(f"Manifest does not exist: {manifest_path}")
+    expected_confirmation = f"{connection.uri}|{connection.database}"
+    if execute and confirm_source != expected_confirmation:
+        raise MigrationError(f"--confirm-source must exactly match: {expected_confirmation}")
+    backup_checksum = None
+    if execute:
+        if backup_file is None:
+            raise MigrationError("In-place schema upgrade requires --backup-file.")
+        backup_file = backup_file.resolve()
+        if not backup_file.is_file() or backup_file.stat().st_size <= 0:
+            raise MigrationError(f"Backup file is missing or empty: {backup_file}")
+        backup_checksum = _backup_checksum(backup_file)
+
+    server = verify_connection(connection, require_write=execute)
+    with GraphDatabase.driver(connection.uri, auth=(connection.username, connection.password)) as driver:
+        before = corpus_upgrade_fingerprint(driver, connection.database, manifest.corpus_id)
+        inventory = read_corpus_merge_inventory(driver, connection.database, manifest.corpus_id)
+        if inventory.nodes.get("Corpus") != 1:
+            raise MigrationError(
+                f"Expected exactly one corpus with id={manifest.corpus_id!r}; inventory={inventory.to_dict()}"
+            )
+        schema_before = read_schema_signature(driver, connection.database)
+        summary: dict[str, Any] = {
+            "mode": "upgrade-in-place",
+            "executed": execute,
+            "source": redacted_connection(connection),
+            "server": server,
+            "corpus_id": manifest.corpus_id,
+            "manifest_version_before": int(
+                json.loads(manifest_path.read_text(encoding="utf-8")).get("version") or 0
+            ),
+            "schema_version_target": GRAPH_SCHEMA_VERSION,
+            "inventory": inventory.to_dict(),
+            "schema_before": sorted(schema_before),
+            "backup_file": str(backup_file) if backup_file else None,
+            "backup_sha256": backup_checksum,
+        }
+        if not execute:
+            return summary
+
+        Neo4jCorpusStore(driver, connection.database, corpus_id=manifest.corpus_id).ensure_schema(
+            manifest.embedding_dimension
+        )
+        with driver.session(database=connection.database) as session:
+            session.run("CALL db.awaitIndexes(300)").consume()
+            updated = session.run(
+                """
+                MATCH (corpus:Corpus {id: $corpus_id})
+                SET corpus.schema_version = $schema_version,
+                    corpus.migration_run_id = $migration_run_id,
+                    corpus.migrated_at = datetime()
+                RETURN count(corpus) AS count
+                """,
+                corpus_id=manifest.corpus_id,
+                schema_version=GRAPH_SCHEMA_VERSION,
+                migration_run_id=migration_run_id,
+            ).single()
+            if not updated or int(updated["count"]) != 1:
+                raise MigrationError("Schema upgrade did not update exactly one corpus.")
+
+        after = corpus_upgrade_fingerprint(driver, connection.database, manifest.corpus_id)
+        if before != after:
+            raise MigrationError("Corpus content fingerprint changed during schema upgrade.")
+        verify_corpus_connection(
+            connection,
+            dimension=manifest.embedding_dimension,
+            retrieval_unit=manifest.retrieval_unit,
+            vector_index=manifest.retrieval_vector_index,
+            keyword_index=manifest.retrieval_keyword_index,
+            require_retrieval_vector=manifest.retrieval_vector_provider == "neo4j",
+        )
+        save_manifest(manifest_path, manifest)
+        summary.update(
+            {
+                "verified": True,
+                "manifest_version_after": GRAPH_SCHEMA_VERSION,
+                "schema_after": sorted(read_schema_signature(driver, connection.database)),
+                "content_fingerprint": after,
+            }
+        )
+        return summary
 
 
 def manifest_corpus_id(path: Path) -> str:
@@ -1694,7 +1863,11 @@ def _connection_from_args(args: argparse.Namespace, prefix: str) -> ResolvedNeo4
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Migrate a local Neo4j database to a hosted Neo4j database.")
-    parser.add_argument("--mode", choices=("portable", "aura-upload", "corpus-merge"), default="portable")
+    parser.add_argument(
+        "--mode",
+        choices=("upgrade-in-place", "portable", "aura-upload", "corpus-merge"),
+        default="portable",
+    )
     for prefix in ("source", "target"):
         parser.add_argument(f"--{prefix}-uri")
         parser.add_argument(f"--{prefix}-user")
@@ -1705,6 +1878,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--resume", action="store_true", help="Resume an interrupted portable or corpus merge")
     parser.add_argument("--overwrite-target", action="store_true")
     parser.add_argument("--confirm-target", help="Exact '<target-uri>|<target-database>' overwrite confirmation")
+    parser.add_argument("--confirm-source", help="Exact '<source-uri>|<source-database>' in-place confirmation")
+    parser.add_argument("--backup-file", type=Path, help="Verified pre-migration backup required for in-place upgrade")
     parser.add_argument("--manifest-path", type=Path)
     parser.add_argument("--state-path", type=Path, help="Checkpoint file for --mode corpus-merge")
     parser.add_argument("--activate-target", action="store_true")
@@ -1720,6 +1895,24 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.batch_size <= 0:
         raise MigrationError("--batch-size must be greater than zero.")
+    if args.mode == "upgrade-in-place":
+        if not args.manifest_path:
+            raise MigrationError("--mode upgrade-in-place requires --manifest-path.")
+        if args.activate_target or args.overwrite_target or args.resume:
+            raise MigrationError(
+                "In-place upgrade does not support --activate-target, --overwrite-target, or --resume."
+            )
+        source = _connection_from_args(args, "source")
+        summary = upgrade_in_place(
+            source,
+            manifest_path=args.manifest_path.resolve(),
+            backup_file=args.backup_file,
+            execute=args.execute,
+            confirm_source=args.confirm_source,
+        )
+        summary["elapsed_seconds"] = round(time.monotonic() - started, 3)
+        print(json.dumps(summary, indent=2, sort_keys=True))
+        return 0
     target = _connection_from_args(args, "target")
     expected_confirmation = f"{target.uri}|{target.database}"
     if (args.overwrite_target or (args.mode == "corpus-merge" and args.execute)) and args.confirm_target != expected_confirmation:
