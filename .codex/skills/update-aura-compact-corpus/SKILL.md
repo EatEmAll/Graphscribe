@@ -29,6 +29,7 @@ Read [references/workflow.md](references/workflow.md) before taking any mutating
 - Never store child chunks in the compact database.
 - Never run full consolidation for an ordinary source batch.
 - Never consolidate before graph extraction is complete.
+- Consolidation must operate only on `__Entity__` nodes; never select, relabel, merge, or attach taxonomy relationships to `CorpusSource` ledger nodes or their bookkeeping relationships.
 - Never garbage-collect the previous revision before validation.
 - APOC merges are not revision-reversible. Require a pre-consolidation backup before `--execute`.
 - If a gate fails, stop; do not lower thresholds or capacity headroom silently.

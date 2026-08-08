@@ -231,7 +231,9 @@ def fetch_taxonomy_candidates(
     query = """
         MATCH (n:__Entity__)
         WHERE
-            (
+            NOT n:CorpusSource
+            AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+            AND (
                 (
                 n:Concept
                 AND ALL(label IN labels(n) WHERE label IN ['__Entity__', 'Concept'])
@@ -307,6 +309,8 @@ def fetch_candidate_pool(session) -> list[dict[str, Any]]:
     result = session.run(
         """
         MATCH (n:__Entity__)
+        WHERE NOT n:CorpusSource
+          AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         OPTIONAL MATCH (n)-[r]-(m)
         RETURN
             elementId(n) AS eid,
@@ -887,8 +891,11 @@ def can_apply_relation(session, *, source_eid: str, relation: str, target_eid: s
 
     reverse = session.run(
         """
-        MATCH (source)-[rel:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A]->(target)
+        MATCH (source:__Entity__)-[rel:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A]->(target:__Entity__)
         WHERE elementId(source) = $target_eid AND elementId(target) = $source_eid
+          AND NOT source:CorpusSource AND NOT target:CorpusSource
+          AND NOT EXISTS { (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+          AND NOT EXISTS { (target)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         RETURN count(rel) AS reverse_count
         """,
         source_eid=source_eid,
@@ -899,8 +906,12 @@ def can_apply_relation(session, *, source_eid: str, relation: str, target_eid: s
 
     cycle = session.run(
         """
-        MATCH (source) WHERE elementId(source) = $source_eid
-        MATCH (target) WHERE elementId(target) = $target_eid
+        MATCH (source:__Entity__)
+        WHERE elementId(source) = $source_eid AND NOT source:CorpusSource
+          AND NOT EXISTS { (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+        MATCH (target:__Entity__)
+        WHERE elementId(target) = $target_eid AND NOT target:CorpusSource
+          AND NOT EXISTS { (target)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         RETURN EXISTS {
             MATCH (target)-[:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A*1..6]->(source)
         } AS would_cycle
@@ -908,13 +919,18 @@ def can_apply_relation(session, *, source_eid: str, relation: str, target_eid: s
         source_eid=source_eid,
         target_eid=target_eid,
     ).single()
+    if cycle is None:
+        return False, "Source or target is not a consolidatable entity"
     if bool(cycle["would_cycle"]):
         return False, "Would introduce taxonomy cycle"
 
     conflicting = session.run(
         f"""
-        MATCH (source)-[rel:{relation}]->(other)
+        MATCH (source:__Entity__)-[rel:{relation}]->(other:__Entity__)
         WHERE elementId(source) = $source_eid AND elementId(other) <> $target_eid
+          AND NOT source:CorpusSource AND NOT other:CorpusSource
+          AND NOT EXISTS {{ (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+          AND NOT EXISTS {{ (other)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
         RETURN count(rel) AS conflicting_count
         """,
         source_eid=source_eid,
@@ -937,7 +953,9 @@ def apply_label(session, *, source_eid: str, old_labels: list[str], new_label: s
     removal_block = "\n        ".join(removal_clauses)
     session.run(
         f"""
-        MATCH (n) WHERE elementId(n) = $source_eid
+        MATCH (n:__Entity__)
+        WHERE elementId(n) = $source_eid AND NOT n:CorpusSource
+          AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
         SET n:`{safe_new_label}`
         {removal_block}
         """,
@@ -948,8 +966,12 @@ def apply_label(session, *, source_eid: str, old_labels: list[str], new_label: s
 def add_relation(session, *, source_eid: str, relation: str, target_eid: str) -> None:
     session.run(
         f"""
-        MATCH (source) WHERE elementId(source) = $source_eid
-        MATCH (target) WHERE elementId(target) = $target_eid
+        MATCH (source:__Entity__)
+        WHERE elementId(source) = $source_eid AND NOT source:CorpusSource
+          AND NOT EXISTS {{ (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+        MATCH (target:__Entity__)
+        WHERE elementId(target) = $target_eid AND NOT target:CorpusSource
+          AND NOT EXISTS {{ (target)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
         MERGE (source)-[:{relation}]->(target)
         """,
         source_eid=source_eid,
