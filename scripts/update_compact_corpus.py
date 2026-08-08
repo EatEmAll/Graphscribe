@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from notebooklm_graph_pipe.ingestion.chunking import HierarchicalChunker, load_minilm_tokenizer
+from notebooklm_graph_pipe.ingestion.adapters import YoutubeSource
 from notebooklm_graph_pipe.ingestion.compact_sync import CompactCorpusUpdater
 from notebooklm_graph_pipe.ingestion.embeddings import MiniLMEmbedder
 from notebooklm_graph_pipe.ingestion.manifest import load_manifest
@@ -35,7 +36,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--manifest-path", required=True)
     parser.add_argument("--source-root", required=True)
-    parser.add_argument("--source", action="append", required=True)
+    parser.add_argument("--source", action="append", default=[])
+    parser.add_argument("--youtube-url", action="append", default=[])
+    parser.add_argument("--force-refresh", action="store_true")
     parser.add_argument("--confirm-target", required=True, help="Must equal <neo4j-uri>|<database>.")
     parser.add_argument("--max-nodes", type=int, default=150_000)
     parser.add_argument("--max-relationships", type=int, default=300_000)
@@ -49,8 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     source_root = Path(args.source_root).resolve()
     if not source_root.is_dir():
         parser.error(f"Source root not found: {source_root}")
-    sources = [Path(value).resolve() for value in args.source]
-    missing = [str(path) for path in sources if not path.is_file()]
+    if not args.source and not args.youtube_url:
+        parser.error("At least one --source or --youtube-url is required.")
+    file_sources = [Path(value).resolve() for value in args.source]
+    missing = [str(path) for path in file_sources if not path.is_file()]
     if missing:
         parser.error(f"Source files not found: {missing}")
     if not 0 <= args.capacity_headroom < 1:
@@ -101,11 +106,12 @@ def main(argv: list[str] | None = None) -> int:
         try:
             with FileLock(str(manifest_path.with_suffix(".update.lock")), timeout=0):
                 report = updater.update(
-                    sources=sources,
+                    sources=[*file_sources, *(YoutubeSource(url) for url in args.youtube_url)],
                     corpus_root=source_root,
                     manifest=manifest,
                     manifest_path=manifest_path,
                     capacity_guard=capacity_guard,
+                    force_refresh=args.force_refresh,
                 )
         except Timeout as exc:
             raise RuntimeError("Another compact corpus update is already running.") from exc

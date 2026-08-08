@@ -8,7 +8,7 @@ from typing import Any, Iterable, Sequence
 from .chunking import ChunkingResult
 from .models import CanonicalDocument
 
-GRAPH_SCHEMA_VERSION = 4
+GRAPH_SCHEMA_VERSION = 5
 
 SCHEMA_QUERIES = (
     "CREATE CONSTRAINT corpus_id_unique IF NOT EXISTS FOR (n:Corpus) REQUIRE n.id IS UNIQUE",
@@ -22,6 +22,11 @@ SCHEMA_QUERIES = (
     "CREATE CONSTRAINT community_report_id_unique IF NOT EXISTS FOR (n:CommunityReport) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT community_finding_id_unique IF NOT EXISTS FOR (n:CommunityFinding) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT claim_id_unique IF NOT EXISTS FOR (n:Claim) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT corpus_source_id_unique IF NOT EXISTS FOR (n:CorpusSource) REQUIRE n.id IS UNIQUE",
+    "CREATE CONSTRAINT corpus_source_provider_unique IF NOT EXISTS FOR (n:CorpusSource) REQUIRE (n.corpus_id, n.provider, n.provider_source_id) IS UNIQUE",
+    "CREATE INDEX corpus_source_uri IF NOT EXISTS FOR (n:CorpusSource) ON (n.corpus_id, n.canonical_uri)",
+    "CREATE INDEX corpus_source_checksum IF NOT EXISTS FOR (n:CorpusSource) ON (n.corpus_id, n.content_checksum)",
+    "CREATE INDEX corpus_source_status IF NOT EXISTS FOR (n:CorpusSource) ON (n.corpus_id, n.ingestion_status, n.retrieval_status)",
     "CREATE INDEX document_status IF NOT EXISTS FOR (n:Document) ON (n.status)",
     "CREATE INDEX revision_ready IF NOT EXISTS FOR (n:DocumentRevision) ON (n.vector_ready, n.graph_ready)",
     "CREATE INDEX chunk_parent_id IF NOT EXISTS FOR (n:Chunk) ON (n.parent_id)",
@@ -335,7 +340,40 @@ class Neo4jCorpusStore:
                     rows=rows,
                 ).consume()
 
-    def activate_compact_revision(self, document_id: str, revision_id: str, expected_parents: int) -> None:
+    def resolve_ledger_source(self, identity: Any) -> dict[str, Any] | None:
+        row = identity.to_row()
+        with self._session() as session:
+            matches = list(session.run(
+                """
+                MATCH (source:CorpusSource {corpus_id: $corpus_id})
+                WHERE (source.provider = $provider AND source.provider_source_id = $provider_source_id)
+                   OR ($canonical_uri IS NOT NULL AND source.canonical_uri = $canonical_uri)
+                   OR source.content_checksum = $content_checksum
+                OPTIONAL MATCH (source)-[:MATERIALIZED_AS]->(document:Document)
+                RETURN source.id AS ledger_source_id, source.provider AS provider,
+                       source.provider_source_id AS provider_source_id,
+                       source.canonical_uri AS canonical_uri,
+                       source.content_checksum AS content_checksum,
+                       source.retrieval_status AS retrieval_status,
+                       document.id AS document_id
+                """, **row
+            ))
+        unique = {record["ledger_source_id"]: dict(record) for record in matches}
+        if len(unique) > 1:
+            raise ValueError("Source identity conflicts with multiple Aura ledger records.")
+        if not unique:
+            return None
+        match = next(iter(unique.values()))
+        provider_match = match["provider"] == row["provider"] and match["provider_source_id"] == row["provider_source_id"]
+        uri_match = bool(row["canonical_uri"] and match.get("canonical_uri") == row["canonical_uri"])
+        checksum_match = match.get("content_checksum") == row["content_checksum"]
+        if not (provider_match or uri_match or checksum_match):
+            raise ValueError("Resolved ledger record does not match the supplied source identity.")
+        return match
+
+    def activate_compact_revision(
+        self, document_id: str, revision_id: str, expected_parents: int, *, ledger: Any | None = None
+    ) -> None:
         with self._session() as session:
             result = session.run(
                 """
@@ -351,11 +389,33 @@ class Neo4jCorpusStore:
                 MERGE (document)-[:ACTIVE_REVISION]->(revision)
                 SET revision.status = 'ACTIVE', revision.vector_ready = true,
                     document.status = 'READY'
+                WITH document, revision
+                OPTIONAL MATCH (corpus:Corpus {id: $corpus_id})
+                FOREACH (_ IN CASE WHEN $ledger IS NULL THEN [] ELSE [1] END |
+                    MERGE (source:CorpusSource {id: $ledger.id})
+                    SET source.corpus_id = $ledger.corpus_id,
+                        source.provider = $ledger.provider,
+                        source.provider_source_id = $ledger.provider_source_id,
+                        source.title = $ledger.title,
+                        source.source_type = $ledger.source_type,
+                        source.canonical_uri = $ledger.canonical_uri,
+                        source.content_checksum = $ledger.content_checksum,
+                        source.acquisition_method = $ledger.acquisition_method,
+                        source.notebook_ids = $ledger.notebook_ids,
+                        source.ledger_version = 1,
+                        source.ingestion_status = 'INGESTED',
+                        source.retrieval_status = 'ACTIVE',
+                        source.last_verified_at = datetime(),
+                        source.first_seen_at = coalesce(source.first_seen_at, datetime())
+                    MERGE (corpus)-[:HAS_SOURCE]->(source)
+                    MERGE (source)-[:MATERIALIZED_AS]->(document))
                 RETURN actual
                 """,
                 document_id=document_id,
                 revision_id=revision_id,
                 expected=expected_parents,
+                corpus_id=self.corpus_id,
+                ledger=ledger.to_row() if ledger is not None else None,
             ).single()
             if not result:
                 raise RuntimeError(
@@ -716,6 +776,13 @@ class Neo4jCorpusStore:
                 SET document.status = 'DELETED'
                 FOREACH (_ IN CASE WHEN revision IS NULL THEN [] ELSE [1] END |
                     SET revision.status = 'INACTIVE')
+                WITH document
+                OPTIONAL MATCH (source:CorpusSource)-[materialized:MATERIALIZED_AS]->(document)
+                DELETE materialized
+                WITH source
+                WHERE source IS NOT NULL
+                SET source.retrieval_status = CASE
+                    WHEN (source)-[:LEGACY_EVIDENCE]->() THEN 'LEGACY_ONLY' ELSE 'INACTIVE' END
                 """,
                 document_id=document_id,
             ).consume()
@@ -729,6 +796,10 @@ class Neo4jCorpusStore:
                 DELETE current
                 MERGE (document)-[:ACTIVE_REVISION]->(revision)
                 SET document.status = 'READY', revision.status = 'ACTIVE', revision.vector_ready = true
+                WITH revision, document
+                OPTIONAL MATCH (source:CorpusSource)-[:MATERIALIZED_AS]->(document)
+                SET source.content_checksum = revision.checksum,
+                    source.retrieval_status = 'ACTIVE', source.ingestion_status = 'INGESTED'
                 RETURN revision.id AS revision_id
                 """,
                 document_id=document_id,

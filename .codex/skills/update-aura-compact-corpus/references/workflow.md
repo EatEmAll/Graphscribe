@@ -9,6 +9,8 @@ Use `docs/AURA_COMPACT_CORPUS_UPDATES.md` as the canonical command reference.
 | Manifest is not parent retrieval | Stop; this workflow targets the Aura compact projection only. |
 | Target confirmation differs | Stop and resolve the correct manifest. |
 | Capacity headroom fails | Stop; resize or build another projection. |
+| Ledger identity conflicts or has multiple matches | Stop without embedding or graph writes; resolve exact evidence. |
+| Ledger source is `LEGACY_ONLY` | Report it as already ingested; require explicit `--force-refresh` to materialize it. |
 | Source checksum is unchanged in Aura | Record it as unchanged; do not re-embed. |
 | Parent persistence fails | Keep or restore the prior active revision. |
 | Graph parents remain failed | Retry extraction; do not consolidate. |

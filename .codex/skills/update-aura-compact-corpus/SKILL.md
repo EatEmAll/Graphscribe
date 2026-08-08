@@ -11,8 +11,8 @@ Read [references/workflow.md](references/workflow.md) before taking any mutating
 
 1. Locate the active compact manifest and verify its parent retrieval profile.
 2. Resolve Aura only from that manifest and require the exact target confirmation. Never substitute a local Neo4j instance.
-3. Inventory capacity and establish a pre-update retrieval and grounding baseline.
-4. Add only explicitly named sources with `scripts/update_compact_corpus.py`. Preserve the emitted new and previous revision IDs.
+3. Run `scripts/source_ledger.py audit`, inventory capacity, and establish a pre-update retrieval and grounding baseline.
+4. Add only explicitly named files or YouTube URLs with `scripts/update_compact_corpus.py`. Resolve exact ledger identity before embedding and preserve the emitted new and previous revision IDs.
 5. Run `scripts/process_graph_queue.py` until every new revision is graph-ready.
 6. Validate the new revision before consolidation. Roll back to the previous revision if the corpus gate fails.
 7. Run `scripts/consolidation/consolidate_delta.py` without `--execute`. Review the proposed changes.
@@ -23,6 +23,8 @@ Read [references/workflow.md](references/workflow.md) before taking any mutating
 
 - Aura is authoritative; local databases are disposable caches unless freshly restored from Aura.
 - Never scan a directory and infer deletions. Routine updates use explicit source paths.
+- Aura's ledger overrides stale local manifest identity. Never deduplicate by title or fuzzy similarity.
+- Treat `LEGACY_ONLY` as already ingested unless the user explicitly authorizes `--force-refresh`.
 - Never store child chunks in the compact database.
 - Never run full consolidation for an ordinary source batch.
 - Never consolidate before graph extraction is complete.
@@ -32,4 +34,4 @@ Read [references/workflow.md](references/workflow.md) before taking any mutating
 
 ## Handoff
 
-Report the exact Aura target, sources, new and previous revision IDs, parent counts, transient child counts, graph completion, delta dry-run and execute status, validation results, capacity before and after, and whether old revisions were retained or collected.
+Report the exact Aura target; ledger audit; added, revised, unchanged, conflicted, and legacy-only sources; new and previous revision IDs; parent and transient child counts; graph completion; delta status; validation; capacity; and revision retention.

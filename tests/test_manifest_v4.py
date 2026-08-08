@@ -5,7 +5,7 @@ import json
 from notebooklm_graph_pipe.ingestion.manifest import CorpusManifest, load_manifest, save_manifest
 
 
-def test_v3_manifest_is_normalized_to_v4_without_enabling_features(tmp_path) -> None:
+def test_v3_manifest_is_normalized_to_v5_without_enabling_features(tmp_path) -> None:
     path = tmp_path / "manifest.json"
     path.write_text(
         json.dumps(
@@ -29,7 +29,7 @@ def test_v3_manifest_is_normalized_to_v4_without_enabling_features(tmp_path) -> 
     manifest = load_manifest(path)
 
     assert manifest is not None
-    assert manifest.version == 4
+    assert manifest.version == 5
     assert manifest.community["enabled"] is False
     assert manifest.graph["claims_enabled"] is False
     assert manifest.graph["extraction_mode"] == "llm"

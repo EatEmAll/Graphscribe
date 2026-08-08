@@ -39,6 +39,13 @@ def document_id(corpus_identifier: str, source_identity: str) -> str:
     return str(uuid.uuid5(uuid.UUID(corpus_identifier), source_identity))
 
 
+def ledger_source_id(corpus_identifier: str, provider: str, provider_source_id: str) -> str:
+    identity = f"{provider.strip().lower()}:{provider_source_id.strip()}"
+    if not provider.strip() or not provider_source_id.strip():
+        raise ValueError("Ledger provider and provider source ID cannot be empty.")
+    return str(uuid.uuid5(uuid.UUID(corpus_identifier), identity))
+
+
 def sha256_text(*parts: object) -> str:
     payload = "\x1f".join(str(part) for part in parts)
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

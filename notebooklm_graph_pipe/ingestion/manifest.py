@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 
-MANIFEST_VERSION = 4
-LEGACY_MANIFEST_VERSIONS = {3}
+MANIFEST_VERSION = 5
+LEGACY_MANIFEST_VERSIONS = {3, 4}
 RETRIEVAL_UNITS = {"chunk", "parent"}
 
 DEFAULT_EXECUTION_CONFIG: dict[str, Any] = {
@@ -43,6 +43,7 @@ class SourceManifestEntry:
     extractor_version: str
     status: str = "ready"
     warnings: list[str] = field(default_factory=list)
+    ledger_source_id: str | None = None
 
 
 @dataclass
