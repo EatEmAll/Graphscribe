@@ -421,7 +421,9 @@ def fetch_concept_only_nodes(
 ) -> list[dict[str, Any]]:
     query = """
         MATCH (n:__Entity__:Concept)
-        WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+        WHERE NOT n:CorpusSource
+          AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+          AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
           AND ($scope_revision_ids IS NULL OR EXISTS {
               MATCH (n)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(revision:DocumentRevision)
               WHERE revision.id IN $scope_revision_ids
@@ -476,7 +478,12 @@ def fetch_concept_only_nodes(
 def apply_label(session, eid: str, new_label: str) -> None:
     safe_label = new_label.replace("`", "")
     session.run(
-        f"MATCH (n) WHERE elementId(n) = $eid SET n:`{safe_label}`",
+        f"""
+        MATCH (n:__Entity__)
+        WHERE elementId(n) = $eid AND NOT n:CorpusSource
+          AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+        SET n:`{safe_label}`
+        """,
         eid=eid,
     )
 

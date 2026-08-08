@@ -474,6 +474,8 @@ def fetch_entities(session, scope_revision_ids: list[str] | None = None) -> list
     result = session.run(
         """
         MATCH (n:__Entity__)
+        WHERE NOT n:CorpusSource
+          AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         OPTIONAL MATCH (n)-[r]-(m)
         OPTIONAL MATCH (n)-[tax:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A]-(tax_neighbor)
         WITH n,
@@ -522,8 +524,12 @@ def fetch_entities(session, scope_revision_ids: list[str] | None = None) -> list
 def merge_pair(session, eid_a: str, eid_b: str, canonical_name: str) -> None:
     session.run(
         """
-        MATCH (a) WHERE elementId(a) = $eid_a
-        MATCH (b) WHERE elementId(b) = $eid_b
+        MATCH (a:__Entity__)
+        WHERE elementId(a) = $eid_a AND NOT a:CorpusSource
+          AND NOT EXISTS { (a)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+        MATCH (b:__Entity__)
+        WHERE elementId(b) = $eid_b AND NOT b:CorpusSource
+          AND NOT EXISTS { (b)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         WITH [a, b] AS nodes
         CALL apoc.refactor.mergeNodes(nodes, {properties: 'combine', mergeRels: true})
         YIELD node

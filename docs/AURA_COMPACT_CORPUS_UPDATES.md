@@ -72,7 +72,7 @@ python scripts/process_graph_queue.py `
   --confirm-target '<neo4j-uri>|<database>'
 ```
 
-The worker creates `ParentChunk-[:HAS_ENTITY]->Entity` evidence and records entity revision provenance. Existing entity and relationship properties are not overwritten during extraction; ontology changes are deferred to the reviewed consolidation step. Do not consolidate a partially extracted revision.
+The worker creates `ParentChunk-[:HAS_ENTITY]->Entity` evidence and records entity revision provenance. Existing entity and relationship properties are not overwritten during extraction; ontology changes are deferred to the reviewed consolidation step. Do not consolidate a partially extracted revision. Consolidation is explicitly limited to `__Entity__` nodes; `CorpusSource` ledger nodes and their `HAS_SOURCE`, `MATERIALIZED_AS`, and `LEGACY_EVIDENCE` bookkeeping relationships are excluded from selection and mutation.
 
 ## 3. Validate before consolidation
 

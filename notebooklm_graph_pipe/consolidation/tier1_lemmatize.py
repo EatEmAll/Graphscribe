@@ -52,6 +52,8 @@ def fetch_entities(session, scope_revision_ids: list[str] | None = None) -> list
     result = session.run(
         """
         MATCH (n:__Entity__)
+        WHERE NOT n:CorpusSource
+          AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         RETURN elementId(n) AS eid, n.id AS name, labels(n) AS labels,
                CASE WHEN $scope_revision_ids IS NULL THEN true ELSE EXISTS {
                    MATCH (n)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(revision:DocumentRevision)
@@ -73,9 +75,12 @@ def merge_group(session, eids: list[str], canonical_name: str, dry_run: bool) ->
 
     session.run(
         """
-        MATCH (n)
+        MATCH (n:__Entity__)
         WHERE elementId(n) IN $eids
+          AND NOT n:CorpusSource
+          AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         WITH collect(n) AS nodes
+        WHERE size(nodes) = size($eids) AND size(nodes) > 1
         CALL apoc.refactor.mergeNodes(nodes, {
             properties: 'combine',
             mergeRels: true

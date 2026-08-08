@@ -898,6 +898,8 @@ def _fetch_live_entity_labels(params: TaxonomyParams) -> set[str]:
             rows = session.run(
                 """
                 MATCH (n:__Entity__)
+                WHERE NOT n:CorpusSource
+                  AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
                 UNWIND [label IN labels(n) WHERE label <> '__Entity__'] AS label
                 RETURN DISTINCT label
                 """
@@ -1351,8 +1353,11 @@ def _can_apply_taxonomy_relation(
         return False, "Self-loop"
     reverse = session.run(
         """
-        MATCH (source)-[rel:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A]->(target)
+        MATCH (source:__Entity__)-[rel:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A]->(target:__Entity__)
         WHERE elementId(source) = $target_eid AND elementId(target) = $source_eid
+          AND NOT source:CorpusSource AND NOT target:CorpusSource
+          AND NOT EXISTS { (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+          AND NOT EXISTS { (target)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         RETURN count(rel) AS reverse_count
         """,
         source_eid=source_eid,
@@ -1362,8 +1367,12 @@ def _can_apply_taxonomy_relation(
         return False, "Reverse taxonomy relation already exists"
     cycle = session.run(
         """
-        MATCH (source) WHERE elementId(source) = $source_eid
-        MATCH (target) WHERE elementId(target) = $target_eid
+        MATCH (source:__Entity__)
+        WHERE elementId(source) = $source_eid AND NOT source:CorpusSource
+          AND NOT EXISTS { (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+        MATCH (target:__Entity__)
+        WHERE elementId(target) = $target_eid AND NOT target:CorpusSource
+          AND NOT EXISTS { (target)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
         RETURN EXISTS {
             MATCH (target)-[:SUBCLASS_OF|INSTANCE_OF|TYPE_OF|IS_A*1..6]->(source)
         } AS would_cycle
@@ -1371,12 +1380,17 @@ def _can_apply_taxonomy_relation(
         source_eid=source_eid,
         target_eid=target_eid,
     ).single()
+    if cycle is None:
+        return False, "Source or target is not a consolidatable entity"
     if bool(cycle["would_cycle"]):
         return False, "Would introduce taxonomy cycle"
     conflicting = session.run(
         f"""
-        MATCH (source)-[rel:{relation}]->(other)
+        MATCH (source:__Entity__)-[rel:{relation}]->(other:__Entity__)
         WHERE elementId(source) = $source_eid AND elementId(other) <> $target_eid
+          AND NOT source:CorpusSource AND NOT other:CorpusSource
+          AND NOT EXISTS {{ (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+          AND NOT EXISTS {{ (other)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
         RETURN count(rel) AS conflicting_count
         """,
         source_eid=source_eid,
@@ -1397,7 +1411,9 @@ def _apply_taxonomy_label(session: Any, *, source_eid: str, old_labels: list[str
     removal_block = "\n        ".join(removal_clauses)
     session.run(
         f"""
-        MATCH (n) WHERE elementId(n) = $source_eid
+        MATCH (n:__Entity__)
+        WHERE elementId(n) = $source_eid AND NOT n:CorpusSource
+          AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
         SET n:`{safe_new_label}`
         {removal_block}
         """,
@@ -1408,8 +1424,12 @@ def _apply_taxonomy_label(session: Any, *, source_eid: str, old_labels: list[str
 def _add_taxonomy_relation(session: Any, *, source_eid: str, relation: str, target_eid: str) -> None:
     session.run(
         f"""
-        MATCH (source) WHERE elementId(source) = $source_eid
-        MATCH (target) WHERE elementId(target) = $target_eid
+        MATCH (source:__Entity__)
+        WHERE elementId(source) = $source_eid AND NOT source:CorpusSource
+          AND NOT EXISTS {{ (source)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+        MATCH (target:__Entity__)
+        WHERE elementId(target) = $target_eid AND NOT target:CorpusSource
+          AND NOT EXISTS {{ (target)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
         MERGE (source)-[:{relation}]->(target)
         """,
         source_eid=source_eid,
@@ -1658,7 +1678,9 @@ def _compute_live_concept_only_without_taxonomy_ratio(params: TaxonomyParams) ->
             row = session.run(
                 """
                 MATCH (n:__Entity__:Concept)
-                WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+                WHERE NOT n:CorpusSource
+                  AND NOT EXISTS { (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }
+                  AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
                 WITH collect(n) AS concept_nodes
                 WITH
                     size(concept_nodes) AS concept_only_count,
@@ -1901,14 +1923,16 @@ def _build_codex_prompt(
   Prioritize semantic cleanliness under the current label set before recommending structural label catalog changes.
   {"\n  ".join(output_contract)}
   Run Cypher queries to compute these KPIs:
-  1) entity_count: MATCH (n:__Entity__) RETURN count(n) AS entity_count
+  1) entity_count: MATCH (n:__Entity__) WHERE NOT n:CorpusSource AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }} RETURN count(n) AS entity_count
   2) concept_only_count:
      MATCH (n:__Entity__:Concept)
-     WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+     WHERE NOT n:CorpusSource
+       AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+       AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
    RETURN count(n) AS concept_only_count
 3) subclass_rel_count: MATCH ()-[r:SUBCLASS_OF]->() RETURN count(r) AS subclass_rel_count
 4) duplicate_anchor_count using this duplicate-anchor logic:
-   MATCH (n:!Chunk&!Session&!Document&!`__Community__`) WITH n
+   MATCH (n:!Chunk&!Session&!Document&!CorpusSource&!`__Community__`) WITH n
    WHERE n.embedding IS NOT NULL AND n.id IS NOT NULL
    WITH n ORDER BY count {{ (n)--() }} DESC, size(toString(n.id)) DESC
    WITH collect(n) AS nodes
@@ -1932,35 +1956,47 @@ Compute:
 Run these additional taxonomy-focused queries:
 5) concept_only_without_taxonomy_count:
    MATCH (n:__Entity__:Concept)
-   WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+   WHERE NOT n:CorpusSource
+   AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+   AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
    AND NOT EXISTS {{ (n)-[:SUBCLASS_OF|INSTANCE_OF|IS_A|TYPE_OF]->() }}
    RETURN count(n) AS concept_only_without_taxonomy_count
 6) concept_only_degree_le_2_count:
    MATCH (n:__Entity__:Concept)
-   WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+   WHERE NOT n:CorpusSource
+   AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+   AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
    WITH n, count {{ (n)--() }} AS degree
    WHERE degree <= 2
    RETURN count(n) AS concept_only_degree_le_2_count
 7) concept_only_degree_le_3_count:
    MATCH (n:__Entity__:Concept)
-   WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+   WHERE NOT n:CorpusSource
+   AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+   AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
    WITH n, count {{ (n)--() }} AS degree
    WHERE degree <= 3
    RETURN count(n) AS concept_only_degree_le_3_count
 8) concept_only_with_similarity_or_alias_count:
    MATCH (n:__Entity__:Concept)
-   WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+   WHERE NOT n:CorpusSource
+   AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+   AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
    AND EXISTS {{ (n)-[:SIMILAR_TO|ALIAS_OF|RELATED_TO]-() }}
    RETURN count(n) AS concept_only_with_similarity_or_alias_count
 9) focus_examples.high_degree_concept_only:
    MATCH (n:__Entity__:Concept)
-   WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+   WHERE NOT n:CorpusSource
+   AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+   AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
    RETURN n.id AS id, count {{ (n)--() }} AS degree
    ORDER BY degree DESC, id ASC
    LIMIT 10
 10) focus_examples.low_degree_concept_only:
     MATCH (n:__Entity__:Concept)
-    WHERE ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
+    WHERE NOT n:CorpusSource
+    AND NOT EXISTS {{ (n)-[:HAS_SOURCE|MATERIALIZED_AS|LEGACY_EVIDENCE]-() }}
+    AND ALL(l IN labels(n) WHERE l IN ['__Entity__', 'Concept'])
     RETURN n.id AS id, count {{ (n)--() }} AS degree
     ORDER BY degree ASC, id ASC
     LIMIT 10
