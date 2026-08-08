@@ -1,15 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from .adapters import DEFAULT_ADAPTERS, ExtractionContext, SourceAdapter, adapter_for
 from .chunking import HierarchicalChunker
 from .embeddings import MiniLMEmbedder, weighted_parent_embedding
-from .ids import canonical_file_identity
+from .ids import block_id, canonical_file_identity, revision_id
 from .manifest import CorpusManifest, SourceManifestEntry, save_manifest
 from .neo4j_store import Neo4jCorpusStore
+from .source_ledger import SourceIdentity, identity_from_document
 
 
 @dataclass
@@ -28,6 +29,8 @@ class CompactUpdateReport:
     added: int = 0
     updated: int = 0
     unchanged: int = 0
+    conflicted: int = 0
+    legacy_only: int = 0
     failed: int = 0
     revision_ids: list[str] = field(default_factory=list)
     events: list[CompactUpdateEvent] = field(default_factory=list)
@@ -37,6 +40,8 @@ class CompactUpdateReport:
             "added": self.added,
             "updated": self.updated,
             "unchanged": self.unchanged,
+            "conflicted": self.conflicted,
+            "legacy_only": self.legacy_only,
             "failed": self.failed,
             "revision_ids": self.revision_ids,
             "events": [asdict(event) for event in self.events],
@@ -73,11 +78,12 @@ class CompactCorpusUpdater:
     def update(
         self,
         *,
-        sources: Iterable[Path],
+        sources: Iterable[object],
         corpus_root: Path,
         manifest: CorpusManifest,
         manifest_path: Path,
         capacity_guard: Callable[[int], None] | None = None,
+        force_refresh: bool = False,
     ) -> CompactUpdateReport:
         self._validate_profile(manifest)
         manifest_model = manifest.embedding_model.rsplit("/", 1)[-1]
@@ -95,8 +101,8 @@ class CompactCorpusUpdater:
         report = CompactUpdateReport()
 
         for source in sources:
-            path = source.resolve()
-            key = canonical_file_identity(path, corpus_root)
+            path = source.resolve() if isinstance(source, Path) else None
+            key = canonical_file_identity(path, corpus_root) if path else str(getattr(source, "url", source))
             document = None
             activated = False
             revision_started = False
@@ -104,10 +110,26 @@ class CompactCorpusUpdater:
             previous_revision_id: str | None = None
             previous_entry = manifest.sources.get(key)
             try:
-                adapter = adapter_for(path, self.adapters)
-                document = adapter.extract(path, context)
+                adapter = adapter_for(path or source, self.adapters)
+                document = adapter.extract(path or source, context)
+                identity = identity_from_document(document)
+                ledger_match = self.store.resolve_ledger_source(identity)
+                if ledger_match:
+                    identity = replace(
+                        identity,
+                        provider=str(ledger_match["provider"]),
+                        provider_source_id=str(ledger_match["provider_source_id"]),
+                    )
+                if ledger_match and ledger_match.get("retrieval_status") == "LEGACY_ONLY" and not force_refresh:
+                    report.legacy_only += 1
+                    report.events.append(CompactUpdateEvent(key, "legacy_only", message="Use --force-refresh to materialize this historical source."))
+                    continue
+                if ledger_match and ledger_match.get("document_id"):
+                    document = _reidentify_document(document, str(ledger_match["document_id"]))
                 active = self.store.active_revision_for_document(document.document_id)
                 if (
+                    not force_refresh
+                    and
                     active
                     and active.get("checksum") == document.source_checksum
                     and active.get("extractor") == document.extractor
@@ -120,6 +142,7 @@ class CompactCorpusUpdater:
                         extractor=str(active["extractor"]),
                         extractor_version=str(active["extractor_version"]),
                         warnings=list(previous_entry.warnings) if previous_entry else [],
+                        ledger_source_id=str(ledger_match["ledger_source_id"]) if ledger_match else identity.id,
                     )
                     manifest_changed = True
                     save_manifest(manifest_path, manifest)
@@ -153,7 +176,9 @@ class CompactCorpusUpdater:
                     chunks=chunks,
                     parent_embeddings=parent_vectors,
                 )
-                self.store.activate_compact_revision(document.document_id, document.revision_id, len(chunks.parents))
+                self.store.activate_compact_revision(
+                    document.document_id, document.revision_id, len(chunks.parents), ledger=identity
+                )
                 activated = True
                 manifest.sources[key] = SourceManifestEntry(
                     document_id=document.document_id,
@@ -162,6 +187,7 @@ class CompactCorpusUpdater:
                     extractor=document.extractor,
                     extractor_version=document.extractor_version,
                     warnings=[*document.warnings, *chunks.warnings],
+                    ledger_source_id=identity.id,
                 )
                 manifest_changed = True
                 save_manifest(manifest_path, manifest)
@@ -210,6 +236,8 @@ class CompactCorpusUpdater:
                         errors.append(f"revision cleanup failed: {cleanup_exc}")
                         cleanup_failed = True
                 report.failed += 1
+                if "conflict" in str(exc).lower():
+                    report.conflicted += 1
                 report.events.append(
                     CompactUpdateEvent(
                         key,
@@ -223,3 +251,16 @@ class CompactCorpusUpdater:
                     break
 
         return report
+
+
+def _reidentify_document(document: Any, target_document_id: str):
+    if document.document_id == target_document_id:
+        return document
+    target_revision_id = revision_id(
+        target_document_id, document.source_checksum, f"{document.extractor}:{document.extractor_version}"
+    )
+    blocks = tuple(
+        replace(block, block_id=block_id(target_revision_id, block.ordinal, block.text))
+        for block in document.blocks
+    )
+    return replace(document, document_id=target_document_id, revision_id=target_revision_id, blocks=blocks)

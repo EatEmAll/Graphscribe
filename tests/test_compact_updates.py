@@ -39,10 +39,13 @@ class FakeStore:
     def active_revision_for_document(self, document_id):
         return None
 
+    def resolve_ledger_source(self, identity):
+        return None
+
     def begin_compact_revision(self, **kwargs):
         self.compact_revisions.append(kwargs)
 
-    def activate_compact_revision(self, document_id, revision_id, expected_parents):
+    def activate_compact_revision(self, document_id, revision_id, expected_parents, *, ledger=None):
         self.activated.append((document_id, revision_id, expected_parents))
 
     def fail_revision(self, revision_id, message):
@@ -174,7 +177,7 @@ def test_failed_compact_activation_cleans_only_the_staged_revision(tmp_path: Pat
             self.failed = []
             self.collected = []
 
-        def activate_compact_revision(self, document_id, revision_id, expected_parents):
+        def activate_compact_revision(self, document_id, revision_id, expected_parents, *, ledger=None):
             raise RuntimeError("activation failed")
 
         def fail_revision(self, revision_id, message):
@@ -203,3 +206,35 @@ def test_failed_compact_activation_cleans_only_the_staged_revision(tmp_path: Pat
     revision_id = store.compact_revisions[0]["document"].revision_id
     assert store.failed == [revision_id]
     assert store.collected == [[revision_id]]
+
+
+def test_checksum_match_reuses_ledger_and_document_for_moved_file(tmp_path: Path) -> None:
+    source = tmp_path / "moved.txt"
+    source.write_text("one two three", encoding="utf-8")
+    manifest = CorpusManifest(
+        corpus_id("demo"), "demo", "Demo", {"uri": "neo4j+s://example.databases.neo4j.io"},
+        embedding_dimension=4, retrieval_unit="parent",
+        retrieval_vector_index="parent_embedding_v1", retrieval_keyword_index="parent_keyword_v1",
+    )
+
+    class MovedStore(FakeStore):
+        def resolve_ledger_source(self, identity):
+            return {
+                "ledger_source_id": "existing-ledger", "provider": "file",
+                "provider_source_id": "old.txt", "document_id": "existing-document",
+                "retrieval_status": "ACTIVE",
+            }
+
+        def activate_compact_revision(self, document_id, revision_id, expected_parents, *, ledger=None):
+            self.activated.append((document_id, revision_id, expected_parents, ledger))
+
+    store = MovedStore()
+    updater = CompactCorpusUpdater(
+        store=store, embedder=MiniLMEmbedder(EmbeddingConfig(dimension=4), model=FakeModel()),
+        chunker=HierarchicalChunker(WordTokenizer()), adapters=(TextAdapter(),),
+    )
+    report = updater.update(sources=[source], corpus_root=tmp_path, manifest=manifest,
+                            manifest_path=tmp_path / "manifest.json")
+    assert report.added == 1
+    assert store.activated[0][0] == "existing-document"
+    assert store.activated[0][3].provider_source_id == "old.txt"

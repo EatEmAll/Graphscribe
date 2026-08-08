@@ -10,4 +10,5 @@ models/local_model/
 data/corpora/
 data/migrations/
 data/notebooklm_exports/
-docs/
+docs/*
+!docs/AURA_COMPACT_CORPUS_UPDATES.md
