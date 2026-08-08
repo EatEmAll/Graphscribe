@@ -143,7 +143,7 @@ def test_activate_manifest_writes_non_secret_target(tmp_path: Path) -> None:
     migration.activate_manifest(path, connection(), "NEO4J_TARGET_PASSWORD")
 
     payload = json.loads(path.read_text(encoding="utf-8"))
-    assert payload["version"] == 5
+    assert payload["version"] == 6
     assert payload["neo4j"] == {
         "deployment": "external",
         "uri": "neo4j+s://target.databases.neo4j.io",

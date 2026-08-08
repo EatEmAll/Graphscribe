@@ -42,7 +42,7 @@ python scripts/update_compact_corpus.py `
   --confirm-target '<neo4j-uri>|<database>'
 ```
 
-Identity resolution is exact and ordered: provider identity, canonical URI, then checksum. Title and fuzzy similarity are never identities. Save the emitted new revision IDs and `previous_revision_id` values. Report `added`, `updated`, `unchanged`, `conflicted`, and `legacy_only`; conflicts stop without writes. `LEGACY_ONLY` sources block accidental ingestion unless the operator deliberately supplies `--force-refresh`. Activation and ledger update are one Aura transaction. The former revision becomes `INACTIVE` but is retained.
+Identity resolution is exact and ordered: canonical provider identity, NotebookLM acquisition alias, canonical URI, then normalized-content fingerprint. Title and fuzzy similarity are never identities. NotebookLM metadata is interpreted as the original `youtube` or `document` type; `notebooklm_source_id` remains an alias rather than the source provider. Historical videos without an exposed URL use an exact transcript fingerprint until a later URL ingestion promotes the same ledger record to its YouTube video ID. Save the emitted new revision IDs and `previous_revision_id` values. Report `added`, `updated`, `unchanged`, `conflicted`, and `legacy_only`; conflicts stop without writes. `LEGACY_ONLY` sources block accidental ingestion unless the operator deliberately supplies `--force-refresh`. Activation and ledger update are one Aura transaction. The former revision becomes `INACTIVE` but is retained.
 
 ## One-time NotebookLM ledger bootstrap
 

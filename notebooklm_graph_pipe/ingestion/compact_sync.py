@@ -115,11 +115,7 @@ class CompactCorpusUpdater:
                 identity = identity_from_document(document)
                 ledger_match = self.store.resolve_ledger_source(identity)
                 if ledger_match:
-                    identity = replace(
-                        identity,
-                        provider=str(ledger_match["provider"]),
-                        provider_source_id=str(ledger_match["provider_source_id"]),
-                    )
+                    identity = replace(identity, ledger_id=str(ledger_match["ledger_source_id"]))
                 if ledger_match and ledger_match.get("retrieval_status") == "LEGACY_ONLY" and not force_refresh:
                     report.legacy_only += 1
                     report.events.append(CompactUpdateEvent(key, "legacy_only", message="Use --force-refresh to materialize this historical source."))
@@ -131,10 +127,29 @@ class CompactCorpusUpdater:
                     not force_refresh
                     and
                     active
-                    and active.get("checksum") == document.source_checksum
-                    and active.get("extractor") == document.extractor
-                    and active.get("extractor_version") == document.extractor_version
+                    and (
+                        bool(
+                            ledger_match
+                            and ledger_match.get("content_checksum") == identity.content_checksum
+                        )
+                        or (
+                            active.get("checksum") == document.source_checksum
+                            and active.get("extractor") == document.extractor
+                            and active.get("extractor_version") == document.extractor_version
+                        )
+                    )
                 ):
+                    if (
+                        ledger_match
+                        and int(ledger_match.get("duplicate_match_count") or 1) == 1
+                        and (
+                            ledger_match.get("provider") != identity.provider
+                            or ledger_match.get("provider_source_id") != identity.provider_source_id
+                        )
+                    ):
+                        self.store.promote_ledger_identity(
+                            str(ledger_match["ledger_source_id"]), identity
+                        )
                     manifest.sources[key] = SourceManifestEntry(
                         document_id=document.document_id,
                         active_revision_id=str(active["revision_id"]),

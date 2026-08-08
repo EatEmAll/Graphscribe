@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any
 
 
-MANIFEST_VERSION = 5
-LEGACY_MANIFEST_VERSIONS = {3, 4}
+MANIFEST_VERSION = 6
+LEGACY_MANIFEST_VERSIONS = {3, 4, 5}
 RETRIEVAL_UNITS = {"chunk", "parent"}
 
 DEFAULT_EXECUTION_CONFIG: dict[str, Any] = {

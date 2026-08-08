@@ -10,6 +10,7 @@ Use `docs/AURA_COMPACT_CORPUS_UPDATES.md` as the canonical command reference.
 | Target confirmation differs | Stop and resolve the correct manifest. |
 | Capacity headroom fails | Stop; resize or build another projection. |
 | Ledger identity conflicts or has multiple matches | Stop without embedding or graph writes; resolve exact evidence. |
+| NotebookLM source has no original URL | Infer its source type and use exact normalized content as the temporary canonical identity; retain the NotebookLM ID as an alias. |
 | Ledger source is `LEGACY_ONLY` | Report it as already ingested; require explicit `--force-refresh` to materialize it. |
 | Source checksum is unchanged in Aura | Record it as unchanged; do not re-embed. |
 | Parent persistence fails | Keep or restore the prior active revision. |

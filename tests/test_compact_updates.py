@@ -42,6 +42,9 @@ class FakeStore:
     def resolve_ledger_source(self, identity):
         return None
 
+    def promote_ledger_identity(self, ledger_source_id, identity):
+        return None
+
     def begin_compact_revision(self, **kwargs):
         self.compact_revisions.append(kwargs)
 
@@ -237,4 +240,35 @@ def test_checksum_match_reuses_ledger_and_document_for_moved_file(tmp_path: Path
                             manifest_path=tmp_path / "manifest.json")
     assert report.added == 1
     assert store.activated[0][0] == "existing-document"
-    assert store.activated[0][3].provider_source_id == "old.txt"
+    assert store.activated[0][3].provider_source_id == "moved.txt"
+    assert store.activated[0][3].id == "existing-ledger"
+
+
+def test_normalized_ledger_content_match_skips_cross_extractor_refresh(tmp_path: Path) -> None:
+    source = tmp_path / "notebook-export.md"
+    source.write_text("---\nnotebooklm:\n  source_id: nlm-1\n  source_type: youtube\n---\n\nsame transcript", encoding="utf-8")
+    manifest = CorpusManifest(
+        corpus_id("demo"), "demo", "Demo", {"uri": "neo4j+s://example.databases.neo4j.io"},
+        embedding_dimension=4, retrieval_unit="parent",
+        retrieval_vector_index="parent_embedding_v1", retrieval_keyword_index="parent_keyword_v1",
+    )
+
+    class ExistingStore(FakeStore):
+        def resolve_ledger_source(self, identity):
+            return {
+                "ledger_source_id": "ledger", "provider": "youtube",
+                "provider_source_id": "content:x", "document_id": "document",
+                "retrieval_status": "ACTIVE", "content_checksum": identity.content_checksum,
+            }
+
+        def active_revision_for_document(self, document_id):
+            return {"revision_id": "old", "checksum": "different-extractor-checksum",
+                    "extractor": "old", "extractor_version": "0"}
+
+    report = CompactCorpusUpdater(
+        store=ExistingStore(), embedder=MiniLMEmbedder(EmbeddingConfig(dimension=4), model=FakeModel()),
+        chunker=HierarchicalChunker(WordTokenizer()),
+    ).update(sources=[source], corpus_root=tmp_path, manifest=manifest,
+             manifest_path=tmp_path / "manifest.json")
+    assert report.unchanged == 1
+    assert report.added == 0

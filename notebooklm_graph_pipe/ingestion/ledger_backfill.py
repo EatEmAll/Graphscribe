@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .ids import ledger_source_id
-from .source_ledger import LEDGER_VERSION, canonical_uri
+from .source_ledger import LEDGER_VERSION, canonical_uri, content_fingerprint
 
 
 def load_notebooklm_sources(notebook_id: str) -> list[dict[str, Any]]:
@@ -59,11 +59,24 @@ def reconcile_inventory(
         if not evidence:
             raise ValueError(f"No legacy evidence document for source {source_id}.")
         url = old.get("url") if not content_backed else None
+        normalized_url = canonical_uri(url)
+        fingerprint = _inventory_content_fingerprint(inventory_path, old) if content_backed else None
+        if old["source_type"] == "youtube":
+            provider = "youtube"
+            provider_source_id = (
+                normalized_url.rsplit("=", 1)[-1]
+                if normalized_url and "youtube.com/watch?v=" in normalized_url
+                else f"content:{fingerprint}:notebooklm:{source_id}"
+            )
+        else:
+            provider = "document"
+            provider_source_id = f"content:{fingerprint}:notebooklm:{source_id}"
         rows.append({
-            "id": ledger_source_id(corpus_id, "notebooklm", source_id),
-            "corpus_id": corpus_id, "provider": "notebooklm", "provider_source_id": source_id,
+            "id": ledger_source_id(corpus_id, provider, provider_source_id),
+            "corpus_id": corpus_id, "provider": provider, "provider_source_id": provider_source_id,
+            "notebooklm_source_id": source_id,
             "title": old["title"], "source_type": old["source_type"],
-            "canonical_uri": canonical_uri(url), "content_checksum": old.get("sha256"),
+            "canonical_uri": normalized_url, "content_checksum": fingerprint,
             "acquisition_method": old.get("acquisition"), "notebook_ids": [notebook_id],
             "ledger_version": LEDGER_VERSION, "ingestion_status": "INGESTED",
             "retrieval_status": "ACTIVE" if content_backed else "LEGACY_ONLY",
@@ -88,6 +101,7 @@ def apply_backfill(session: Any, rows: list[dict[str, Any]], run_id: str) -> dic
         OPTIONAL MATCH (s)-[:MATERIALIZED_AS]->(document:Document)
         OPTIONAL MATCH (s)-[:LEGACY_EVIDENCE]->(legacy:Document)
         RETURN s.id AS id, s.provider AS provider, s.provider_source_id AS provider_source_id,
+               s.notebooklm_source_id AS notebooklm_source_id,
                s.title AS title, s.source_type AS source_type, s.canonical_uri AS canonical_uri,
                s.content_checksum AS content_checksum, s.acquisition_method AS acquisition_method,
                s.notebook_ids AS notebook_ids, s.ledger_version AS ledger_version,
@@ -97,27 +111,49 @@ def apply_backfill(session: Any, rows: list[dict[str, Any]], run_id: str) -> dic
         """,
         corpus_id=rows[0]["corpus_id"],
     ))
-    expected_ids = {row["id"] for row in rows}
-    foreign = [dict(record) for record in existing if record["id"] not in expected_ids]
-    if foreign:
-        raise ValueError("Aura already contains CorpusSource records outside this exact backfill.")
     if len(existing) == len(rows):
-        expected = {row["id"]: row for row in rows}
+        expected = {row["notebooklm_source_id"]: row for row in rows}
         compare_fields = {
             "provider", "provider_source_id", "title", "source_type", "canonical_uri",
             "content_checksum", "acquisition_method", "notebook_ids", "ledger_version",
-            "ingestion_status", "retrieval_status", "document_id", "legacy_document_ids",
+            "ingestion_status", "retrieval_status", "document_id", "legacy_document_ids", "notebooklm_source_id",
         }
+        migration_needed = False
         for record in existing:
             actual = dict(record)
-            wanted = expected[actual["id"]]
+            alias = actual.get("notebooklm_source_id") or (
+                actual.get("provider_source_id") if actual.get("provider") == "notebooklm" else None
+            )
+            if alias not in expected:
+                raise ValueError(f"Existing ledger has an unknown NotebookLM identity: {alias}")
+            wanted = expected[alias]
             for field in compare_fields:
                 left = sorted(actual[field] or []) if field in {"notebook_ids", "legacy_document_ids"} else actual[field]
                 right = sorted(wanted[field] or []) if field in {"notebook_ids", "legacy_document_ids"} else wanted[field]
                 if left != right:
-                    raise ValueError(f"Existing ledger differs for {actual['id']} field {field}.")
-            if actual["backfill_run_id"] != run_id:
-                raise ValueError(f"Existing ledger has a different backfill run ID for {actual['id']}.")
+                    migration_needed = True
+            if actual["id"] != wanted["id"] or actual["backfill_run_id"] != run_id:
+                migration_needed = True
+        if migration_needed:
+            changed = session.run(
+                """
+                UNWIND $rows AS row
+                MATCH (source:CorpusSource {corpus_id: row.corpus_id})
+                WHERE source.notebooklm_source_id = row.notebooklm_source_id
+                   OR (source.provider = 'notebooklm' AND source.provider_source_id = row.notebooklm_source_id)
+                SET source.id = row.id, source.provider = row.provider,
+                    source.provider_source_id = row.provider_source_id,
+                    source.notebooklm_source_id = row.notebooklm_source_id,
+                    source.source_type = row.source_type, source.canonical_uri = row.canonical_uri,
+                    source.content_checksum = row.content_checksum,
+                    source.ledger_version = row.ledger_version,
+                    source.backfill_run_id = $run_id, source.last_verified_at = datetime()
+                RETURN count(source) AS changed
+                """, rows=rows, run_id=run_id,
+            ).single()["changed"]
+            if int(changed) != len(rows):
+                raise RuntimeError(f"Canonical identity migration changed {changed} of {len(rows)} sources.")
+            return {"created": 0, "changed": int(changed), "unchanged": 0}
         return {"created": 0, "changed": 0, "unchanged": len(rows)}
     if existing:
         raise ValueError("Partial source ledger exists; audit and resolve it before backfill.")
@@ -129,6 +165,7 @@ def apply_backfill(session: Any, rows: list[dict[str, Any]], run_id: str) -> dic
         CREATE (source:CorpusSource)
         SET source.id = row.id, source.corpus_id = row.corpus_id,
             source.provider = row.provider, source.provider_source_id = row.provider_source_id,
+            source.notebooklm_source_id = row.notebooklm_source_id,
             source.title = row.title, source.source_type = row.source_type,
             source.canonical_uri = row.canonical_uri, source.content_checksum = row.content_checksum,
             source.acquisition_method = row.acquisition_method, source.notebook_ids = row.notebook_ids,
@@ -166,3 +203,13 @@ def _group_by_source_id(rows: list[dict[str, Any]]) -> dict[str, list[dict[str, 
     for row in rows:
         grouped.setdefault(str(row["source_id"]), []).append(row)
     return grouped
+
+
+def _inventory_content_fingerprint(inventory_path: Path, source: dict[str, Any]) -> str:
+    path = inventory_path.parent / str(source["relative_path"])
+    text = path.read_text(encoding="utf-8")
+    if text.startswith("---\n"):
+        end = text.find("\n---\n", 4)
+        if end >= 0:
+            text = text[end + 5 :]
+    return content_fingerprint(text)
