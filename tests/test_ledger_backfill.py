@@ -10,6 +10,11 @@ NOTEBOOK_ID = "dfae4958-fe79-4b26-bb93-dd50b6561adb"
 
 
 def inventory(tmp_path, rows):
+    for row in rows:
+        if row.get("relative_path"):
+            source = tmp_path / row["relative_path"]
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(f"---\ntitle: {row['title']}\n---\n\ncontent for {row['source_id']}", encoding="utf-8")
     path = tmp_path / "inventory.json"
     path.write_text(json.dumps({"sources": rows}), encoding="utf-8")
     return path
@@ -54,6 +59,8 @@ def test_reconciliation_builds_active_and_legacy_only_without_guessing_urls(tmp_
                                      canonical_documents=canonical, legacy_documents=legacy)
     assert sum(row["retrieval_status"] == "ACTIVE" for row in reconciled) == 237
     assert sum(row["retrieval_status"] == "LEGACY_ONLY" for row in reconciled) == 7
+    assert sum(row["provider"] == "youtube" for row in reconciled) == 244
+    assert all(row["notebooklm_source_id"] for row in reconciled)
     assert all(row["canonical_uri"] is None for row in reconciled[:237])
     assert len({row["id"] for row in reconciled}) == 244
     assert backfill_run_id(reconciled) == backfill_run_id(list(reversed(reconciled)))

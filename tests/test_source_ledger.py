@@ -43,7 +43,17 @@ def test_notebooklm_identity_takes_precedence_over_path():
     first = identity_from_document(document(notebooklm={"source_id": "nlm-1", "notebook_ids": ["nb"]}))
     moved = identity_from_document(replace(document(notebooklm={"source_id": "nlm-1"}), source_uri="other.md"))
     assert first.id == moved.id
-    assert first.provider == "notebooklm"
+    assert first.provider == "document"
+    assert first.notebooklm_source_id == "nlm-1"
+
+
+def test_notebooklm_youtube_type_is_inferred_without_url():
+    identity = identity_from_document(
+        document(notebooklm={"source_id": "nlm-video", "source_type": "youtube"})
+    )
+    assert identity.provider == "youtube"
+    assert identity.provider_source_id.startswith("content:")
+    assert identity.notebooklm_source_id == "nlm-video"
 
 
 def test_empty_provider_identity_is_rejected():

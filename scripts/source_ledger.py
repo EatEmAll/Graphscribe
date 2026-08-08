@@ -59,7 +59,11 @@ def _audit(session, corpus_id: str) -> dict[str, int]:
                count(DISTINCT CASE WHEN s.retrieval_status='ACTIVE' THEN s END) AS active,
                count(DISTINCT CASE WHEN s.retrieval_status='LEGACY_ONLY' THEN s END) AS legacy_only,
                count(DISTINCT CASE WHEN d IS NOT NULL AND r.vector_ready AND r.graph_ready THEN s END) AS ready,
-               count(DISTINCT CASE WHEN legacy IS NOT NULL THEN s END) AS with_legacy
+               count(DISTINCT CASE WHEN legacy IS NOT NULL THEN s END) AS with_legacy,
+               count(DISTINCT CASE WHEN s.provider='youtube' THEN s END) AS youtube,
+               count(DISTINCT CASE WHEN s.provider='document' THEN s END) AS documents,
+               count(DISTINCT CASE WHEN s.notebooklm_source_id IS NOT NULL THEN s END) AS notebooklm_aliases,
+               count(DISTINCT CASE WHEN s.provider='youtube' AND s.provider_source_id STARTS WITH 'content:' THEN s END) AS youtube_awaiting_video_id
         """, corpus_id=corpus_id
     ).single()
     return dict(row) if row else {"total": 0, "active": 0, "legacy_only": 0, "ready": 0, "with_legacy": 0}
@@ -135,7 +139,7 @@ def main(argv=None):
                     store.ensure_parent_retrieval_schema(manifest.embedding_dimension)
                     result = session.execute_write(lambda tx: apply_backfill(tx, rows, run_id))
                     session.run(
-                        "MATCH (c:Corpus {id: $corpus_id}) SET c.schema_version = 5",
+                        "MATCH (c:Corpus {id: $corpus_id}) SET c.schema_version = 6",
                         corpus_id=manifest.corpus_id,
                     ).consume()
                     ledger_by_document = {
@@ -147,7 +151,7 @@ def main(argv=None):
                         if ledger_id and entry.ledger_source_id != ledger_id:
                             entry.ledger_source_id = ledger_id
                             manifest_changed = True
-                    if manifest_changed or manifest.version != 5:
+                    if manifest_changed or manifest.version != 6:
                         save_manifest(manifest_path, manifest)
                 payload = {"target": target, "dry_run": not args.execute, "records": len(rows),
                            "active": sum(r["retrieval_status"] == "ACTIVE" for r in rows),

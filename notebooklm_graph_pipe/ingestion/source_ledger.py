@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -10,7 +11,12 @@ from .ids import ledger_source_id
 from .models import CanonicalDocument
 
 
-LEDGER_VERSION = 1
+LEDGER_VERSION = 2
+
+
+def content_fingerprint(text: str) -> str:
+    normalized = " ".join(text.replace("\r\n", "\n").replace("\r", "\n").split()).casefold()
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
 
 
 def canonical_uri(value: str | None) -> str | None:
@@ -40,24 +46,39 @@ class SourceIdentity:
     content_checksum: str
     acquisition_method: str | None = None
     notebook_ids: tuple[str, ...] = ()
+    notebooklm_source_id: str | None = None
+    ledger_id: str | None = None
 
     @property
     def id(self) -> str:
-        return ledger_source_id(self.corpus_id, self.provider, self.provider_source_id)
+        return self.ledger_id or ledger_source_id(self.corpus_id, self.provider, self.provider_source_id)
 
     def to_row(self) -> dict[str, Any]:
-        return {**asdict(self), "id": self.id, "notebook_ids": list(self.notebook_ids)}
+        row = asdict(self)
+        row.pop("ledger_id", None)
+        return {**row, "id": self.id, "notebook_ids": list(self.notebook_ids)}
 
 
 def identity_from_document(document: CanonicalDocument) -> SourceIdentity:
+    fingerprint = content_fingerprint(document.text)
     notebook = document.metadata.get("notebooklm") if isinstance(document.metadata, dict) else None
     if isinstance(notebook, dict) and notebook.get("source_id"):
-        provider = "notebooklm"
-        provider_source_id = str(notebook["source_id"])
         uri = notebook.get("original_url") or document.source_uri
         acquisition = notebook.get("acquisition")
         notebook_ids = tuple(str(value) for value in notebook.get("notebook_ids") or ())
         source_type = str(notebook.get("source_type") or document.source_type)
+        normalized = canonical_uri(uri)
+        if source_type == "youtube":
+            provider = "youtube"
+            provider_source_id = (
+                normalized.rsplit("=", 1)[-1]
+                if normalized and "youtube.com/watch?v=" in normalized
+                else f"content:{fingerprint}:notebooklm:{notebook['source_id']}"
+            )
+        else:
+            provider = "document"
+            provider_source_id = f"content:{fingerprint}:notebooklm:{notebook['source_id']}"
+        notebooklm_source_id = str(notebook["source_id"])
     else:
         uri = document.source_uri
         normalized = canonical_uri(uri)
@@ -70,6 +91,7 @@ def identity_from_document(document: CanonicalDocument) -> SourceIdentity:
         acquisition = document.extractor
         notebook_ids = ()
         source_type = document.source_type
+        notebooklm_source_id = None
     return SourceIdentity(
         corpus_id=document.corpus_id,
         provider=provider,
@@ -77,7 +99,8 @@ def identity_from_document(document: CanonicalDocument) -> SourceIdentity:
         title=document.title,
         source_type=source_type,
         canonical_uri=canonical_uri(uri),
-        content_checksum=document.source_checksum,
+        content_checksum=fingerprint,
         acquisition_method=str(acquisition) if acquisition else None,
         notebook_ids=notebook_ids,
+        notebooklm_source_id=notebooklm_source_id,
     )

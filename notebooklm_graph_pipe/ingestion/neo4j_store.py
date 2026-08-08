@@ -8,7 +8,7 @@ from typing import Any, Iterable, Sequence
 from .chunking import ChunkingResult
 from .models import CanonicalDocument
 
-GRAPH_SCHEMA_VERSION = 5
+GRAPH_SCHEMA_VERSION = 6
 
 SCHEMA_QUERIES = (
     "CREATE CONSTRAINT corpus_id_unique IF NOT EXISTS FOR (n:Corpus) REQUIRE n.id IS UNIQUE",
@@ -24,6 +24,7 @@ SCHEMA_QUERIES = (
     "CREATE CONSTRAINT claim_id_unique IF NOT EXISTS FOR (n:Claim) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT corpus_source_id_unique IF NOT EXISTS FOR (n:CorpusSource) REQUIRE n.id IS UNIQUE",
     "CREATE CONSTRAINT corpus_source_provider_unique IF NOT EXISTS FOR (n:CorpusSource) REQUIRE (n.corpus_id, n.provider, n.provider_source_id) IS UNIQUE",
+    "CREATE CONSTRAINT corpus_source_notebooklm_unique IF NOT EXISTS FOR (n:CorpusSource) REQUIRE (n.corpus_id, n.notebooklm_source_id) IS UNIQUE",
     "CREATE INDEX corpus_source_uri IF NOT EXISTS FOR (n:CorpusSource) ON (n.corpus_id, n.canonical_uri)",
     "CREATE INDEX corpus_source_checksum IF NOT EXISTS FOR (n:CorpusSource) ON (n.corpus_id, n.content_checksum)",
     "CREATE INDEX corpus_source_status IF NOT EXISTS FOR (n:CorpusSource) ON (n.corpus_id, n.ingestion_status, n.retrieval_status)",
@@ -347,6 +348,7 @@ class Neo4jCorpusStore:
                 """
                 MATCH (source:CorpusSource {corpus_id: $corpus_id})
                 WHERE (source.provider = $provider AND source.provider_source_id = $provider_source_id)
+                   OR ($notebooklm_source_id IS NOT NULL AND source.notebooklm_source_id = $notebooklm_source_id)
                    OR ($canonical_uri IS NOT NULL AND source.canonical_uri = $canonical_uri)
                    OR source.content_checksum = $content_checksum
                 OPTIONAL MATCH (source)-[:MATERIALIZED_AS]->(document:Document)
@@ -354,13 +356,23 @@ class Neo4jCorpusStore:
                        source.provider_source_id AS provider_source_id,
                        source.canonical_uri AS canonical_uri,
                        source.content_checksum AS content_checksum,
+                       source.notebooklm_source_id AS notebooklm_source_id,
                        source.retrieval_status AS retrieval_status,
                        document.id AS document_id
                 """, **row
             ))
         unique = {record["ledger_source_id"]: dict(record) for record in matches}
         if len(unique) > 1:
-            raise ValueError("Source identity conflicts with multiple Aura ledger records.")
+            duplicates = list(unique.values())
+            if not all(
+                item.get("provider") == row["provider"]
+                and item.get("content_checksum") == row["content_checksum"]
+                for item in duplicates
+            ):
+                raise ValueError("Source identity conflicts with multiple Aura ledger records.")
+            match = sorted(duplicates, key=lambda item: item["ledger_source_id"])[0]
+            match["duplicate_match_count"] = len(duplicates)
+            return match
         if not unique:
             return None
         match = next(iter(unique.values()))
@@ -370,6 +382,24 @@ class Neo4jCorpusStore:
         if not (provider_match or uri_match or checksum_match):
             raise ValueError("Resolved ledger record does not match the supplied source identity.")
         return match
+
+    def promote_ledger_identity(self, ledger_source_id: str, identity: Any) -> None:
+        row = identity.to_row()
+        with self._session() as session:
+            result = session.run(
+                """
+                MATCH (source:CorpusSource {id: $ledger_source_id, corpus_id: $corpus_id})
+                SET source.provider = $provider,
+                    source.provider_source_id = $provider_source_id,
+                    source.canonical_uri = $canonical_uri,
+                    source.content_checksum = $content_checksum,
+                    source.source_type = $source_type,
+                    source.last_verified_at = datetime()
+                RETURN source.id AS id
+                """, ledger_source_id=ledger_source_id, **row,
+            ).single()
+            if not result:
+                raise RuntimeError(f"Could not promote ledger identity {ledger_source_id}.")
 
     def activate_compact_revision(
         self, document_id: str, revision_id: str, expected_parents: int, *, ledger: Any | None = None
@@ -402,7 +432,8 @@ class Neo4jCorpusStore:
                         source.content_checksum = $ledger.content_checksum,
                         source.acquisition_method = $ledger.acquisition_method,
                         source.notebook_ids = $ledger.notebook_ids,
-                        source.ledger_version = 1,
+                        source.notebooklm_source_id = $ledger.notebooklm_source_id,
+                        source.ledger_version = 2,
                         source.ingestion_status = 'INGESTED',
                         source.retrieval_status = 'ACTIVE',
                         source.last_verified_at = datetime(),

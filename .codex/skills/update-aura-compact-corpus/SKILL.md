@@ -23,7 +23,8 @@ Read [references/workflow.md](references/workflow.md) before taking any mutating
 
 - Aura is authoritative; local databases are disposable caches unless freshly restored from Aura.
 - Never scan a directory and infer deletions. Routine updates use explicit source paths.
-- Aura's ledger overrides stale local manifest identity. Never deduplicate by title or fuzzy similarity.
+- Aura's ledger overrides stale local manifest identity. Resolve canonical provider identity, NotebookLM alias, URI, then exact normalized-content fingerprint. Never deduplicate by title or fuzzy similarity.
+- Treat NotebookLM as an acquisition alias and infer the original `youtube` or `document` provider from its metadata.
 - Treat `LEGACY_ONLY` as already ingested unless the user explicitly authorizes `--force-refresh`.
 - Never store child chunks in the compact database.
 - Never run full consolidation for an ordinary source batch.
