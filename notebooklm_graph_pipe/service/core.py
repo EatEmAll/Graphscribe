@@ -7,12 +7,14 @@ from filelock import FileLock, Timeout
 
 from notebooklm_graph_pipe.ingestion.manifest import save_manifest
 from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
+from notebooklm_graph_pipe.ingestion.source_ledger import SourceIdentity, SourceIdentityConflict
 from notebooklm_graph_pipe.retrieval.hybrid import SearchRequest
 
 from .jobs import CorpusJobManager
 from .conversation import ConversationStore, contextualize_question
 from .registry import CorpusRegistry
 from .runtime import RuntimeFactory
+from .ingestions import CorpusIngestionManager
 
 
 class CorpusService:
@@ -22,11 +24,101 @@ class CorpusService:
         runtimes: RuntimeFactory,
         jobs: CorpusJobManager,
         conversations: ConversationStore | None = None,
+        ingestions: CorpusIngestionManager | None = None,
     ):
         self.registry = registry
         self.runtimes = runtimes
         self.jobs = jobs
         self.conversations = conversations
+        self.ingestions = ingestions
+
+    def resolve_sources(self, key: str, probes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not 1 <= len(probes) <= 100:
+            raise ValueError("Source resolution accepts between 1 and 100 probes.")
+        entry = self.registry.get(key)
+        runtime = self.runtimes.get(entry)
+        store = Neo4jCorpusStore(
+            runtime.driver,
+            entry.manifest.neo4j.get("database") or "neo4j",
+            corpus_id=entry.manifest.corpus_id,
+        )
+        results: list[dict[str, Any]] = []
+        try:
+            for index, probe in enumerate(probes):
+                identity = SourceIdentity(
+                    corpus_id=entry.manifest.corpus_id,
+                    provider=str(probe.get("provider") or ""),
+                    provider_source_id=str(probe.get("provider_source_id") or ""),
+                    title=str(probe.get("title") or "discovery probe"),
+                    source_type=str(probe.get("source_type") or "document"),
+                    canonical_uri=str(probe["canonical_uri"]) if probe.get("canonical_uri") else None,
+                    content_checksum=str(probe.get("content_checksum") or ""),
+                    notebooklm_source_id=(
+                        str(probe["notebooklm_source_id"])
+                        if probe.get("notebooklm_source_id")
+                        else None
+                    ),
+                )
+                if not any(
+                    (
+                        identity.provider and identity.provider_source_id,
+                        identity.canonical_uri,
+                        identity.content_checksum,
+                        identity.notebooklm_source_id,
+                    )
+                ):
+                    raise ValueError(f"Source probe {index} has no exact identity field.")
+                try:
+                    match = store.resolve_ledger_source(identity)
+                except SourceIdentityConflict as exc:
+                    results.append(
+                        {
+                            "index": index,
+                            "status": "conflict",
+                            "ledger_source_ids": sorted(
+                                str(item["ledger_source_id"]) for item in exc.matches
+                            ),
+                        }
+                    )
+                    continue
+                results.append(
+                    {"index": index, "status": "matched" if match else "novel", "match": match}
+                )
+        finally:
+            store.close()
+        return results
+
+    def submit_ingestion(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.ingestions is None:
+            raise RuntimeError("Typed ingestion is not configured.")
+        return asdict(
+            self.ingestions.submit(
+                key,
+                idempotency_key=str(payload["idempotency_key"]),
+                package_sha256=str(payload["package_sha256"]),
+                package_path=str(payload["package_path"]),
+            )
+        )
+
+    def get_ingestion(self, ingestion_id: str) -> dict[str, Any]:
+        if self.ingestions is None:
+            raise RuntimeError("Typed ingestion is not configured.")
+        return asdict(self.ingestions.get(ingestion_id))
+
+    def evaluate_ingestion(self, ingestion_id: str, metrics: dict[str, Any]) -> dict[str, Any]:
+        if self.ingestions is None:
+            raise RuntimeError("Typed ingestion is not configured.")
+        return asdict(self.ingestions.evaluate(ingestion_id, metrics))
+
+    def accept_ingestion(self, ingestion_id: str) -> dict[str, Any]:
+        if self.ingestions is None:
+            raise RuntimeError("Typed ingestion is not configured.")
+        return asdict(self.ingestions.accept(ingestion_id))
+
+    def rollback_ingestion(self, ingestion_id: str) -> dict[str, Any]:
+        if self.ingestions is None:
+            raise RuntimeError("Typed ingestion is not configured.")
+        return asdict(self.ingestions.rollback(ingestion_id))
 
     def list_corpora(self) -> list[dict[str, Any]]:
         return [
@@ -192,6 +284,8 @@ class CorpusService:
 
     def close(self) -> None:
         self.jobs.close()
+        if self.ingestions is not None:
+            self.ingestions.close()
         self.runtimes.close()
 
 

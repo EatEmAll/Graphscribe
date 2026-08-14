@@ -342,15 +342,18 @@ class Neo4jCorpusStore:
                 ).consume()
 
     def resolve_ledger_source(self, identity: Any) -> dict[str, Any] | None:
+        from .source_ledger import SourceIdentityConflict
+
         row = identity.to_row()
         with self._session() as session:
             matches = list(session.run(
                 """
                 MATCH (source:CorpusSource {corpus_id: $corpus_id})
-                WHERE (source.provider = $provider AND source.provider_source_id = $provider_source_id)
+                 WHERE ($provider <> '' AND $provider_source_id <> ''
+                        AND source.provider = $provider AND source.provider_source_id = $provider_source_id)
                    OR ($notebooklm_source_id IS NOT NULL AND source.notebooklm_source_id = $notebooklm_source_id)
                    OR ($canonical_uri IS NOT NULL AND source.canonical_uri = $canonical_uri)
-                   OR source.content_checksum = $content_checksum
+                   OR ($content_checksum <> '' AND source.content_checksum = $content_checksum)
                 OPTIONAL MATCH (source)-[:MATERIALIZED_AS]->(document:Document)
                 RETURN source.id AS ledger_source_id, source.provider AS provider,
                        source.provider_source_id AS provider_source_id,
@@ -358,7 +361,14 @@ class Neo4jCorpusStore:
                        source.content_checksum AS content_checksum,
                        source.notebooklm_source_id AS notebooklm_source_id,
                        source.retrieval_status AS retrieval_status,
-                       document.id AS document_id
+                       document.id AS document_id,
+                       source.provider = $provider AND source.provider_source_id = $provider_source_id
+                           AS provider_match,
+                       $notebooklm_source_id IS NOT NULL
+                           AND source.notebooklm_source_id = $notebooklm_source_id AS notebooklm_match,
+                       $canonical_uri IS NOT NULL AND source.canonical_uri = $canonical_uri AS uri_match,
+                       $content_checksum <> '' AND source.content_checksum = $content_checksum
+                           AS fingerprint_match
                 """, **row
             ))
         unique = {record["ledger_source_id"]: dict(record) for record in matches}
@@ -369,19 +379,133 @@ class Neo4jCorpusStore:
                 and item.get("content_checksum") == row["content_checksum"]
                 for item in duplicates
             ):
-                raise ValueError("Source identity conflicts with multiple Aura ledger records.")
+                raise SourceIdentityConflict(duplicates)
             match = sorted(duplicates, key=lambda item: item["ledger_source_id"])[0]
             match["duplicate_match_count"] = len(duplicates)
+            match["equivalent_ledger_source_ids"] = sorted(unique)
+            match["match_reason"] = "multiple_equivalent"
             return match
         if not unique:
             return None
         match = next(iter(unique.values()))
         provider_match = match["provider"] == row["provider"] and match["provider_source_id"] == row["provider_source_id"]
+        notebook_match = bool(
+            row["notebooklm_source_id"]
+            and match.get("notebooklm_source_id") == row["notebooklm_source_id"]
+        )
         uri_match = bool(row["canonical_uri"] and match.get("canonical_uri") == row["canonical_uri"])
         checksum_match = match.get("content_checksum") == row["content_checksum"]
-        if not (provider_match or uri_match or checksum_match):
+        if not (provider_match or notebook_match or uri_match or checksum_match):
             raise ValueError("Resolved ledger record does not match the supplied source identity.")
+        match["match_reason"] = next(
+            reason
+            for reason, matched in (
+                ("provider_id", bool(match.get("provider_match"))),
+                ("notebooklm_alias", bool(match.get("notebooklm_match"))),
+                ("canonical_uri", bool(match.get("uri_match"))),
+                ("content_fingerprint", bool(match.get("fingerprint_match"))),
+            )
+            if matched
+        )
         return match
+
+    def stage_compact_revision(self, document_id: str, revision_id: str, expected_parents: int) -> None:
+        """Make an embedded revision graph-queue eligible without exposing it to retrieval."""
+        with self._session() as session:
+            result = session.run(
+                """
+                MATCH (document:Document {id: $document_id})-[:HAS_REVISION]->
+                      (revision:DocumentRevision {id: $revision_id})
+                MATCH (revision)-[:HAS_PARENT]->(parent:ParentChunk)
+                WITH document, revision, count(parent) AS actual,
+                     count(parent.embedding) AS embedded
+                WHERE actual = $expected AND embedded = $expected
+                  AND NOT (document)-[:ACTIVE_REVISION]->(revision)
+                SET revision.status = 'STAGED', revision.vector_ready = true,
+                    revision.staged_at = datetime(),
+                    document.status = CASE
+                        WHEN EXISTS { MATCH (document)-[:ACTIVE_REVISION]->() } THEN 'READY'
+                        ELSE 'STAGED'
+                    END
+                RETURN actual
+                """,
+                document_id=document_id,
+                revision_id=revision_id,
+                expected=expected_parents,
+            ).single()
+            if not result:
+                raise RuntimeError(
+                    "Compact revision staging failed because stored parent/embedding counts "
+                    f"did not equal {expected_parents}."
+                )
+
+    def staged_revision_state(self, document_id: str, revision_id: str) -> dict[str, Any] | None:
+        with self._session() as session:
+            row = session.run(
+                """
+                MATCH (document:Document {id: $document_id})-[:HAS_REVISION]->
+                      (revision:DocumentRevision {id: $revision_id})
+                OPTIONAL MATCH (revision)-[:HAS_PARENT]->(parent:ParentChunk)
+                RETURN revision.status AS status, revision.vector_ready AS vector_ready,
+                       revision.graph_ready AS graph_ready, count(parent) AS parent_count,
+                       count(CASE WHEN parent.graph_status = 'COMPLETED' THEN 1 END)
+                           AS completed_parents,
+                       EXISTS { MATCH (document)-[:ACTIVE_REVISION]->(revision) } AS is_active
+                """,
+                document_id=document_id,
+                revision_id=revision_id,
+            ).single()
+            return dict(row) if row else None
+
+    def rollback_failed_accept(
+        self,
+        document_id: str,
+        revision_id: str,
+        previous_revision_id: str | None,
+        ledger_source_id: str,
+        *,
+        remove_new_ledger: bool,
+    ) -> None:
+        """Restore the pre-accept graph state after a manifest write failure."""
+        with self._session() as session:
+            result = session.run(
+                """
+                MATCH (document:Document {id: $document_id})-[:HAS_REVISION]->
+                      (revision:DocumentRevision {id: $revision_id})
+                OPTIONAL MATCH (document)-[current:ACTIVE_REVISION]->(:DocumentRevision)
+                DELETE current
+                WITH document, revision
+                OPTIONAL MATCH (document)-[:HAS_REVISION]->(previous:DocumentRevision {id: $previous_revision_id})
+                FOREACH (_ IN CASE WHEN previous IS NULL THEN [] ELSE [1] END |
+                    MERGE (document)-[:ACTIVE_REVISION]->(previous)
+                    SET previous.status = 'ACTIVE')
+                SET revision.status = 'STAGED',
+                    document.status = CASE WHEN previous IS NULL THEN 'STAGED' ELSE 'READY' END
+                WITH document, previous
+                OPTIONAL MATCH (source:CorpusSource {id: $ledger_source_id})-[materialized:MATERIALIZED_AS]->(document)
+                DELETE materialized
+                WITH document, previous, source
+                FOREACH (_ IN CASE WHEN source IS NULL OR $remove_new_ledger THEN [] ELSE [1] END |
+                    MERGE (source)-[:MATERIALIZED_AS]->(document)
+                    SET source.content_checksum = coalesce(previous.checksum, source.content_checksum),
+                        source.retrieval_status = 'ACTIVE', source.ingestion_status = 'INGESTED')
+                WITH document, source
+                OPTIONAL MATCH (:Corpus)-[has_source:HAS_SOURCE]->(source)
+                FOREACH (_ IN CASE WHEN has_source IS NULL OR NOT $remove_new_ledger THEN [] ELSE [1] END |
+                    DELETE has_source)
+                WITH document, source
+                FOREACH (_ IN CASE WHEN source IS NULL OR NOT $remove_new_ledger THEN [] ELSE [1] END |
+                    DELETE source)
+                RETURN document.id AS document_id
+                """,
+                document_id=document_id,
+                revision_id=revision_id,
+                previous_revision_id=previous_revision_id,
+                ledger_source_id=ledger_source_id,
+                remove_new_ledger=remove_new_ledger,
+            ).single()
+            if not result:
+                raise RuntimeError(f"Could not roll back failed acceptance for {revision_id}.")
 
     def promote_ledger_identity(self, ledger_source_id: str, identity: Any) -> None:
         row = identity.to_row()
@@ -402,7 +526,13 @@ class Neo4jCorpusStore:
                 raise RuntimeError(f"Could not promote ledger identity {ledger_source_id}.")
 
     def activate_compact_revision(
-        self, document_id: str, revision_id: str, expected_parents: int, *, ledger: Any | None = None
+        self,
+        document_id: str,
+        revision_id: str,
+        expected_parents: int,
+        *,
+        ledger: Any | None = None,
+        require_staged: bool = False,
     ) -> None:
         with self._session() as session:
             result = session.run(
@@ -412,6 +542,8 @@ class Neo4jCorpusStore:
                 WITH document, revision, count(parent) AS actual,
                      count(parent.embedding) AS embedded
                 WHERE actual = $expected AND embedded = $expected
+                  AND (NOT $require_staged OR
+                       (revision.status = 'STAGED' AND revision.graph_ready = true))
                 OPTIONAL MATCH (document)-[old:ACTIVE_REVISION]->(previous:DocumentRevision)
                 DELETE old
                 FOREACH (_ IN CASE WHEN previous IS NULL THEN [] ELSE [1] END |
@@ -445,6 +577,7 @@ class Neo4jCorpusStore:
                 document_id=document_id,
                 revision_id=revision_id,
                 expected=expected_parents,
+                require_staged=require_staged,
                 corpus_id=self.corpus_id,
                 ledger=ledger.to_row() if ledger is not None else None,
             ).single()

@@ -28,7 +28,36 @@ class AnswerBody(BaseModel):
     conversation_id: str | None = Field(default=None, min_length=1, max_length=128)
 
 
-def create_app(service: CorpusService, token: str) -> FastAPI:
+class SourceProbe(BaseModel):
+    provider: str = Field(default="", max_length=100)
+    provider_source_id: str = Field(default="", max_length=500)
+    canonical_uri: str | None = Field(default=None, max_length=4000)
+    content_checksum: str = Field(default="", max_length=128)
+    notebooklm_source_id: str | None = Field(default=None, max_length=500)
+    title: str = Field(default="discovery probe", max_length=1000)
+    source_type: str = Field(default="document", max_length=100)
+
+
+class ResolveSourcesBody(BaseModel):
+    probes: list[SourceProbe] = Field(min_length=1, max_length=100)
+
+
+class IngestionBody(BaseModel):
+    idempotency_key: str = Field(min_length=1, max_length=200)
+    package_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    package_path: str = Field(min_length=1, max_length=2000)
+
+
+class EvaluationBody(BaseModel):
+    baseline_quality_ratio: float = Field(ge=0, le=2, allow_inf_nan=False)
+    effective_citation_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
+    unsupported_claim_delta: float = Field(allow_inf_nan=False)
+    graph_expansion_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
+    capacity_headroom_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
+    source_canary_retrieved: bool
+
+
+def create_app(service: CorpusService, token: str, write_token: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
@@ -40,6 +69,11 @@ def create_app(service: CorpusService, token: str) -> FastAPI:
         expected = f"Bearer {token}"
         if authorization is None or not secrets.compare_digest(authorization, expected):
             raise HTTPException(status_code=401, detail="Invalid bearer token.")
+
+    def authorize_write(authorization: str | None = Header(default=None)) -> None:
+        expected = f"Bearer {write_token}" if write_token else ""
+        if not expected or authorization is None or not secrets.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="Invalid write bearer token.")
 
     @app.get("/health")
     def health():
@@ -60,6 +94,37 @@ def create_app(service: CorpusService, token: str) -> FastAPI:
     @app.get("/v1/jobs/{job_id}", dependencies=[Depends(authorize)])
     def job(job_id: str):
         return _call(service.get_job, job_id)
+
+    @app.post(
+        "/v1/corpora/{corpus_key}/sources:resolve",
+        dependencies=[Depends(authorize_write)],
+    )
+    def resolve_sources(corpus_key: str, body: ResolveSourcesBody):
+        return _call(service.resolve_sources, corpus_key, [item.model_dump() for item in body.probes])
+
+    @app.post(
+        "/v1/corpora/{corpus_key}/ingestions",
+        status_code=202,
+        dependencies=[Depends(authorize_write)],
+    )
+    def submit_ingestion(corpus_key: str, body: IngestionBody):
+        return _call(service.submit_ingestion, corpus_key, body.model_dump())
+
+    @app.get("/v1/ingestions/{ingestion_id}", dependencies=[Depends(authorize_write)])
+    def ingestion(ingestion_id: str):
+        return _call(service.get_ingestion, ingestion_id)
+
+    @app.post("/v1/ingestions/{ingestion_id}:evaluate", dependencies=[Depends(authorize_write)])
+    def evaluate_ingestion(ingestion_id: str, body: EvaluationBody):
+        return _call(service.evaluate_ingestion, ingestion_id, body.model_dump())
+
+    @app.post("/v1/ingestions/{ingestion_id}:accept", dependencies=[Depends(authorize_write)])
+    def accept_ingestion(ingestion_id: str):
+        return _call(service.accept_ingestion, ingestion_id)
+
+    @app.post("/v1/ingestions/{ingestion_id}:rollback", dependencies=[Depends(authorize_write)])
+    def rollback_ingestion(ingestion_id: str):
+        return _call(service.rollback_ingestion, ingestion_id)
 
     @app.post("/v1/corpora/{corpus_key}/search", dependencies=[Depends(authorize)])
     def search(corpus_key: str, body: SearchBody):

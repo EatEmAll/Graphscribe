@@ -16,6 +16,7 @@ from notebooklm_graph_pipe.service.api import create_app
 from notebooklm_graph_pipe.service.core import CorpusService
 from notebooklm_graph_pipe.service.conversation import ConversationStore
 from notebooklm_graph_pipe.service.jobs import CorpusJobManager
+from notebooklm_graph_pipe.service.ingestions import CorpusIngestionManager
 from notebooklm_graph_pipe.service.registry import CorpusRegistry
 from notebooklm_graph_pipe.service.runtime import RuntimeFactory
 from notebooklm_graph_pipe.service.security import load_or_create_token
@@ -25,17 +26,25 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Serve the local Neo4j corpus REST API.")
     parser.add_argument("--registry-root", default=str(REPO_ROOT / "data" / "corpora"))
     parser.add_argument("--token-path", default=str(REPO_ROOT / ".local" / "api_token"))
+    parser.add_argument("--write-token-path", default=str(REPO_ROOT / ".local" / "write_api_token"))
+    parser.add_argument("--ingestion-root", default=str(REPO_ROOT / ".local" / "ingestion"))
     parser.add_argument("--llm-routing-config")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
     registry = CorpusRegistry(Path(args.registry_root))
+    runtimes = RuntimeFactory(args.llm_routing_config)
     service = CorpusService(
         registry,
-        RuntimeFactory(args.llm_routing_config),
+        runtimes,
         CorpusJobManager(registry, REPO_ROOT),
         ConversationStore(REPO_ROOT / ".local" / "conversations.sqlite3"),
+        CorpusIngestionManager(registry, runtimes, Path(args.ingestion_root)),
     )
-    app = create_app(service, load_or_create_token(Path(args.token_path)))
+    app = create_app(
+        service,
+        load_or_create_token(Path(args.token_path)),
+        load_or_create_token(Path(args.write_token_path)),
+    )
     uvicorn.run(app, host="127.0.0.1", port=args.port)
 
 
