@@ -233,7 +233,10 @@ class Neo4jRetrievalBackend:
             {seed_match}
             MATCH (seed_parent)-[seed_mention:HAS_ENTITY]->(origin:__Entity__)
             WHERE coalesce(seed_mention.extraction_state, 'VERIFIED') = 'VERIFIED'
-              AND COUNT {{ (origin)<-[:HAS_ENTITY]-(:ParentChunk) }} <= $max_entity_degree
+              AND COUNT {{
+                  (origin)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(:DocumentRevision)
+                    <-[:ACTIVE_REVISION]-(:Document)<-[:HAS_DOCUMENT]-(corpus)
+              }} <= $max_entity_degree
             MATCH path=(origin)-[*0..{max_path}]-(reached:__Entity__)
             {evidence_match}
             WHERE revision.graph_ready = true AND document.status = 'READY' AND {seed_exclusion}
@@ -241,7 +244,10 @@ class Neo4jRetrievalBackend:
               AND ($document_ids = [] OR document.id IN $document_ids)
               AND ($source_types = [] OR document.source_type IN $source_types)
               AND ($language IS NULL OR document.language = $language)
-              AND COUNT {{ (reached)<-[:HAS_ENTITY]-(:ParentChunk) }} <= $max_entity_degree
+              AND COUNT {{
+                  (reached)<-[:HAS_ENTITY]-(:ParentChunk)<-[:HAS_PARENT]-(:DocumentRevision)
+                    <-[:ACTIVE_REVISION]-(:Document)<-[:HAS_DOCUMENT]-(corpus)
+              }} <= $max_entity_degree
               AND all(rel IN relationships(path)
                   WHERE NOT type(rel) IN $excluded_relationships
                     AND any(parent_id IN coalesce(rel.source_parent_ids, [])
