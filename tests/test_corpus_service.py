@@ -31,6 +31,24 @@ class Service:
     def get_job(self, job_id):
         return {"id": job_id}
 
+    def resolve_sources(self, key, probes):
+        return [{"index": 0, "status": "novel", "key": key, "probe": probes[0]}]
+
+    def submit_ingestion(self, key, payload):
+        return {"id": "ingestion", "corpus_key": key, **payload}
+
+    def get_ingestion(self, ingestion_id):
+        return {"id": ingestion_id, "status": "staged"}
+
+    def evaluate_ingestion(self, ingestion_id, metrics):
+        return {"id": ingestion_id, "status": "evaluated", "metrics": metrics}
+
+    def accept_ingestion(self, ingestion_id):
+        return {"id": ingestion_id, "status": "accepted"}
+
+    def rollback_ingestion(self, ingestion_id):
+        return {"id": ingestion_id, "status": "rolled_back"}
+
     def search(self, key, payload):
         return {"key": key, "query": payload["query"]}
 
@@ -70,6 +88,48 @@ def test_search_endpoint_validates_and_delegates() -> None:
     response = client.post("/v1/corpora/demo/search", headers=headers, json={"query": "hello"})
     assert response.status_code == 200
     assert response.json() == {"key": "demo", "query": "hello"}
+
+
+def test_typed_ingestion_endpoints_require_distinct_write_token() -> None:
+    client = TestClient(create_app(Service(), "r" * 32, "w" * 32))
+    read_headers = {"Authorization": f"Bearer {'r' * 32}"}
+    write_headers = {"Authorization": f"Bearer {'w' * 32}"}
+    resolve = {"probes": [{"provider": "doi", "provider_source_id": "10.1/example"}]}
+
+    assert client.post("/v1/corpora/demo/sources:resolve", headers=read_headers, json=resolve).status_code == 401
+    assert client.post("/v1/corpora/demo/sources:resolve", headers=write_headers, json=resolve).json()[0]["status"] == "novel"
+    submitted = client.post(
+        "/v1/corpora/demo/ingestions",
+        headers=write_headers,
+        json={"idempotency_key": "one", "package_sha256": "a" * 64, "package_path": "one"},
+    )
+    assert submitted.status_code == 202
+    assert client.get("/v1/ingestions/ingestion", headers=read_headers).status_code == 401
+    assert client.get("/v1/ingestions/ingestion", headers=write_headers).json()["status"] == "staged"
+
+
+def test_evaluation_endpoint_enforces_complete_metric_contract() -> None:
+    client = TestClient(create_app(Service(), "r" * 32, "w" * 32))
+    headers = {"Authorization": f"Bearer {'w' * 32}"}
+    incomplete = client.post(
+        "/v1/ingestions/ingestion:evaluate",
+        headers=headers,
+        json={"baseline_quality_ratio": 1},
+    )
+    assert incomplete.status_code == 422
+    complete = client.post(
+        "/v1/ingestions/ingestion:evaluate",
+        headers=headers,
+        json={
+            "baseline_quality_ratio": 0.95,
+            "effective_citation_ratio": 1,
+            "unsupported_claim_delta": 0,
+            "graph_expansion_ratio": 0.9,
+            "capacity_headroom_ratio": 0.25,
+            "source_canary_retrieved": True,
+        },
+    )
+    assert complete.status_code == 200
 
 
 def test_answer_endpoint_accepts_global_mode() -> None:

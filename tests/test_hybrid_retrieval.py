@@ -306,6 +306,7 @@ def test_parent_backend_uses_declared_indexes_and_parent_paths() -> None:
     graph_query = calls[1][0]
     assert "(seed_parent:ParentChunk {id: seed_id})" in graph_query
     assert "coalesce(rel.source_parent_ids, [])" in graph_query
+    assert graph_query.count("<-[:ACTIVE_REVISION]-(:Document)") >= 3
 
 
 def test_backend_rejects_unsafe_index_names() -> None:
