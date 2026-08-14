@@ -59,6 +59,7 @@ class IngestionRecord:
     document_id: str | None = None
     revision_id: str | None = None
     previous_revision_id: str | None = None
+    previous_document: dict[str, Any] | None = None
     source_key: str | None = None
     expected_parents: int = 0
     source_checksum: str | None = None
@@ -253,6 +254,12 @@ class CorpusIngestionManager:
                 f"source-package/{identity.id}",
             )
             record.previous_revision_id = str(active["revision_id"]) if active else None
+            record.previous_document = (
+                {key: active.get(key) for key in (
+                    "source_type", "source_uri", "relative_path", "title", "language"
+                )}
+                if active else None
+            )
             record.source_key = source_key
             record.expected_parents = len(chunks.parents)
             record.source_checksum = document.source_checksum
@@ -344,6 +351,7 @@ class CorpusIngestionManager:
                     ledger=identity,
                     require_staged=True,
                 )
+                previous_manifest_source = entry.manifest.sources.get(record.source_key)
                 try:
                     entry.manifest.sources[record.source_key] = SourceManifestEntry(
                         document_id=record.document_id,
@@ -355,12 +363,18 @@ class CorpusIngestionManager:
                     )
                     save_manifest(entry.manifest_path, entry.manifest)
                 except Exception:
+                    if previous_manifest_source is None:
+                        entry.manifest.sources.pop(record.source_key, None)
+                    else:
+                        entry.manifest.sources[record.source_key] = previous_manifest_source
                     store.rollback_failed_accept(
                         record.document_id,
                         record.revision_id,
                         record.previous_revision_id,
                         identity.id,
                         remove_new_ledger=record.ledger_match is None,
+                        previous_ledger=record.ledger_match,
+                        previous_document=record.previous_document,
                     )
                     raise
                 finally:

@@ -10,7 +10,11 @@ import pytest
 from notebooklm_graph_pipe.ingestion.adapters import ExtractionContext, SourcePackage, SourcePackageAdapter
 from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
 from notebooklm_graph_pipe.ingestion.ids import corpus_id
-from notebooklm_graph_pipe.ingestion.source_ledger import identity_from_document
+from notebooklm_graph_pipe.ingestion.source_ledger import (
+    SourceIdentity,
+    SourceIdentityConflict,
+    identity_from_document,
+)
 from notebooklm_graph_pipe.service.ingestions import CorpusIngestionManager, package_digest
 from notebooklm_graph_pipe.service.registry import CorpusRegistry
 
@@ -137,6 +141,31 @@ def test_acceptance_can_require_graph_ready_staged_revision() -> None:
     assert parameters["require_staged"] is True
 
 
+def test_conflicting_exact_ledger_identities_are_quarantined() -> None:
+    class Session:
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def run(self, query, **parameters):
+            return iter(
+                [
+                    {"ledger_source_id": "source-a", "provider": "doi",
+                     "provider_source_id": "10.1/a", "canonical_uri": "https://example/a",
+                     "content_checksum": "f" * 64},
+                    {"ledger_source_id": "source-b", "provider": "doi",
+                     "provider_source_id": "10.1/b", "canonical_uri": "https://example/b",
+                     "content_checksum": "f" * 64},
+                ]
+            )
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+    identity = SourceIdentity(
+        corpus_id("corpus"), "doi", "10.1/a", "Synthetic", "paper",
+        "https://example/b", "f" * 64,
+    )
+    with pytest.raises(SourceIdentityConflict):
+        store.resolve_ledger_source(identity)
+
+
 def test_failed_accept_rollback_restores_previous_revision_and_removes_new_ledger() -> None:
     calls: list[tuple[str, dict]] = []
 
@@ -156,10 +185,17 @@ def test_failed_accept_rollback_restores_previous_revision_and_removes_new_ledge
             return Result()
 
     store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
-    store.rollback_failed_accept("document", "new", "old", "ledger", remove_new_ledger=True)
+    store.rollback_failed_accept(
+        "document", "new", "old", "ledger", remove_new_ledger=True,
+        previous_ledger={"title": "Old title"},
+        previous_document={"title": "Old document title"},
+    )
 
     query, parameters = calls[0]
     assert "previous.status = 'ACTIVE'" in query
     assert "DELETE source" in query
     assert "MERGE (source)-[:MATERIALIZED_AS]->(document)" in query
+    assert "source.title = coalesce($previous_ledger.title" in query
     assert parameters["remove_new_ledger"] is True
+    assert parameters["previous_ledger"]["title"] == "Old title"
+    assert parameters["previous_document"]["title"] == "Old document title"

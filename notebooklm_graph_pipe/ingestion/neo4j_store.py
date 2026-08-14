@@ -279,11 +279,11 @@ class Neo4jCorpusStore:
                 MERGE (document:Document {id: $document_id})
                 WITH corpus, document
                 OPTIONAL MATCH (document)-[:ACTIVE_REVISION]->(active_revision:DocumentRevision)
-                SET document.source_type = $source_type,
-                    document.source_uri = $source_uri,
-                    document.relative_path = $relative_path,
-                    document.title = $title,
-                    document.language = $language,
+                SET document.source_type = CASE WHEN active_revision IS NULL THEN $source_type ELSE document.source_type END,
+                    document.source_uri = CASE WHEN active_revision IS NULL THEN $source_uri ELSE document.source_uri END,
+                    document.relative_path = CASE WHEN active_revision IS NULL THEN $relative_path ELSE document.relative_path END,
+                    document.title = CASE WHEN active_revision IS NULL THEN $title ELSE document.title END,
+                    document.language = CASE WHEN active_revision IS NULL THEN $language ELSE document.language END,
                     document.status = CASE WHEN active_revision IS NULL THEN 'BUILDING' ELSE 'READY' END
                 WITH corpus, document
                 MERGE (corpus)-[:HAS_DOCUMENT]->(document)
@@ -291,6 +291,11 @@ class Neo4jCorpusStore:
                 SET revision.checksum = $checksum,
                     revision.extractor = $extractor,
                     revision.extractor_version = $extractor_version,
+                    revision.source_type = $source_type,
+                    revision.source_uri = $source_uri,
+                    revision.relative_path = $relative_path,
+                    revision.title = $title,
+                    revision.language = $language,
                     revision.status = 'BUILDING',
                     revision.vector_ready = false,
                     revision.graph_ready = false,
@@ -360,6 +365,10 @@ class Neo4jCorpusStore:
                        source.canonical_uri AS canonical_uri,
                        source.content_checksum AS content_checksum,
                        source.notebooklm_source_id AS notebooklm_source_id,
+                       source.title AS title, source.source_type AS source_type,
+                       source.acquisition_method AS acquisition_method,
+                       source.notebook_ids AS notebook_ids,
+                       source.ingestion_status AS ingestion_status,
                        source.retrieval_status AS retrieval_status,
                        document.id AS document_id,
                        source.provider = $provider AND source.provider_source_id = $provider_source_id
@@ -373,18 +382,10 @@ class Neo4jCorpusStore:
             ))
         unique = {record["ledger_source_id"]: dict(record) for record in matches}
         if len(unique) > 1:
-            duplicates = list(unique.values())
-            if not all(
-                item.get("provider") == row["provider"]
-                and item.get("content_checksum") == row["content_checksum"]
-                for item in duplicates
-            ):
-                raise SourceIdentityConflict(duplicates)
-            match = sorted(duplicates, key=lambda item: item["ledger_source_id"])[0]
-            match["duplicate_match_count"] = len(duplicates)
-            match["equivalent_ledger_source_ids"] = sorted(unique)
-            match["match_reason"] = "multiple_equivalent"
-            return match
+            # One probe resolving to multiple exact ledger identities is ambiguous even when
+            # the bytes happen to match. Stable provider IDs and aliases may not be collapsed
+            # automatically; an operator must resolve the conflict explicitly.
+            raise SourceIdentityConflict(list(unique.values()))
         if not unique:
             return None
         match = next(iter(unique.values()))
@@ -465,6 +466,8 @@ class Neo4jCorpusStore:
         ledger_source_id: str,
         *,
         remove_new_ledger: bool,
+        previous_ledger: dict[str, Any] | None = None,
+        previous_document: dict[str, Any] | None = None,
     ) -> None:
         """Restore the pre-accept graph state after a manifest write failure."""
         with self._session() as session:
@@ -480,15 +483,29 @@ class Neo4jCorpusStore:
                     MERGE (document)-[:ACTIVE_REVISION]->(previous)
                     SET previous.status = 'ACTIVE')
                 SET revision.status = 'STAGED',
-                    document.status = CASE WHEN previous IS NULL THEN 'STAGED' ELSE 'READY' END
+                    document.status = CASE WHEN previous IS NULL THEN 'STAGED' ELSE 'READY' END,
+                    document.source_type = coalesce($previous_document.source_type, document.source_type),
+                    document.source_uri = coalesce($previous_document.source_uri, document.source_uri),
+                    document.relative_path = coalesce($previous_document.relative_path, document.relative_path),
+                    document.title = coalesce($previous_document.title, document.title),
+                    document.language = coalesce($previous_document.language, document.language)
                 WITH document, previous
                 OPTIONAL MATCH (source:CorpusSource {id: $ledger_source_id})-[materialized:MATERIALIZED_AS]->(document)
                 DELETE materialized
                 WITH document, previous, source
                 FOREACH (_ IN CASE WHEN source IS NULL OR $remove_new_ledger THEN [] ELSE [1] END |
                     MERGE (source)-[:MATERIALIZED_AS]->(document)
-                    SET source.content_checksum = coalesce(previous.checksum, source.content_checksum),
-                        source.retrieval_status = 'ACTIVE', source.ingestion_status = 'INGESTED')
+                    SET source.provider = coalesce($previous_ledger.provider, source.provider),
+                        source.provider_source_id = coalesce($previous_ledger.provider_source_id, source.provider_source_id),
+                        source.title = coalesce($previous_ledger.title, source.title),
+                        source.source_type = coalesce($previous_ledger.source_type, source.source_type),
+                        source.canonical_uri = coalesce($previous_ledger.canonical_uri, source.canonical_uri),
+                        source.content_checksum = coalesce($previous_ledger.content_checksum, previous.checksum, source.content_checksum),
+                        source.acquisition_method = coalesce($previous_ledger.acquisition_method, source.acquisition_method),
+                        source.notebook_ids = coalesce($previous_ledger.notebook_ids, source.notebook_ids),
+                        source.notebooklm_source_id = coalesce($previous_ledger.notebooklm_source_id, source.notebooklm_source_id),
+                        source.retrieval_status = coalesce($previous_ledger.retrieval_status, 'ACTIVE'),
+                        source.ingestion_status = coalesce($previous_ledger.ingestion_status, 'INGESTED'))
                 WITH document, source
                 OPTIONAL MATCH (:Corpus)-[has_source:HAS_SOURCE]->(source)
                 FOREACH (_ IN CASE WHEN has_source IS NULL OR NOT $remove_new_ledger THEN [] ELSE [1] END |
@@ -503,6 +520,8 @@ class Neo4jCorpusStore:
                 previous_revision_id=previous_revision_id,
                 ledger_source_id=ledger_source_id,
                 remove_new_ledger=remove_new_ledger,
+                previous_ledger=previous_ledger or {},
+                previous_document=previous_document or {},
             ).single()
             if not result:
                 raise RuntimeError(f"Could not roll back failed acceptance for {revision_id}.")
@@ -550,7 +569,12 @@ class Neo4jCorpusStore:
                     SET previous.status = 'INACTIVE', previous.deactivated_at = datetime())
                 MERGE (document)-[:ACTIVE_REVISION]->(revision)
                 SET revision.status = 'ACTIVE', revision.vector_ready = true,
-                    document.status = 'READY'
+                    document.status = 'READY',
+                    document.source_type = revision.source_type,
+                    document.source_uri = revision.source_uri,
+                    document.relative_path = revision.relative_path,
+                    document.title = revision.title,
+                    document.language = revision.language
                 WITH document, revision
                 OPTIONAL MATCH (corpus:Corpus {id: $corpus_id})
                 FOREACH (_ IN CASE WHEN $ledger IS NULL THEN [] ELSE [1] END |
@@ -607,7 +631,10 @@ class Neo4jCorpusStore:
                 RETURN revision.id AS revision_id, revision.checksum AS checksum,
                        revision.extractor AS extractor,
                        revision.extractor_version AS extractor_version,
-                       revision.graph_ready AS graph_ready
+                       revision.graph_ready AS graph_ready,
+                       document.source_type AS source_type, document.source_uri AS source_uri,
+                       document.relative_path AS relative_path, document.title AS title,
+                       document.language AS language
                 """,
                 document_id=document_id,
             ).single()
