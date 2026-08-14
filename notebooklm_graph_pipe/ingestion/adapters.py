@@ -48,6 +48,73 @@ class SourceAdapter(ABC):
     def extract(self, source: object, context: ExtractionContext) -> CanonicalDocument: ...
 
 
+@dataclass(frozen=True)
+class SourcePackage:
+    root: Path
+
+
+class SourcePackageAdapter(SourceAdapter):
+    """Read a controller-created, content-addressed Markdown source package."""
+
+    name = "source-package"
+    version = "1"
+
+    def supports(self, source: object) -> bool:
+        return isinstance(source, SourcePackage)
+
+    def extract(self, source: object, context: ExtractionContext) -> CanonicalDocument:
+        package = source if isinstance(source, SourcePackage) else SourcePackage(Path(source))
+        root = package.root.resolve()
+        metadata_path = root / "source.json"
+        content_path = root / "content.md"
+        if not metadata_path.is_file() or not content_path.is_file():
+            raise ValueError("Source package requires source.json and content.md.")
+        import json
+
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        required = {"provider", "provider_source_id", "title", "source_type"}
+        missing = sorted(required - metadata.keys())
+        if missing:
+            raise ValueError(f"Source package metadata is missing fields: {missing}")
+        provider = str(metadata["provider"]).strip()
+        provider_source_id = str(metadata["provider_source_id"]).strip()
+        title = str(metadata["title"]).strip()
+        if not provider or not provider_source_id or not title:
+            raise ValueError("Source package identity fields must be non-empty.")
+        text, warnings = _decode_text(content_path)
+        blocks, markdown_metadata = parse_markdown_blocks(text)
+        uri = str(metadata.get("canonical_uri") or f"{provider}:{provider_source_id}")
+        checksum = file_checksum(content_path)
+        expected_checksum = str(metadata.get("content_sha256") or "")
+        if expected_checksum and expected_checksum != checksum:
+            raise ValueError("Source package content checksum does not match source.json.")
+        return _document(
+            context=context,
+            source_type=str(metadata["source_type"]),
+            source_uri=uri,
+            relative_path=None,
+            title=title,
+            checksum=checksum,
+            extractor=self.name,
+            extractor_version=self.version,
+            raw_blocks=blocks,
+            language=str(metadata.get("language") or "en"),
+            metadata={
+                **markdown_metadata,
+                "source_identity": {
+                    "provider": provider,
+                    "provider_source_id": provider_source_id,
+                    "canonical_uri": metadata.get("canonical_uri"),
+                    "source_type": metadata["source_type"],
+                    "acquisition_method": metadata.get("acquisition_method"),
+                    "notebook_ids": metadata.get("notebook_ids") or [],
+                    "notebooklm_source_id": metadata.get("notebooklm_source_id"),
+                },
+            },
+            warnings=warnings,
+        )
+
+
 def _decode_text(path: Path) -> tuple[str, tuple[str, ...]]:
     from charset_normalizer import from_bytes
 
@@ -504,6 +571,7 @@ def _yt_dlp_transcript(video_id: str, languages: tuple[str, ...]) -> tuple[list[
 
 
 DEFAULT_ADAPTERS: tuple[SourceAdapter, ...] = (
+    SourcePackageAdapter(),
     TextAdapter(),
     MarkdownAdapter(),
     PdfAdapter(),

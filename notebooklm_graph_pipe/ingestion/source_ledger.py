@@ -14,6 +14,13 @@ from .models import CanonicalDocument
 LEDGER_VERSION = 2
 
 
+class SourceIdentityConflict(ValueError):
+    def __init__(self, matches: list[dict[str, Any]]):
+        self.matches = matches
+        identifiers = ", ".join(sorted(str(item["ledger_source_id"]) for item in matches))
+        super().__init__(f"Source identity conflicts with multiple ledger records: {identifiers}")
+
+
 def content_fingerprint(text: str) -> str:
     normalized = " ".join(text.replace("\r\n", "\n").replace("\r", "\n").split()).casefold()
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -61,8 +68,21 @@ class SourceIdentity:
 
 def identity_from_document(document: CanonicalDocument) -> SourceIdentity:
     fingerprint = content_fingerprint(document.text)
+    declared = document.metadata.get("source_identity") if isinstance(document.metadata, dict) else None
     notebook = document.metadata.get("notebooklm") if isinstance(document.metadata, dict) else None
-    if isinstance(notebook, dict) and notebook.get("source_id"):
+    if isinstance(declared, dict):
+        provider = str(declared["provider"])
+        provider_source_id = str(declared["provider_source_id"])
+        uri = declared.get("canonical_uri") or document.source_uri
+        acquisition = declared.get("acquisition_method") or document.extractor
+        notebook_ids = tuple(str(value) for value in declared.get("notebook_ids") or ())
+        notebooklm_source_id = (
+            str(declared["notebooklm_source_id"])
+            if declared.get("notebooklm_source_id")
+            else None
+        )
+        source_type = str(declared.get("source_type") or document.source_type)
+    elif isinstance(notebook, dict) and notebook.get("source_id"):
         uri = notebook.get("original_url") or document.source_uri
         acquisition = notebook.get("acquisition")
         notebook_ids = tuple(str(value) for value in notebook.get("notebook_ids") or ())
