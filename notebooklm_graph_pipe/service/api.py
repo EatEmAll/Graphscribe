@@ -3,13 +3,17 @@ from __future__ import annotations
 import secrets
 import json
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .core import CorpusService
+
+class CorpusServiceApi(Protocol):
+    """Structural service boundary; importing HTTP schemas needs no LLM runtime."""
+
+    def close(self) -> None: ...
 
 
 class SearchBody(BaseModel):
@@ -29,6 +33,8 @@ class AnswerBody(BaseModel):
 
 
 class SourceProbe(BaseModel):
+    connector_id: str = Field(default="", max_length=100)
+    provider_id: str = Field(default="", max_length=500)
     provider: str = Field(default="", max_length=100)
     provider_source_id: str = Field(default="", max_length=500)
     canonical_uri: str | None = Field(default=None, max_length=4000)
@@ -57,7 +63,7 @@ class EvaluationBody(BaseModel):
     source_canary_retrieved: bool
 
 
-def create_app(service: CorpusService, token: str, write_token: str | None = None) -> FastAPI:
+def create_app(service: CorpusServiceApi, token: str, write_token: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
@@ -97,7 +103,7 @@ def create_app(service: CorpusService, token: str, write_token: str | None = Non
 
     @app.post(
         "/v1/corpora/{corpus_key}/sources:resolve",
-        dependencies=[Depends(authorize_write)],
+        dependencies=[Depends(authorize)],
     )
     def resolve_sources(corpus_key: str, body: ResolveSourcesBody):
         return _call(service.resolve_sources, corpus_key, [item.model_dump() for item in body.probes])
