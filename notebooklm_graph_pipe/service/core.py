@@ -32,7 +32,7 @@ class CorpusService:
         self.conversations = conversations
         self.ingestions = ingestions
 
-    def resolve_sources(self, key: str, probes: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    def resolve_sources(self, key: str, probes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
         if not 1 <= len(probes) <= 100:
             raise ValueError("Source resolution accepts between 1 and 100 probes.")
         entry = self.registry.get(key)
@@ -43,50 +43,56 @@ class CorpusService:
             corpus_id=entry.manifest.corpus_id,
         )
         results: list[dict[str, Any]] = []
-        try:
-            for index, probe in enumerate(probes):
-                identity = SourceIdentity(
-                    corpus_id=entry.manifest.corpus_id,
-                    provider=str(probe.get("provider") or ""),
-                    provider_source_id=str(probe.get("provider_source_id") or ""),
-                    title=str(probe.get("title") or "discovery probe"),
-                    source_type=str(probe.get("source_type") or "document"),
-                    canonical_uri=str(probe["canonical_uri"]) if probe.get("canonical_uri") else None,
-                    content_checksum=str(probe.get("content_checksum") or ""),
-                    notebooklm_source_id=(
-                        str(probe["notebooklm_source_id"])
-                        if probe.get("notebooklm_source_id")
-                        else None
-                    ),
+        for index, probe in enumerate(probes):
+            identity = SourceIdentity(
+                corpus_id=entry.manifest.corpus_id,
+                provider=str(probe.get("connector_id") or probe.get("provider") or ""),
+                provider_source_id=str(
+                    probe.get("provider_id") or probe.get("provider_source_id") or ""
+                ),
+                title=str(probe.get("title") or "discovery probe"),
+                source_type=str(probe.get("source_type") or "document"),
+                canonical_uri=str(probe["canonical_uri"]) if probe.get("canonical_uri") else None,
+                content_checksum=str(probe.get("content_checksum") or ""),
+                notebooklm_source_id=(
+                    str(probe["notebooklm_source_id"])
+                    if probe.get("notebooklm_source_id")
+                    else None
+                ),
+            )
+            if not any(
+                (
+                    identity.provider and identity.provider_source_id,
+                    identity.canonical_uri,
+                    identity.content_checksum,
+                    identity.notebooklm_source_id,
                 )
-                if not any(
-                    (
-                        identity.provider and identity.provider_source_id,
-                        identity.canonical_uri,
-                        identity.content_checksum,
-                        identity.notebooklm_source_id,
-                    )
-                ):
-                    raise ValueError(f"Source probe {index} has no exact identity field.")
-                try:
-                    match = store.resolve_ledger_source(identity)
-                except SourceIdentityConflict as exc:
-                    results.append(
-                        {
-                            "index": index,
-                            "status": "conflict",
-                            "ledger_source_ids": sorted(
-                                str(item["ledger_source_id"]) for item in exc.matches
-                            ),
-                        }
-                    )
-                    continue
+            ):
+                raise ValueError(f"Source probe {index} has no exact identity field.")
+            try:
+                match = store.resolve_ledger_source(identity)
+            except SourceIdentityConflict as exc:
                 results.append(
-                    {"index": index, "status": "matched" if match else "novel", "match": match}
+                    {
+                        "index": index,
+                        "classification": "conflict",
+                        "source_id": None,
+                        "match_reason": "conflicting-exact-identities",
+                        "ledger_source_ids": sorted(
+                            str(item["ledger_source_id"]) for item in exc.matches
+                        ),
+                    }
                 )
-        finally:
-            store.close()
-        return results
+                continue
+            results.append(
+                {
+                    "index": index,
+                    "classification": "existing-unchanged" if match else "new",
+                    "source_id": str(match["ledger_source_id"]) if match else None,
+                    "match_reason": "exact-ledger-identity" if match else "no-exact-match",
+                }
+            )
+        return {"results": results}
 
     def submit_ingestion(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self.ingestions is None:
