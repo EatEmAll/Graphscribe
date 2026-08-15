@@ -9,9 +9,10 @@ from fastapi.testclient import TestClient
 
 from notebooklm_graph_pipe.ingestion.ids import corpus_id
 from notebooklm_graph_pipe.ingestion.manifest import CorpusManifest, SourceManifestEntry, load_manifest, save_manifest
-from notebooklm_graph_pipe.service.api import create_app
+from notebooklm_graph_pipe.service.api import create_app, create_source_resolution_app
 from notebooklm_graph_pipe.service.core import CorpusService
 from notebooklm_graph_pipe.service import core as core_module
+from notebooklm_graph_pipe.service import source_resolution as source_resolution_module
 from notebooklm_graph_pipe.service.registry import CorpusRegistry
 from notebooklm_graph_pipe.service.security import load_or_create_token
 
@@ -130,7 +131,7 @@ def test_source_resolution_reuses_runtime_driver_and_accepts_ratchetlab_fields(m
         def close(self):
             raise AssertionError("request-local source resolution must not close the runtime")
 
-    monkeypatch.setattr(core_module, "Neo4jCorpusStore", Store)
+    monkeypatch.setattr(source_resolution_module, "Neo4jCorpusStore", Store)
     manifest = CorpusManifest(corpus_id("demo"), "demo", "Demo", {"database": "neo4j"})
     service = CorpusService(
         SimpleNamespace(get=lambda _key: SimpleNamespace(manifest=manifest)),
@@ -152,6 +153,20 @@ def test_source_resolution_reuses_runtime_driver_and_accepts_ratchetlab_fields(m
         ("init", "shared-driver", "neo4j", manifest.corpus_id),
         ("resolve", "openalex-v1", "W123"),
     ]
+
+
+def test_lightweight_source_resolution_app_has_only_read_surface() -> None:
+    service = Service()
+    client = TestClient(create_source_resolution_app(service, "r" * 32))
+    headers = {"Authorization": f"Bearer {'r' * 32}"}
+
+    assert client.get("/health").json() == {"status": "ok"}
+    response = client.post(
+        "/v1/corpora/demo/sources:resolve", headers=headers,
+        json={"probes": [{"connector_id": "crossref-v1", "provider_id": "10.1/x"}]},
+    )
+    assert response.json()["results"][0]["classification"] == "new"
+    assert client.post("/v1/corpora/demo/ingestions", headers=headers, json={}).status_code == 404
 
 
 def test_evaluation_endpoint_enforces_complete_metric_contract() -> None:

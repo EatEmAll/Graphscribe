@@ -166,6 +166,37 @@ def create_app(service: CorpusServiceApi, token: str, write_token: str | None = 
     return app
 
 
+def create_source_resolution_app(service: CorpusServiceApi, token: str) -> FastAPI:
+    """Create a read-only app that imports no retrieval or LLM runtime."""
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        service.close()
+
+    app = FastAPI(
+        title="Neo4j Corpus Source Resolution Service", version="1.0.0", lifespan=lifespan,
+    )
+
+    def authorize(authorization: str | None = Header(default=None)) -> None:
+        expected = f"Bearer {token}"
+        if authorization is None or not secrets.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="Invalid bearer token.")
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post(
+        "/v1/corpora/{corpus_key}/sources:resolve", dependencies=[Depends(authorize)],
+    )
+    def resolve_sources(corpus_key: str, body: ResolveSourcesBody):
+        return _call(
+            service.resolve_sources, corpus_key, [item.model_dump() for item in body.probes]
+        )
+
+    return app
+
+
 def _call(function, *args):
     try:
         return function(*args)

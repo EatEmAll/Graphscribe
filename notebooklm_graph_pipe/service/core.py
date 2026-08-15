@@ -7,7 +7,6 @@ from filelock import FileLock, Timeout
 
 from notebooklm_graph_pipe.ingestion.manifest import save_manifest
 from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
-from notebooklm_graph_pipe.ingestion.source_ledger import SourceIdentity, SourceIdentityConflict
 from notebooklm_graph_pipe.retrieval.hybrid import SearchRequest
 
 from .jobs import CorpusJobManager
@@ -15,6 +14,7 @@ from .conversation import ConversationStore, contextualize_question
 from .registry import CorpusRegistry
 from .runtime import RuntimeFactory
 from .ingestions import CorpusIngestionManager
+from .source_resolution import resolve_source_probes
 
 
 class CorpusService:
@@ -33,66 +33,9 @@ class CorpusService:
         self.ingestions = ingestions
 
     def resolve_sources(self, key: str, probes: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
-        if not 1 <= len(probes) <= 100:
-            raise ValueError("Source resolution accepts between 1 and 100 probes.")
-        entry = self.registry.get(key)
-        runtime = self.runtimes.get(entry)
-        store = Neo4jCorpusStore(
-            runtime.driver,
-            entry.manifest.neo4j.get("database") or "neo4j",
-            corpus_id=entry.manifest.corpus_id,
+        return resolve_source_probes(
+            self.registry, lambda entry: self.runtimes.get(entry).driver, key, probes,
         )
-        results: list[dict[str, Any]] = []
-        for index, probe in enumerate(probes):
-            identity = SourceIdentity(
-                corpus_id=entry.manifest.corpus_id,
-                provider=str(probe.get("connector_id") or probe.get("provider") or ""),
-                provider_source_id=str(
-                    probe.get("provider_id") or probe.get("provider_source_id") or ""
-                ),
-                title=str(probe.get("title") or "discovery probe"),
-                source_type=str(probe.get("source_type") or "document"),
-                canonical_uri=str(probe["canonical_uri"]) if probe.get("canonical_uri") else None,
-                content_checksum=str(probe.get("content_checksum") or ""),
-                notebooklm_source_id=(
-                    str(probe["notebooklm_source_id"])
-                    if probe.get("notebooklm_source_id")
-                    else None
-                ),
-            )
-            if not any(
-                (
-                    identity.provider and identity.provider_source_id,
-                    identity.canonical_uri,
-                    identity.content_checksum,
-                    identity.notebooklm_source_id,
-                )
-            ):
-                raise ValueError(f"Source probe {index} has no exact identity field.")
-            try:
-                match = store.resolve_ledger_source(identity)
-            except SourceIdentityConflict as exc:
-                results.append(
-                    {
-                        "index": index,
-                        "classification": "conflict",
-                        "source_id": None,
-                        "match_reason": "conflicting-exact-identities",
-                        "ledger_source_ids": sorted(
-                            str(item["ledger_source_id"]) for item in exc.matches
-                        ),
-                    }
-                )
-                continue
-            results.append(
-                {
-                    "index": index,
-                    "classification": "existing-unchanged" if match else "new",
-                    "source_id": str(match["ledger_source_id"]) if match else None,
-                    "match_reason": "exact-ledger-identity" if match else "no-exact-match",
-                }
-            )
-        return {"results": results}
 
     def submit_ingestion(self, key: str, payload: dict[str, Any]) -> dict[str, Any]:
         if self.ingestions is None:
