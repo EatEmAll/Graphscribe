@@ -2,12 +2,16 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 from neo4j import GraphDatabase
 
 from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
-from notebooklm_graph_pipe.ingestion.source_ledger import SourceIdentity, SourceIdentityConflict
+from notebooklm_graph_pipe.ingestion.source_ledger import (
+    SourceIdentity,
+    SourceIdentityConflict,
+)
 from notebooklm_graph_pipe.runtime.neo4j_connection import resolve_connection_mapping
 
 from .registry import CorpusRegistry, CorpusRegistryEntry
