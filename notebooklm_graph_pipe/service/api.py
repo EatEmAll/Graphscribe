@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import secrets
 import json
+import secrets
 from contextlib import asynccontextmanager
 from typing import Any, Protocol
 

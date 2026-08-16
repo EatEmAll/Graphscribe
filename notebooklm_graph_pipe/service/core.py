@@ -9,11 +9,11 @@ from notebooklm_graph_pipe.ingestion.manifest import save_manifest
 from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
 from notebooklm_graph_pipe.retrieval.hybrid import SearchRequest
 
-from .jobs import CorpusJobManager
 from .conversation import ConversationStore, contextualize_question
+from .ingestions import CorpusIngestionManager
+from .jobs import CorpusJobManager
 from .registry import CorpusRegistry
 from .runtime import RuntimeFactory
-from .ingestions import CorpusIngestionManager
 from .source_resolution import resolve_source_probes
 
 

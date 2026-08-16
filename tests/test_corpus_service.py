@@ -4,15 +4,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from filelock import FileLock
 from fastapi.testclient import TestClient
+from filelock import FileLock
 
 from notebooklm_graph_pipe.ingestion.ids import corpus_id
-from notebooklm_graph_pipe.ingestion.manifest import CorpusManifest, SourceManifestEntry, load_manifest, save_manifest
-from notebooklm_graph_pipe.service.api import create_app, create_source_resolution_app
-from notebooklm_graph_pipe.service.core import CorpusService
+from notebooklm_graph_pipe.ingestion.manifest import (
+    CorpusManifest,
+    SourceManifestEntry,
+    load_manifest,
+    save_manifest,
+)
 from notebooklm_graph_pipe.service import core as core_module
 from notebooklm_graph_pipe.service import source_resolution as source_resolution_module
+from notebooklm_graph_pipe.service.api import create_app, create_source_resolution_app
+from notebooklm_graph_pipe.service.core import CorpusService
 from notebooklm_graph_pipe.service.registry import CorpusRegistry
 from notebooklm_graph_pipe.service.security import load_or_create_token
 
@@ -126,7 +131,6 @@ def test_source_resolution_reuses_runtime_driver_and_accepts_ratchetlab_fields(m
 
         def resolve_ledger_source(self, identity):
             calls.append(("resolve", identity.provider, identity.provider_source_id))
-            return None
 
         def close(self):
             raise AssertionError("request-local source resolution must not close the runtime")
