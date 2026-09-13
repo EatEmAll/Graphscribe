@@ -49,6 +49,12 @@ class Service:
     def get_ingestion(self, ingestion_id):
         return {"id": ingestion_id, "status": "staged"}
 
+    def get_ingestion_evaluation_context(self, ingestion_id):
+        return {
+            "id": ingestion_id,
+            "schema_version": "graphscribe-staged-evaluation-context-v1",
+        }
+
     def evaluate_ingestion(self, ingestion_id, metrics):
         return {"id": ingestion_id, "status": "evaluated", "metrics": metrics}
 
@@ -189,12 +195,35 @@ def test_evaluation_endpoint_enforces_complete_metric_contract() -> None:
             "baseline_quality_ratio": 0.95,
             "effective_citation_ratio": 1,
             "unsupported_claim_delta": 0,
-            "graph_expansion_ratio": 0.9,
-            "capacity_headroom_ratio": 0.25,
-            "source_canary_retrieved": True,
         },
     )
     assert complete.status_code == 200
+    self_attested = client.post(
+        "/v1/ingestions/ingestion:evaluate",
+        headers=headers,
+        json={
+            "baseline_quality_ratio": 1,
+            "effective_citation_ratio": 1,
+            "unsupported_claim_delta": 0,
+            "source_canary_retrieved": True,
+        },
+    )
+    assert self_attested.status_code == 422
+
+
+def test_staged_evaluation_context_requires_write_authority() -> None:
+    client = TestClient(create_app(Service(), "r" * 32, "w" * 32))
+    read_headers = {"Authorization": f"Bearer {'r' * 32}"}
+    write_headers = {"Authorization": f"Bearer {'w' * 32}"}
+
+    path = "/v1/ingestions/ingestion/evaluation-context"
+    assert client.get(path, headers=read_headers).status_code == 401
+    response = client.get(path, headers=write_headers)
+    assert response.status_code == 200
+    assert response.json() == {
+        "id": "ingestion",
+        "schema_version": "graphscribe-staged-evaluation-context-v1",
+    }
 
 
 def test_answer_endpoint_accepts_global_mode() -> None:

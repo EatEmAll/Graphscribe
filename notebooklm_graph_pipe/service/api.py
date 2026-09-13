@@ -7,7 +7,7 @@ from typing import Any, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class CorpusServiceApi(Protocol):
@@ -55,12 +55,11 @@ class IngestionBody(BaseModel):
 
 
 class EvaluationBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     baseline_quality_ratio: float = Field(ge=0, le=2, allow_inf_nan=False)
     effective_citation_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
     unsupported_claim_delta: float = Field(allow_inf_nan=False)
-    graph_expansion_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
-    capacity_headroom_ratio: float = Field(ge=0, le=1, allow_inf_nan=False)
-    source_canary_retrieved: bool
 
 
 def create_app(service: CorpusServiceApi, token: str, write_token: str | None = None) -> FastAPI:
@@ -119,6 +118,13 @@ def create_app(service: CorpusServiceApi, token: str, write_token: str | None = 
     @app.get("/v1/ingestions/{ingestion_id}", dependencies=[Depends(authorize_write)])
     def ingestion(ingestion_id: str):
         return _call(service.get_ingestion, ingestion_id)
+
+    @app.get(
+        "/v1/ingestions/{ingestion_id}/evaluation-context",
+        dependencies=[Depends(authorize_write)],
+    )
+    def ingestion_evaluation_context(ingestion_id: str):
+        return _call(service.get_ingestion_evaluation_context, ingestion_id)
 
     @app.post("/v1/ingestions/{ingestion_id}:evaluate", dependencies=[Depends(authorize_write)])
     def evaluate_ingestion(ingestion_id: str, body: EvaluationBody):

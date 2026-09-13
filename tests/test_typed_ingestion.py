@@ -112,6 +112,87 @@ def test_staging_marks_vector_ready_without_creating_active_revision() -> None:
     assert "MERGE (document)-[:ACTIVE_REVISION]" not in query
 
 
+def test_staged_evaluation_context_is_measured_from_graph_state() -> None:
+    class Store:
+        def staged_revision_state(self, document_id, revision_id):
+            assert (document_id, revision_id) == ("document", "revision")
+            return {
+                "status": "STAGED",
+                "vector_ready": True,
+                "graph_ready": True,
+                "parent_count": 2,
+                "completed_parents": 2,
+                "retrievable_parents": 2,
+                "is_active": False,
+            }
+
+        def capacity_counts(self):
+            return {"nodes": 50_000, "relationships": 100_000}
+
+        def close(self):
+            pass
+
+    record = SimpleNamespace(
+        id="ingestion",
+        status="staged",
+        corpus_key="demo",
+        document_id="document",
+        revision_id="revision",
+        expected_parents=2,
+    )
+    manager = object.__new__(CorpusIngestionManager)
+    manager._records = {record.id: record}
+    manager.registry = SimpleNamespace(
+        get=lambda _key: SimpleNamespace(
+            manifest=SimpleNamespace(neo4j={"database": "neo4j"}, corpus_id="corpus")
+        )
+    )
+    manager.runtimes = SimpleNamespace(
+        get=lambda _entry: SimpleNamespace(driver="driver")
+    )
+    manager.store_factory = lambda *_args, **_kwargs: Store()
+    manager.maximum_nodes = 200_000
+    manager.maximum_relationships = 400_000
+
+    context = manager.evaluation_context(record.id)
+
+    assert context["metrics"] == {
+        "graph_expansion_ratio": 1.0,
+        "capacity_headroom_ratio": 0.75,
+        "source_canary_retrieved": True,
+    }
+    assert context["capacity"] == {
+        "nodes": 50_000,
+        "relationships": 100_000,
+        "maximum_nodes": 200_000,
+        "maximum_relationships": 400_000,
+    }
+
+
+def test_capacity_counts_preserve_empty_relationship_inventory() -> None:
+    calls = []
+
+    class Result:
+        def single(self):
+            return {"nodes": 3, "relationships": 0}
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query, **_parameters):
+            calls.append(query)
+            return Result()
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+
+    assert store.capacity_counts() == {"nodes": 3, "relationships": 0}
+    assert "OPTIONAL MATCH ()-[relationship]->()" in calls[0]
+
+
 def test_acceptance_can_require_graph_ready_staged_revision() -> None:
     calls: list[tuple[str, dict]] = []
 
