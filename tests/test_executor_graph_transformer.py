@@ -11,7 +11,11 @@ class Adapter:
     provider = "test"
     model = "test"
 
+    def __init__(self) -> None:
+        self.request = None
+
     def execute(self, request):
+        self.request = request
         return "", {
             "nodes": [
                 {"id": "a", "type": "System"},
@@ -25,8 +29,9 @@ class Adapter:
 
 
 def test_executor_graph_transformer_drops_relationships_with_unknown_endpoints() -> None:
+    adapter = Adapter()
     executor = ModelExecutor(
-        {"graph": Adapter()},
+        {"graph": adapter},
         {GRAPH_EXTRACTION_ROLE: "graph"},
     )
 
@@ -35,3 +40,4 @@ def test_executor_graph_transformer_drops_relationships_with_unknown_endpoints()
     assert [node.id for node in graph.nodes] == ["a", "b"]
     assert len(graph.relationships) == 1
     assert graph.relationships[0].type == "USES"
+    assert "source_id and target_id" in adapter.request.prompt

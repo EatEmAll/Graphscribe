@@ -4,14 +4,20 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from filelock import FileLock
 from fastapi.testclient import TestClient
+from filelock import FileLock
 
 from notebooklm_graph_pipe.ingestion.ids import corpus_id
-from notebooklm_graph_pipe.ingestion.manifest import CorpusManifest, SourceManifestEntry, load_manifest, save_manifest
-from notebooklm_graph_pipe.service.api import create_app
-from notebooklm_graph_pipe.service.core import CorpusService
+from notebooklm_graph_pipe.ingestion.manifest import (
+    CorpusManifest,
+    SourceManifestEntry,
+    load_manifest,
+    save_manifest,
+)
 from notebooklm_graph_pipe.service import core as core_module
+from notebooklm_graph_pipe.service import source_resolution as source_resolution_module
+from notebooklm_graph_pipe.service.api import create_app, create_source_resolution_app
+from notebooklm_graph_pipe.service.core import CorpusService
 from notebooklm_graph_pipe.service.registry import CorpusRegistry
 from notebooklm_graph_pipe.service.security import load_or_create_token
 
@@ -32,7 +38,10 @@ class Service:
         return {"id": job_id}
 
     def resolve_sources(self, key, probes):
-        return [{"index": 0, "status": "novel", "key": key, "probe": probes[0]}]
+        return {"results": [{
+            "index": 0, "classification": "new", "source_id": None,
+            "match_reason": "no-exact-match", "key": key, "probe": probes[0],
+        }]}
 
     def submit_ingestion(self, key, payload):
         return {"id": "ingestion", "corpus_key": key, **payload}
@@ -90,14 +99,19 @@ def test_search_endpoint_validates_and_delegates() -> None:
     assert response.json() == {"key": "demo", "query": "hello"}
 
 
-def test_typed_ingestion_endpoints_require_distinct_write_token() -> None:
+def test_resolution_is_read_only_and_ingestion_requires_distinct_write_token() -> None:
     client = TestClient(create_app(Service(), "r" * 32, "w" * 32))
     read_headers = {"Authorization": f"Bearer {'r' * 32}"}
     write_headers = {"Authorization": f"Bearer {'w' * 32}"}
     resolve = {"probes": [{"provider": "doi", "provider_source_id": "10.1/example"}]}
 
-    assert client.post("/v1/corpora/demo/sources:resolve", headers=read_headers, json=resolve).status_code == 401
-    assert client.post("/v1/corpora/demo/sources:resolve", headers=write_headers, json=resolve).json()[0]["status"] == "novel"
+    resolved = client.post(
+        "/v1/corpora/demo/sources:resolve", headers=read_headers, json=resolve,
+    )
+    assert resolved.json()["results"][0]["classification"] == "new"
+    assert client.post(
+        "/v1/corpora/demo/sources:resolve", headers=write_headers, json=resolve,
+    ).status_code == 401
     submitted = client.post(
         "/v1/corpora/demo/ingestions",
         headers=write_headers,
@@ -106,6 +120,57 @@ def test_typed_ingestion_endpoints_require_distinct_write_token() -> None:
     assert submitted.status_code == 202
     assert client.get("/v1/ingestions/ingestion", headers=read_headers).status_code == 401
     assert client.get("/v1/ingestions/ingestion", headers=write_headers).json()["status"] == "staged"
+
+
+def test_source_resolution_reuses_runtime_driver_and_accepts_ratchetlab_fields(monkeypatch):
+    calls = []
+
+    class Store:
+        def __init__(self, driver, database, *, corpus_id=None):
+            calls.append(("init", driver, database, corpus_id))
+
+        def resolve_ledger_source(self, identity):
+            calls.append(("resolve", identity.provider, identity.provider_source_id))
+
+        def close(self):
+            raise AssertionError("request-local source resolution must not close the runtime")
+
+    monkeypatch.setattr(source_resolution_module, "Neo4jCorpusStore", Store)
+    manifest = CorpusManifest(corpus_id("demo"), "demo", "Demo", {"database": "neo4j"})
+    service = CorpusService(
+        SimpleNamespace(get=lambda _key: SimpleNamespace(manifest=manifest)),
+        SimpleNamespace(get=lambda _entry: SimpleNamespace(driver="shared-driver")),
+        SimpleNamespace(),
+    )
+
+    first = service.resolve_sources("demo", [{
+        "connector_id": "crossref-v1", "provider_id": "10.1/fabricated",
+    }])
+    second = service.resolve_sources("demo", [{
+        "connector_id": "openalex-v1", "provider_id": "W123",
+    }])
+
+    assert first["results"][0]["classification"] == "new"
+    assert second["results"][0]["classification"] == "new"
+    assert calls[1:] == [
+        ("resolve", "crossref-v1", "10.1/fabricated"),
+        ("init", "shared-driver", "neo4j", manifest.corpus_id),
+        ("resolve", "openalex-v1", "W123"),
+    ]
+
+
+def test_lightweight_source_resolution_app_has_only_read_surface() -> None:
+    service = Service()
+    client = TestClient(create_source_resolution_app(service, "r" * 32))
+    headers = {"Authorization": f"Bearer {'r' * 32}"}
+
+    assert client.get("/health").json() == {"status": "ok"}
+    response = client.post(
+        "/v1/corpora/demo/sources:resolve", headers=headers,
+        json={"probes": [{"connector_id": "crossref-v1", "provider_id": "10.1/x"}]},
+    )
+    assert response.json()["results"][0]["classification"] == "new"
+    assert client.post("/v1/corpora/demo/ingestions", headers=headers, json={}).status_code == 404
 
 
 def test_evaluation_endpoint_enforces_complete_metric_contract() -> None:
