@@ -129,6 +129,16 @@ def test_staged_evaluation_context_is_measured_from_graph_state() -> None:
         def capacity_counts(self):
             return {"nodes": 50_000, "relationships": 100_000}
 
+        def staged_revision_failures(self, document_id, revision_id):
+            assert (document_id, revision_id) == ("document", "revision")
+            return [
+                {
+                    "parent_id": "parent-2",
+                    "attempts": 2,
+                    "graph_error": "RuntimeError: upstream rejected request",
+                }
+            ]
+
         def close(self):
             pass
 
@@ -167,6 +177,53 @@ def test_staged_evaluation_context_is_measured_from_graph_state() -> None:
         "maximum_nodes": 200_000,
         "maximum_relationships": 400_000,
     }
+    assert context["failures"] == [
+        {
+            "parent_id": "parent-2",
+            "attempts": 2,
+            "error_type": "RuntimeError",
+            "error_sha256": hashlib.sha256(
+                b"RuntimeError: upstream rejected request"
+            ).hexdigest(),
+            "message": "RuntimeError: upstream rejected request",
+        }
+    ]
+
+
+def test_staged_revision_failures_are_scoped_and_failed_only() -> None:
+    calls: list[tuple[str, dict]] = []
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return [
+                {
+                    "parent_id": "parent",
+                    "attempts": 3,
+                    "graph_error": "ValueError: invalid graph",
+                }
+            ]
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+
+    assert store.staged_revision_failures("document", "revision") == [
+        {
+            "parent_id": "parent",
+            "attempts": 3,
+            "graph_error": "ValueError: invalid graph",
+        }
+    ]
+    query, parameters = calls[0]
+    assert "Document {id: $document_id}" in query
+    assert "DocumentRevision {id: $revision_id}" in query
+    assert "parent.graph_status = 'FAILED'" in query
+    assert parameters == {"document_id": "document", "revision_id": "revision"}
 
 
 def test_capacity_counts_preserve_empty_relationship_inventory() -> None:

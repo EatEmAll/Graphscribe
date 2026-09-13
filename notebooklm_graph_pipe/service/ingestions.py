@@ -316,6 +316,9 @@ class CorpusIngestionManager:
         try:
             state = store.staged_revision_state(record.document_id, record.revision_id)
             capacity = store.capacity_counts()
+            failure_rows = store.staged_revision_failures(
+                record.document_id, record.revision_id
+            )
         finally:
             store.close()
         if not state or state.get("is_active") or state.get("status") != "STAGED":
@@ -327,6 +330,20 @@ class CorpusIngestionManager:
         relationship_headroom = (
             self.maximum_relationships - capacity["relationships"]
         ) / self.maximum_relationships
+        failures = []
+        for row in failure_rows:
+            message = str(row.get("graph_error") or "")
+            prefix, separator, _detail = message.partition(":")
+            error_type = prefix if separator and prefix.isidentifier() else "UnknownError"
+            failures.append(
+                {
+                    "parent_id": str(row.get("parent_id") or ""),
+                    "attempts": int(row.get("attempts") or 0),
+                    "error_type": error_type,
+                    "error_sha256": hashlib.sha256(message.encode("utf-8")).hexdigest(),
+                    "message": message[:1000],
+                }
+            )
         return {
             "schema_version": "graphscribe-staged-evaluation-context-v1",
             "id": record.id,
@@ -339,6 +356,7 @@ class CorpusIngestionManager:
                 "maximum_nodes": self.maximum_nodes,
                 "maximum_relationships": self.maximum_relationships,
             },
+            "failures": failures,
             "metrics": {
                 "graph_expansion_ratio": completed / expected if expected else 0.0,
                 "capacity_headroom_ratio": max(
