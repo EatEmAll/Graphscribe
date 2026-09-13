@@ -393,6 +393,7 @@ class CorpusIngestionManager:
             failures.append("graph_ready")
         record.evaluation = {"passed": not failures, "failures": sorted(set(failures)), "metrics": metrics, "state": state}
         record.status = "evaluated"
+        entry = self.registry.get(record.corpus_key)
         self._save(entry, record)
         return record
 
