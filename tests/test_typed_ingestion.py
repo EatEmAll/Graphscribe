@@ -190,6 +190,47 @@ def test_staged_evaluation_context_is_measured_from_graph_state() -> None:
     ]
 
 
+def test_evaluate_persists_against_the_ingestion_corpus_entry() -> None:
+    entry = object()
+    saved: list[tuple[object, object]] = []
+    record = SimpleNamespace(
+        id="ingestion",
+        status="staged",
+        corpus_key="demo",
+        document_id="document",
+        revision_id="revision",
+        expected_parents=2,
+        evaluation={},
+    )
+    manager = object.__new__(CorpusIngestionManager)
+    manager._records = {record.id: record}
+    manager.registry = SimpleNamespace(get=lambda key: entry if key == "demo" else None)
+    manager.evaluation_context = lambda _record_id: {
+        "state": {"graph_ready": True, "completed_parents": 2},
+        "metrics": {
+            "graph_expansion_ratio": 1.0,
+            "capacity_headroom_ratio": 0.75,
+            "source_canary_retrieved": True,
+        },
+    }
+    manager._save = lambda saved_entry, saved_record: saved.append(
+        (saved_entry, saved_record)
+    )
+
+    result = manager.evaluate(
+        record.id,
+        {
+            "baseline_quality_ratio": 1.0,
+            "effective_citation_ratio": 1.0,
+            "unsupported_claim_delta": 0.0,
+        },
+    )
+
+    assert result.status == "evaluated"
+    assert result.evaluation["passed"] is True
+    assert saved == [(entry, record)]
+
+
 def test_staged_revision_failures_are_scoped_and_failed_only() -> None:
     calls: list[tuple[str, dict]] = []
 
