@@ -216,7 +216,9 @@ class GraphExtractionWorker:
                 except GraphCapacityError:
                     raise
                 except Exception as exc:
-                    self.store.fail_parent_graph(parent["parent_id"], str(exc))
+                    self.store.fail_parent_graph(
+                        parent["parent_id"], f"{type(exc).__name__}: {exc}"
+                    )
                     return "failed"
 
         if self.max_concurrency <= 0:
