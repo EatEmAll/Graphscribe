@@ -42,7 +42,7 @@ def test_worker_isolates_parent_failures_and_finalizes_ready_revisions() -> None
     assert summary == {"requested": 2, "completed": 1, "failed": 1, "revisions_finalized": 1}
     assert store.saved[0][0] == "ok"
     assert store.saved[0][3] == "r1"
-    assert store.failed == [("bad", "bad graph")]
+    assert store.failed == [("bad", "RuntimeError: bad graph")]
 
 
 def test_worker_stops_without_marking_parent_failed_when_capacity_gate_fails() -> None:

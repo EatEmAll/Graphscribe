@@ -462,6 +462,27 @@ class Neo4jCorpusStore:
             ).single()
             return dict(row) if row else None
 
+    def staged_revision_failures(
+        self, document_id: str, revision_id: str
+    ) -> list[dict[str, Any]]:
+        """Return exact-revision parent failures for write-authority diagnosis."""
+        with self._session() as session:
+            rows = session.run(
+                """
+                MATCH (document:Document {id: $document_id})-[:HAS_REVISION]->
+                      (revision:DocumentRevision {id: $revision_id})-[:HAS_PARENT]->
+                      (parent:ParentChunk)
+                WHERE parent.graph_status = 'FAILED'
+                RETURN parent.id AS parent_id,
+                       coalesce(parent.graph_attempts, 0) AS attempts,
+                       coalesce(parent.graph_error, '') AS graph_error
+                ORDER BY parent.position, parent.id
+                """,
+                document_id=document_id,
+                revision_id=revision_id,
+            )
+            return [dict(row) for row in rows]
+
     def capacity_counts(self) -> dict[str, int]:
         """Return database-wide counts used by the hosted-capacity gate."""
         with self._session() as session:
