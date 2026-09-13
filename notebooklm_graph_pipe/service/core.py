@@ -54,6 +54,11 @@ class CorpusService:
             raise RuntimeError("Typed ingestion is not configured.")
         return asdict(self.ingestions.get(ingestion_id))
 
+    def get_ingestion_evaluation_context(self, ingestion_id: str) -> dict[str, Any]:
+        if self.ingestions is None:
+            raise RuntimeError("Typed ingestion is not configured.")
+        return self.ingestions.evaluation_context(ingestion_id)
+
     def evaluate_ingestion(self, ingestion_id: str, metrics: dict[str, Any]) -> dict[str, Any]:
         if self.ingestions is None:
             raise RuntimeError("Typed ingestion is not configured.")

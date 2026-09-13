@@ -25,6 +25,8 @@ from .runtime import RuntimeFactory
 
 
 TERMINAL = frozenset({"duplicate", "accepted", "rolled_back", "failed", "quarantined"})
+DEFAULT_MAXIMUM_NODES = 200_000
+DEFAULT_MAXIMUM_RELATIONSHIPS = 400_000
 
 
 def utc_now() -> str:
@@ -79,13 +81,19 @@ class CorpusIngestionManager:
         store_factory: Callable[..., Neo4jCorpusStore] = Neo4jCorpusStore,
         embedder_factory: Callable[[], MiniLMEmbedder] = MiniLMEmbedder,
         chunker_factory: Callable[[], HierarchicalChunker] | None = None,
+        maximum_nodes: int = DEFAULT_MAXIMUM_NODES,
+        maximum_relationships: int = DEFAULT_MAXIMUM_RELATIONSHIPS,
     ):
+        if maximum_nodes <= 0 or maximum_relationships <= 0:
+            raise ValueError("Neo4j capacity limits must be positive.")
         self.registry = registry
         self.runtimes = runtimes
         self.ingestion_root = ingestion_root.resolve()
         self.store_factory = store_factory
         self.embedder_factory = embedder_factory
         self.chunker_factory = chunker_factory or (lambda: HierarchicalChunker(load_minilm_tokenizer()))
+        self.maximum_nodes = maximum_nodes
+        self.maximum_relationships = maximum_relationships
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="corpus-ingestion")
         self._records: dict[str, IngestionRecord] = {}
         self._active_corpora: set[str] = set()
@@ -290,21 +298,65 @@ class CorpusIngestionManager:
         except KeyError as exc:
             raise KeyError(f"Ingestion not found: {record_id}") from exc
 
+    def evaluation_context(self, record_id: str) -> dict[str, Any]:
+        """Measure the staged-only metrics that an ingestion caller cannot attest."""
+        record = self.get(record_id)
+        if (
+            record.status not in {"staged", "evaluated"}
+            or not record.document_id
+            or not record.revision_id
+        ):
+            raise RuntimeError("Only a staged ingestion has an evaluation context.")
+        entry = self.registry.get(record.corpus_key)
+        store = self.store_factory(
+            self.runtimes.get(entry).driver,
+            entry.manifest.neo4j.get("database") or "neo4j",
+            corpus_id=entry.manifest.corpus_id,
+        )
+        try:
+            state = store.staged_revision_state(record.document_id, record.revision_id)
+            capacity = store.capacity_counts()
+        finally:
+            store.close()
+        if not state or state.get("is_active") or state.get("status") != "STAGED":
+            raise RuntimeError("Revision is not safely staged.")
+        expected = record.expected_parents
+        completed = int(state.get("completed_parents") or 0)
+        retrievable = int(state.get("retrievable_parents") or 0)
+        node_headroom = (self.maximum_nodes - capacity["nodes"]) / self.maximum_nodes
+        relationship_headroom = (
+            self.maximum_relationships - capacity["relationships"]
+        ) / self.maximum_relationships
+        return {
+            "schema_version": "graphscribe-staged-evaluation-context-v1",
+            "id": record.id,
+            "corpus_key": record.corpus_key,
+            "document_id": record.document_id,
+            "revision_id": record.revision_id,
+            "state": state,
+            "capacity": {
+                **capacity,
+                "maximum_nodes": self.maximum_nodes,
+                "maximum_relationships": self.maximum_relationships,
+            },
+            "metrics": {
+                "graph_expansion_ratio": completed / expected if expected else 0.0,
+                "capacity_headroom_ratio": max(
+                    0.0, min(node_headroom, relationship_headroom)
+                ),
+                "source_canary_retrieved": expected > 0 and retrievable == expected,
+            },
+        }
+
     def evaluate(self, record_id: str, metrics: dict[str, Any]) -> IngestionRecord:
         import math
 
         record = self.get(record_id)
         if record.status not in {"staged", "evaluated"} or not record.document_id or not record.revision_id:
             raise RuntimeError("Only a staged ingestion can be evaluated.")
-        entry = self.registry.get(record.corpus_key)
-        runtime = self.runtimes.get(entry)
-        store = self.store_factory(runtime.driver, entry.manifest.neo4j.get("database") or "neo4j", corpus_id=entry.manifest.corpus_id)
-        try:
-            state = store.staged_revision_state(record.document_id, record.revision_id)
-        finally:
-            store.close()
-        if not state or state.get("is_active") or state.get("status") != "STAGED":
-            raise RuntimeError("Revision is not safely staged.")
+        context = self.evaluation_context(record_id)
+        state = context["state"]
+        metrics = {**metrics, **context["metrics"]}
         required = {
             "baseline_quality_ratio": 0.95,
             "effective_citation_ratio": 1.0,
