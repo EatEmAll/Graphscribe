@@ -575,7 +575,7 @@ class Neo4jCorpusStore:
                     document.relative_path = revision.relative_path,
                     document.title = revision.title,
                     document.language = revision.language
-                WITH document, revision
+                WITH document, revision, actual
                 OPTIONAL MATCH (corpus:Corpus {id: $corpus_id})
                 FOREACH (_ IN CASE WHEN $ledger IS NULL THEN [] ELSE [1] END |
                     MERGE (source:CorpusSource {id: $ledger.id})

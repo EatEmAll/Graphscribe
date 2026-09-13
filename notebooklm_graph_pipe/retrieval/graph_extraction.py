@@ -118,7 +118,9 @@ class ExecutorGraphTransformer:
                 role=GRAPH_EXTRACTION_ROLE,
                 prompt=(
                     "Extract only entities and relationships explicitly supported by this parent chunk. "
-                    "Use stable concise entity IDs. Every relationship endpoint must name an extracted node.\n\n"
+                    "Use stable concise entity IDs. Return nodes with exactly the fields id, type, and optional "
+                    "properties. Return relationships with exactly the fields source_id, target_id, type, and "
+                    "optional properties; source_id and target_id must name extracted node IDs.\n\n"
                     f"Parent ID: {parent_id}\n\n{text}"
                 ),
                 system_instruction="Return a source-grounded property graph only.",
