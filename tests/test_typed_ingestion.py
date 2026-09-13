@@ -138,6 +138,7 @@ def test_acceptance_can_require_graph_ready_staged_revision() -> None:
     query, parameters = calls[0]
     assert "revision.status = 'STAGED'" in query
     assert "revision.graph_ready = true" in query
+    assert "WITH document, revision, actual" in query
     assert parameters["require_staged"] is True
 
 
