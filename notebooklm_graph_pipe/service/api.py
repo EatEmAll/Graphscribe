@@ -1,15 +1,19 @@
 from __future__ import annotations
 
-import secrets
 import json
+import secrets
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Protocol
 
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
-from .core import CorpusService
+
+class CorpusServiceApi(Protocol):
+    """Structural service boundary; importing HTTP schemas needs no LLM runtime."""
+
+    def close(self) -> None: ...
 
 
 class SearchBody(BaseModel):
@@ -29,6 +33,8 @@ class AnswerBody(BaseModel):
 
 
 class SourceProbe(BaseModel):
+    connector_id: str = Field(default="", max_length=100)
+    provider_id: str = Field(default="", max_length=500)
     provider: str = Field(default="", max_length=100)
     provider_source_id: str = Field(default="", max_length=500)
     canonical_uri: str | None = Field(default=None, max_length=4000)
@@ -57,7 +63,7 @@ class EvaluationBody(BaseModel):
     source_canary_retrieved: bool
 
 
-def create_app(service: CorpusService, token: str, write_token: str | None = None) -> FastAPI:
+def create_app(service: CorpusServiceApi, token: str, write_token: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         yield
@@ -97,7 +103,7 @@ def create_app(service: CorpusService, token: str, write_token: str | None = Non
 
     @app.post(
         "/v1/corpora/{corpus_key}/sources:resolve",
-        dependencies=[Depends(authorize_write)],
+        dependencies=[Depends(authorize)],
     )
     def resolve_sources(corpus_key: str, body: ResolveSourcesBody):
         return _call(service.resolve_sources, corpus_key, [item.model_dump() for item in body.probes])
@@ -156,6 +162,37 @@ def create_app(service: CorpusService, token: str, write_token: str | None = Non
     @app.delete("/v1/corpora/{corpus_key}/documents/{document_id}", dependencies=[Depends(authorize)])
     def delete_document(corpus_key: str, document_id: str):
         return _call(service.delete_document, corpus_key, document_id)
+
+    return app
+
+
+def create_source_resolution_app(service: CorpusServiceApi, token: str) -> FastAPI:
+    """Create a read-only app that imports no retrieval or LLM runtime."""
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        yield
+        service.close()
+
+    app = FastAPI(
+        title="Neo4j Corpus Source Resolution Service", version="1.0.0", lifespan=lifespan,
+    )
+
+    def authorize(authorization: str | None = Header(default=None)) -> None:
+        expected = f"Bearer {token}"
+        if authorization is None or not secrets.compare_digest(authorization, expected):
+            raise HTTPException(status_code=401, detail="Invalid bearer token.")
+
+    @app.get("/health")
+    def health():
+        return {"status": "ok"}
+
+    @app.post(
+        "/v1/corpora/{corpus_key}/sources:resolve", dependencies=[Depends(authorize)],
+    )
+    def resolve_sources(corpus_key: str, body: ResolveSourcesBody):
+        return _call(
+            service.resolve_sources, corpus_key, [item.model_dump() for item in body.probes]
+        )
 
     return app
 
