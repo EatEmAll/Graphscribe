@@ -451,12 +451,34 @@ class Neo4jCorpusStore:
                        revision.graph_ready AS graph_ready, count(parent) AS parent_count,
                        count(CASE WHEN parent.graph_status = 'COMPLETED' THEN 1 END)
                            AS completed_parents,
+                       count(CASE WHEN parent.graph_status = 'COMPLETED'
+                                        AND parent.embedding IS NOT NULL
+                                        AND trim(coalesce(parent.text, '')) <> ''
+                                  THEN 1 END) AS retrievable_parents,
                        EXISTS { MATCH (document)-[:ACTIVE_REVISION]->(revision) } AS is_active
                 """,
                 document_id=document_id,
                 revision_id=revision_id,
             ).single()
             return dict(row) if row else None
+
+    def capacity_counts(self) -> dict[str, int]:
+        """Return database-wide counts used by the hosted-capacity gate."""
+        with self._session() as session:
+            row = session.run(
+                """
+                MATCH (node)
+                WITH count(node) AS nodes
+                OPTIONAL MATCH ()-[relationship]->()
+                RETURN nodes, count(relationship) AS relationships
+                """
+            ).single()
+            if row is None:
+                raise RuntimeError("Neo4j capacity inventory is unavailable.")
+            return {
+                "nodes": int(row["nodes"]),
+                "relationships": int(row["relationships"]),
+            }
 
     def rollback_failed_accept(
         self,
