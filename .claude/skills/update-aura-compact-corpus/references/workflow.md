@@ -1,6 +1,6 @@
 # Operator reference
 
-Use `docs/AURA_COMPACT_CORPUS_UPDATES.md` as the canonical command reference.
+Use the operator's local Aura compact workflow notes as the canonical command reference; this file records the decision points only.
 
 ## Decision points
 

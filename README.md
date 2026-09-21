@@ -4,7 +4,7 @@
 
 See [Local Neo4j Corpus RAG](docs/LOCAL_CORPUS_RAG.md) for the primary setup, migration, API, MCP, and operations guide.
 
-For routine additions to the Aura-authoritative compact parent-vector corpus, use the revision-scoped [Aura compact corpus update workflow](docs/AURA_COMPACT_CORPUS_UPDATES.md) or invoke `$update-aura-compact-corpus`. It updates parent embeddings and graph evidence without rerunning full consolidation.
+For routine additions to an Aura-authoritative compact parent-vector corpus, the `update-aura-compact-corpus` skill drives a revision-scoped workflow that updates parent embeddings and graph evidence without rerunning full consolidation.
 
 ## Primary Local Pipeline
 

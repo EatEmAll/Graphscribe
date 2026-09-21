@@ -11,5 +11,4 @@ data/corpora/
 data/migrations/
 data/notebooklm_exports/
 docs/*
-!docs/AURA_COMPACT_CORPUS_UPDATES.md
 !docs/LOCAL_CORPUS_RAG.md

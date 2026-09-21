@@ -1,3 +1,4 @@
+import os
 from dataclasses import replace
 
 import pytest
@@ -7,7 +8,8 @@ from notebooklm_graph_pipe.ingestion.models import CanonicalBlock, CanonicalDocu
 from notebooklm_graph_pipe.ingestion.source_ledger import canonical_uri, identity_from_document
 
 
-CORPUS_ID = "11111111-1111-1111-1111-111111111111"
+# Any UUID works; this identifies nothing. Override to exercise a real corpus.
+CORPUS_ID = os.environ.get("GRAPHSCRIBE_TEST_CORPUS_ID", "11111111-1111-1111-1111-111111111111")
 
 
 def document(**metadata):

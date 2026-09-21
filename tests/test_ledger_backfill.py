@@ -1,12 +1,14 @@
 import json
+import os
 
 import pytest
 
 from notebooklm_graph_pipe.ingestion.ledger_backfill import backfill_run_id, reconcile_inventory
 
 
-CORPUS_ID = "11111111-1111-1111-1111-111111111111"
-NOTEBOOK_ID = "00000000-0000-0000-0000-000000000000"
+# Any UUID works; these identify nothing. Override to exercise a real corpus.
+CORPUS_ID = os.environ.get("GRAPHSCRIBE_TEST_CORPUS_ID", "11111111-1111-1111-1111-111111111111")
+NOTEBOOK_ID = os.environ.get("GRAPHSCRIBE_TEST_NOTEBOOK_ID", "00000000-0000-0000-0000-000000000000")
 
 
 def inventory(tmp_path, rows):
