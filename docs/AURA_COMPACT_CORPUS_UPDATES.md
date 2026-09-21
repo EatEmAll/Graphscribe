@@ -7,7 +7,14 @@ Routine updates are incremental: every changed source creates an immutable `Docu
 ## Preconditions
 
 1. Use the active `neo4j-quant-aura-compact` manifest and confirm `unit: parent`, `parent_embedding_v1`, and `parent_keyword_v1`.
-2. Set the password environment variable named by `neo4j.password_env`.
+2. Set the password environment variable named by `neo4j.password_env`, then confirm the instance is reachable and ready before any other command:
+
+   ```powershell
+   python scripts/check_corpus_connection.py `
+     --manifest-path <compact-manifest.json>
+   ```
+
+   This is read-only. Require exit code `0`: the `Corpus` node present, and `parent_embedding_v1` and `parent_keyword_v1` both `ONLINE` at 100%. Record the reported counts as the structural baseline for the batch. See [Verify a connection](LOCAL_CORPUS_RAG.md#verify-a-connection) for exit codes and failure interpretation.
 3. Audit the Aura `CorpusSource` ledger before ingestion. Aura identity takes precedence over the local manifest and path, so renamed or moved files reuse their mapped `Document`.
 4. Immediately before executed consolidation, open the instance in Aura Console, choose **Snapshots**, take an on-demand snapshot, wait for it to become exportable, and download the `.backup` file. AuraDB Free supports on-demand snapshots; see Neo4j's [backup, export, and restore guide](https://neo4j.com/docs/aura/managing-instances/backup-restore-export/). Revision rollback cannot reverse APOC entity merges.
 5. Preserve at least 25% capacity headroom. Override the default Aura limits only if the target tier differs.
@@ -76,7 +83,7 @@ The worker creates `ParentChunk-[:HAS_ENTITY]->Entity` evidence and records enti
 
 ## 3. Validate before consolidation
 
-Run the fixed hosted question set in text-hybrid and graph-hybrid modes. Require expected documents and parent counts, both parent indexes `ONLINE` at 100%, valid citations to active revisions, no increase in unsupported claims, grounded graph evidence, and sufficient Aura node/relationship headroom.
+Run the fixed hosted question set in text-hybrid (`hybrid`) and graph-hybrid (`graph_hybrid`) modes. Require expected documents and parent counts, both parent indexes `ONLINE` at 100%, valid citations to active revisions, no increase in unsupported claims, grounded graph evidence, and sufficient Aura node/relationship headroom.
 
 ```powershell
 python scripts/run_corpus_evaluation.py `

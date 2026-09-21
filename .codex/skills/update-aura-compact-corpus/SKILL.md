@@ -10,7 +10,7 @@ Read [references/workflow.md](references/workflow.md) before taking any mutating
 ## Required sequence
 
 1. Locate the active compact manifest and verify its parent retrieval profile.
-2. Resolve Aura only from that manifest and require the exact target confirmation. Never substitute a local Neo4j instance.
+2. Resolve Aura only from that manifest and require the exact target confirmation. Never substitute a local Neo4j instance. Confirm reachability first with the read-only `scripts/check_corpus_connection.py --manifest-path <compact-manifest.json>` and require exit code `0` before any mutating step.
 3. Run `scripts/source_ledger.py audit`, inventory capacity, and establish a pre-update retrieval and grounding baseline.
 4. Add only explicitly named files or YouTube URLs with `scripts/update_compact_corpus.py`. Resolve exact ledger identity before embedding and preserve the emitted new and previous revision IDs.
 5. Run `scripts/process_graph_queue.py` until every new revision is graph-ready.

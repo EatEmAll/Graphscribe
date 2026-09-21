@@ -29,6 +29,15 @@ Quick start:
 .\.venv\Scripts\python.exe scripts\serve_corpus_api.py
 ```
 
+Check an existing corpus before using it. `scripts/check_corpus_connection.py` is read-only and resolves the connection from the manifest the same way REST, MCP, extraction, and sync do:
+
+```powershell
+.\.venv\Scripts\python.exe scripts\check_corpus_connection.py `
+  --manifest-path data\corpora\<corpus-key>\manifest.json
+```
+
+See [Verify a connection](docs/LOCAL_CORPUS_RAG.md#verify-a-connection).
+
 ## Legacy NotebookLM Pipeline
 
 Retained temporarily for blue-green migration and historical benchmark compatibility. `sync_notebook_graph.py` is deprecated and delegates to the local corpus synchronizer when executed directly. See [Legacy NotebookLM Pipeline](docs/LEGACY_NOTEBOOKLM_PIPELINE.md) for the full setup, migration, and getting-started guide.
