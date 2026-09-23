@@ -192,7 +192,7 @@ def test_phase_upload_and_extract_propagates_retry_condition(tmp_path: Path) -> 
     ]
 
 
-def test_build_graph_parse_args_accepts_dataset_registry_defaults(monkeypatch) -> None:
+def test_build_graph_parse_args_accepts_dataset_registry_defaults(monkeypatch, tmp_path: Path) -> None:
     entry = dr.DatasetRegistryEntry(
         key="bench-imdb-scifi",
         notebook=dr.RegistryNotebook(id="nb-1", title="bench-imdb-scifi"),
@@ -204,7 +204,8 @@ def test_build_graph_parse_args_accepts_dataset_registry_defaults(monkeypatch) -
         ),
     )
     monkeypatch.setattr(bg, "load_dataset_entry", lambda dataset_key, registry_path=None: entry)
-    monkeypatch.setattr(bg, "default_sources_dir", lambda dataset_key: Path("C:/tmp/bench-imdb-scifi/sources"))
+    sources_dir = tmp_path / "bench-imdb-scifi" / "sources"
+    monkeypatch.setattr(bg, "default_sources_dir", lambda dataset_key: sources_dir)
     monkeypatch.setattr(bg.sys, "argv", ["build_graph.py", "--dataset-key", "bench-imdb-scifi"])
 
     args = bg.parse_args()
@@ -213,7 +214,7 @@ def test_build_graph_parse_args_accepts_dataset_registry_defaults(monkeypatch) -
     assert args.neo4j_user == "neo4j"
     assert args.neo4j_password == "pw-123"
     assert args.neo4j_database == "neo4j"
-    assert args.sources_dir == "C:\\tmp\\bench-imdb-scifi\\sources"
+    assert args.sources_dir == str(sources_dir)
 
 
 def test_dataset_registry_defaults_use_config_dir() -> None:

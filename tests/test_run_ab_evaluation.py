@@ -177,7 +177,27 @@ def test_run_answer_generation_retries_when_codex_exits_without_final_message(
 ) -> None:
     dataset = ab.dataset_specs()["bench-openalex-rag"]
     question = ab.QuestionSpec("OA01", "Question text")
-    entry = ab.load_dataset_entry("bench-openalex-rag")
+    registry_path = tmp_path / "benchmark_dataset_registry.json"
+    registry_path.write_text(
+        json.dumps(
+            {
+                "datasets": {
+                    "bench-openalex-rag": {
+                        "notebook": {"id": "nb-openalex", "title": "bench-openalex-rag"},
+                        "neo4j": {
+                            "uri": "bolt://127.0.0.1:17687",
+                            "username": "neo4j",
+                            "password_env": "GRAPHSCRIBE_TEST_NEO4J_PASSWORD",
+                            "database": "neo4j",
+                        },
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("GRAPHSCRIBE_TEST_NEO4J_PASSWORD", "pw-test")
+    entry = ab.load_dataset_entry("bench-openalex-rag", registry_path)
     calls: list[int] = []
 
     def fake_run_codex_exec(**kwargs: object) -> tuple[str, list[str], str]:

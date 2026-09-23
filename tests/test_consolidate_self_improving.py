@@ -1,5 +1,6 @@
 import json
 import subprocess
+import types
 from pathlib import Path
 
 import pytest
@@ -489,15 +490,22 @@ def test_resolve_cli_executable_prefers_cmd_over_bare_shim_on_windows(monkeypatc
             self.returncode = 0
             self.stdout = stdout
 
-    monkeypatch.setattr(csi.os, "name", "nt")
-    monkeypatch.setattr(csi.shutil, "which", lambda executable: f"C:\\tools\\{executable}.cmd")
-    monkeypatch.setattr(
-        csi.subprocess,
-        "run",
-        lambda *args, **kwargs: FakeCompletedProcess("C:\\tools\\opencode\nC:\\tools\\opencode.cmd\n"),
-    )
+    # Simulate Windows only inside the module under test. Patching the global
+    # ``os.name`` would make ``pathlib.Path`` try to build a ``WindowsPath``,
+    # which cannot be instantiated on POSIX hosts.
+    fake_os = types.SimpleNamespace(name="nt")
+    where_calls: list[list[str]] = []
+
+    def fake_run(args: list[str], **kwargs: object) -> FakeCompletedProcess:
+        where_calls.append(list(args))
+        return FakeCompletedProcess("C:\\tools\\opencode\nC:\\tools\\opencode.cmd\n")
+
+    monkeypatch.setattr(csi, "os", fake_os)
+    monkeypatch.setattr(csi.shutil, "which", lambda executable: f"C:\\tools\\{executable}")
+    monkeypatch.setattr(csi.subprocess, "run", fake_run)
 
     assert csi._resolve_cli_executable("opencode") == "C:\\tools\\opencode.cmd"
+    assert where_calls == [["where.exe", "opencode"]]
 
 
 def test_extract_opencode_text_prefers_text_events() -> None:

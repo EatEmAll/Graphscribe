@@ -246,4 +246,4 @@ def test_parse_args_accepts_dataset_registry_defaults(monkeypatch) -> None:
     assert args.neo4j_user == "neo4j"
     assert args.neo4j_password == "pw-123"
     assert args.neo4j_database == "neo4j"
-    assert args.run_dir.endswith("runs\\bench-openalex-rag\\postprocess_20260325_1015")
+    assert Path(args.run_dir) == ppg.RUNS_DIR / "bench-openalex-rag" / "postprocess_20260325_1015"
