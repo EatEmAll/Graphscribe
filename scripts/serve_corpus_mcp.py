@@ -22,13 +22,16 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Serve corpus research tools over MCP stdio.")
     parser.add_argument("--registry-root", default=str(REPO_ROOT / "data" / "corpora"))
     parser.add_argument("--llm-routing-config")
+    parser.add_argument(
+        "--conversations-path", default=str(REPO_ROOT / ".local" / "conversations.sqlite3")
+    )
     args = parser.parse_args()
     registry = CorpusRegistry(Path(args.registry_root))
     service = CorpusService(
         registry,
         RuntimeFactory(args.llm_routing_config),
         CorpusJobManager(registry, REPO_ROOT),
-        ConversationStore(REPO_ROOT / ".local" / "conversations.sqlite3"),
+        ConversationStore(Path(args.conversations_path)),
     )
     create_mcp_server(service).run(transport="stdio")
 

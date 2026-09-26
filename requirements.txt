@@ -11,5 +11,5 @@ pyarrow
 lancedb>=0.36,<0.37
 docling
 markdown-it-py
-mcp[cli]
+mcp[cli]<2
 yt-dlp

@@ -28,6 +28,9 @@ def main() -> None:
     parser.add_argument("--token-path", default=str(REPO_ROOT / ".local" / "api_token"))
     parser.add_argument("--write-token-path", default=str(REPO_ROOT / ".local" / "write_api_token"))
     parser.add_argument("--ingestion-root", default=str(REPO_ROOT / ".local" / "ingestion"))
+    parser.add_argument(
+        "--conversations-path", default=str(REPO_ROOT / ".local" / "conversations.sqlite3")
+    )
     parser.add_argument("--llm-routing-config")
     parser.add_argument("--port", type=int, default=8765)
     args = parser.parse_args()
@@ -37,7 +40,7 @@ def main() -> None:
         registry,
         runtimes,
         CorpusJobManager(registry, REPO_ROOT),
-        ConversationStore(REPO_ROOT / ".local" / "conversations.sqlite3"),
+        ConversationStore(Path(args.conversations_path)),
         CorpusIngestionManager(registry, runtimes, Path(args.ingestion_root)),
     )
     app = create_app(
