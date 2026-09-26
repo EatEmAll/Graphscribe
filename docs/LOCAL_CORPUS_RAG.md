@@ -93,6 +93,8 @@ The routing file may configure `single_prompt.graph_extraction` and `single_prom
 The service binds to `127.0.0.1:8765`. On first start it creates a bearer token at `.local/api_token`. `/health` is public on loopback; all `/v1` endpoints require `Authorization: Bearer <token>`.
 Corpus metadata returned by REST or MCP omits the stored Neo4j password.
 
+REST and MCP keep conversation history in `.local/conversations.sqlite3` by default. A deployment that must keep runtime state outside the checkout passes `--registry-root`, `--token-path`, `--write-token-path`, `--ingestion-root`, and `--conversations-path` (the source-resolution service takes `--registry-root` and `--token-path`).
+
 Key endpoints:
 
 - `GET /v1/corpora`
