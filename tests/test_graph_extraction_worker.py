@@ -12,8 +12,10 @@ class Store:
     def __init__(self):
         self.saved = []
         self.failed = []
+        self.scopes = []
 
-    def pending_graph_parents(self, limit):
+    def pending_graph_parents(self, limit, *, revision_id=None):
+        self.scopes.append(("pending", revision_id))
         return [
             {"revision_id": "r1", "parent_id": "ok", "text": "good", "child_ids": ["c1"]},
             {"revision_id": "r1", "parent_id": "bad", "text": "bad", "child_ids": ["c2"]},
@@ -25,7 +27,8 @@ class Store:
     def fail_parent_graph(self, parent_id, message):
         self.failed.append((parent_id, message))
 
-    def finalize_graph_revisions(self):
+    def finalize_graph_revisions(self, revision_id=None):
+        self.scopes.append(("finalize", revision_id))
         return 1
 
 
@@ -60,3 +63,9 @@ def test_worker_stops_without_marking_parent_failed_when_capacity_gate_fails() -
 
     assert store.saved == []
     assert store.failed == []
+
+
+def test_worker_confines_pending_and_finalization_to_one_revision() -> None:
+    store = Store()
+    asyncio.run(GraphExtractionWorker(store, Transformer()).run_batch(revision_id="r1"))
+    assert store.scopes == [("pending", "r1"), ("finalize", "r1")]

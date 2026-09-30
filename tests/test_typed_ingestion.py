@@ -379,3 +379,208 @@ def test_failed_accept_rollback_restores_previous_revision_and_removes_new_ledge
     assert parameters["remove_new_ledger"] is True
     assert parameters["previous_ledger"]["title"] == "Old title"
     assert parameters["previous_document"]["title"] == "Old document title"
+
+
+class _RecordingSession:
+    def __init__(self, calls, row=None):
+        self.calls = calls
+        self.row = row or {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def run(self, query, **parameters):
+        self.calls.append((query, parameters))
+        row = self.row
+
+        class Result:
+            def single(self):
+                return row
+
+            def __iter__(self):
+                return iter(())
+
+        return Result()
+
+
+def test_rollback_removes_the_document_it_alone_created_and_reruns_cleanup() -> None:
+    calls: list[str] = []
+
+    class Store:
+        def fail_revision(self, revision_id, message):
+            calls.append(f"fail:{revision_id}")
+
+        def garbage_collect(self, *, revision_ids):
+            calls.append(f"gc:{revision_ids}")
+            return {"revisions": 1, "chunks": 0, "parents": 5, "relationships": 0, "entities": 0}
+
+        def remove_unrevisioned_document(self, document_id):
+            calls.append(f"orphan:{document_id}")
+            return 1
+
+        def active_revision_for_document(self, document_id):
+            return None
+
+        def close(self):
+            pass
+
+    record = SimpleNamespace(
+        id="ingestion", status="staged", corpus_key="demo", document_id="document",
+        revision_id="revision", previous_revision_id=None, rollback_cleanups=[],
+    )
+    manager = object.__new__(CorpusIngestionManager)
+    manager._records = {record.id: record}
+    manager.registry = SimpleNamespace(
+        get=lambda _key: SimpleNamespace(
+            manifest=SimpleNamespace(neo4j={"database": "neo4j"}, corpus_id="corpus")
+        )
+    )
+    manager.runtimes = SimpleNamespace(get=lambda _entry: SimpleNamespace(driver="driver"))
+    manager.store_factory = lambda *_args, **_kwargs: Store()
+    manager._save = lambda _entry, _record: None
+
+    manager.rollback(record.id)
+    manager.rollback(record.id)
+
+    assert record.status == "rolled_back"
+    assert calls == [
+        "fail:revision", "gc:['revision']", "orphan:document",
+        "gc:['revision']", "orphan:document",
+    ]
+    assert [cleanup["documents"] for cleanup in record.rollback_cleanups] == [1, 1]
+
+
+def test_rollback_of_a_revision_update_keeps_the_existing_document() -> None:
+    class Store:
+        def fail_revision(self, revision_id, message):
+            pass
+
+        def garbage_collect(self, *, revision_ids):
+            return {}
+
+        def remove_unrevisioned_document(self, document_id):
+            raise AssertionError("an updated document must survive rollback")
+
+        def active_revision_for_document(self, document_id):
+            return {"revision_id": "old"}
+
+        def close(self):
+            pass
+
+    record = SimpleNamespace(
+        id="ingestion", status="staged", corpus_key="demo", document_id="document",
+        revision_id="new", previous_revision_id="old", rollback_cleanups=[],
+    )
+    manager = object.__new__(CorpusIngestionManager)
+    manager._records = {record.id: record}
+    manager.registry = SimpleNamespace(
+        get=lambda _key: SimpleNamespace(
+            manifest=SimpleNamespace(neo4j={"database": "neo4j"}, corpus_id="corpus")
+        )
+    )
+    manager.runtimes = SimpleNamespace(get=lambda _entry: SimpleNamespace(driver="driver"))
+    manager.store_factory = lambda *_args, **_kwargs: Store()
+    manager._save = lambda _entry, _record: None
+
+    manager.rollback(record.id)
+
+    assert record.rollback_cleanups[0]["documents"] == 0
+
+
+def test_unrevisioned_document_removal_is_guarded() -> None:
+    calls: list[tuple[str, dict]] = []
+    store = Neo4jCorpusStore(
+        SimpleNamespace(session=lambda **kwargs: _RecordingSession(calls, {"documents": 1}))
+    )
+
+    assert store.remove_unrevisioned_document("document") == 1
+    query, parameters = calls[0]
+    assert "NOT (document)-[:HAS_REVISION]->()" in query
+    assert "NOT (document)-[:ACTIVE_REVISION]->()" in query
+    assert "NOT ()-[:MATERIALIZED_AS]->(document)" in query
+    assert parameters == {"document_id": "document"}
+
+
+def test_staging_extracts_the_graph_of_only_its_revision() -> None:
+    runs: list[tuple[int, str]] = []
+
+    class Worker:
+        def __init__(self):
+            self.remaining = 1
+
+        async def run_batch(self, limit, *, revision_id):
+            runs.append((limit, revision_id))
+            failed, self.remaining = self.remaining, 0
+            return {"requested": 2, "completed": 2 - failed, "failed": failed, "revisions_finalized": 1 - failed}
+
+    manager = object.__new__(CorpusIngestionManager)
+    manager.graph_worker_factory = lambda _store, _entry: Worker()
+    record = SimpleNamespace(expected_parents=2, revision_id="revision")
+
+    result = manager._extract_staged_graph(object(), object(), record)
+
+    assert runs == [(2, "revision"), (2, "revision")]
+    assert [item["failed"] for item in result["passes"]] == [1, 0]
+
+
+def test_measurement_reports_do_not_break_record_reload(tmp_path: Path) -> None:
+    registry_root = tmp_path / "registry"
+    corpus_dir = registry_root / "demo"
+    (corpus_dir / "ingestions").mkdir(parents=True)
+    entry = SimpleNamespace(key="demo", manifest_path=corpus_dir / "manifest.json")
+    record = {
+        "id": "ingestion", "corpus_key": "demo", "idempotency_key": "k",
+        "package_sha256": "a" * 64, "package_path": "p", "status": "staged",
+        "created_at": "t", "updated_at": "t", "document_id": "document",
+        "revision_id": "revision",
+    }
+    (corpus_dir / "ingestions" / "ingestion.json").write_text(json.dumps(record), encoding="utf-8")
+    manager = object.__new__(CorpusIngestionManager)
+    manager.registry = SimpleNamespace(root=registry_root, get=lambda _key: entry)
+    manager._records = {}
+    manager._load_records()
+
+    binding = manager.record_measurement(
+        "ingestion", {"question_set_sha256": "q", "metrics": {"baseline_quality_ratio": 1.0}}
+    )
+    reloaded = object.__new__(CorpusIngestionManager)
+    reloaded.registry = manager.registry
+    reloaded._records = {}
+    reloaded._load_records()
+
+    report = corpus_dir / "ingestions" / "measurements" / "ingestion.json"
+    assert hashlib.sha256(report.read_bytes()).hexdigest() == binding["report_sha256"]
+    assert reloaded._records["ingestion"].measurement["question_set_sha256"] == "q"
+
+
+def test_rollback_refuses_a_revision_that_a_later_ingestion_activated() -> None:
+    class Store:
+        def active_revision_for_document(self, document_id):
+            return {"revision_id": "revision"}
+
+        def fail_revision(self, revision_id, message):
+            raise AssertionError("an active revision must never be failed")
+
+        def close(self):
+            pass
+
+    record = SimpleNamespace(
+        id="ingestion", status="rolled_back", corpus_key="demo", document_id="document",
+        revision_id="revision", previous_revision_id=None, rollback_cleanups=[],
+    )
+    manager = object.__new__(CorpusIngestionManager)
+    manager._records = {record.id: record}
+    manager.registry = SimpleNamespace(
+        get=lambda _key: SimpleNamespace(
+            manifest=SimpleNamespace(neo4j={"database": "neo4j"}, corpus_id="corpus")
+        )
+    )
+    manager.runtimes = SimpleNamespace(get=lambda _entry: SimpleNamespace(driver="driver"))
+    manager.store_factory = lambda *_args, **_kwargs: Store()
+
+    with pytest.raises(RuntimeError, match="revision is active"):
+        manager.rollback(record.id)
+    assert record.rollback_cleanups == []

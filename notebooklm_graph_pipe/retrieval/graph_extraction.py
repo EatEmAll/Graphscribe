@@ -125,7 +125,9 @@ class ExecutorGraphTransformer:
                 ),
                 system_instruction="Return a source-grounded property graph only.",
                 response_schema=GRAPH_SCHEMA,
-                max_output_tokens=4096,
+                # Gemini 2.5 counts thinking tokens against this cap; a dense 879-character
+                # parent spent 4,739 thinking and 1,816 answer tokens, so 4,096 truncated it.
+                max_output_tokens=16384,
                 cache_namespace="graph-extraction",
                 idempotency_key=parent_id,
             )
@@ -196,8 +198,9 @@ class GraphExtractionWorker:
         )
         return cls(store, ExecutorGraphTransformer(executor), capacity_guard, max_concurrency=max_concurrency)
 
-    async def run_batch(self, limit: int = 100) -> dict[str, int]:
-        parents = self.store.pending_graph_parents(limit)
+    async def run_batch(self, limit: int = 100, *, revision_id: str | None = None) -> dict[str, int]:
+        """Extract pending parents; ``revision_id`` confines work to one (staged) revision."""
+        parents = self.store.pending_graph_parents(limit, revision_id=revision_id)
         semaphore = asyncio.Semaphore(self.max_concurrency)
 
         async def process(parent: dict[str, Any]) -> str:
@@ -232,7 +235,7 @@ class GraphExtractionWorker:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        finalized = self.store.finalize_graph_revisions()
+        finalized = self.store.finalize_graph_revisions(revision_id)
         return {
             "requested": len(parents),
             "completed": outcomes.count("completed"),

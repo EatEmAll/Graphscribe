@@ -715,7 +715,9 @@ class Neo4jCorpusStore:
                 revision_id=revision_id,
             ).consume()
 
-    def pending_graph_parents(self, limit: int = 100) -> list[dict[str, Any]]:
+    def pending_graph_parents(
+        self, limit: int = 100, *, revision_id: str | None = None
+    ) -> list[dict[str, Any]]:
         scope = (
             "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
             "(revision:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk)"
@@ -727,6 +729,7 @@ class Neo4jCorpusStore:
                 f"""
                 {scope}
                 WHERE revision.vector_ready = true AND revision.graph_ready = false
+                  AND ($revision_id IS NULL OR revision.id = $revision_id)
                   AND parent.graph_status IN ['PENDING', 'FAILED', 'PROVISIONAL']
                 OPTIONAL MATCH (parent)-[:HAS_CHILD]->(chunk:Chunk)
                 RETURN revision.id AS revision_id, parent.id AS parent_id, parent.text AS text,
@@ -738,6 +741,7 @@ class Neo4jCorpusStore:
                 """,
                 limit=limit,
                 corpus_id=self.corpus_id,
+                revision_id=revision_id,
             )
             return [dict(row) for row in rows]
 
@@ -977,7 +981,7 @@ class Neo4jCorpusStore:
                 message=message[:2000],
             ).consume()
 
-    def finalize_graph_revisions(self) -> int:
+    def finalize_graph_revisions(self, revision_id: str | None = None) -> int:
         scope = (
             "MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:HAS_REVISION]->"
             "(revision:DocumentRevision)"
@@ -989,6 +993,7 @@ class Neo4jCorpusStore:
                 f"""
                 {scope}
                 WHERE revision.vector_ready = true AND revision.graph_ready = false
+                  AND ($revision_id IS NULL OR revision.id = $revision_id)
                   AND NOT EXISTS {{
                     MATCH (revision)-[:HAS_PARENT]->(parent:ParentChunk)
                     WHERE parent.graph_status <> 'COMPLETED'
@@ -997,6 +1002,7 @@ class Neo4jCorpusStore:
                 RETURN count(revision) AS count
                 """,
                 corpus_id=self.corpus_id,
+                revision_id=revision_id,
             ).single()
             return int(row["count"]) if row else 0
 
@@ -1054,6 +1060,23 @@ class Neo4jCorpusStore:
                 revision_id=revision_id,
                 message=message[:2000],
             ).consume()
+
+    def remove_unrevisioned_document(self, document_id: str) -> int:
+        """Delete a Document left with no revision, active pointer, or ledger materialization."""
+        with self._session() as session:
+            row = session.run(
+                """
+                MATCH (document:Document {id: $document_id})
+                WHERE NOT (document)-[:HAS_REVISION]->()
+                  AND NOT (document)-[:ACTIVE_REVISION]->()
+                  AND NOT ()-[:MATERIALIZED_AS]->(document)
+                WITH collect(document) AS documents
+                FOREACH (document IN documents | DETACH DELETE document)
+                RETURN size(documents) AS documents
+                """,
+                document_id=document_id,
+            ).single()
+            return int(row["documents"]) if row else 0
 
     def garbage_collect(
         self,
