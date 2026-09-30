@@ -9,6 +9,7 @@ from typing import Any, Callable, Protocol
 from langchain_core.documents import Document
 from langchain_openai import ChatOpenAI
 
+from notebooklm_graph_pipe.retrieval.entity_vocabulary import EntityVocabulary
 from notebooklm_graph_pipe.runtime.llm_routing import (
     GRAPH_EXTRACTION_ROLE,
     PromptRoleConfig,
@@ -109,10 +110,12 @@ class LangChainGraphTransformer:
 
 
 class ExecutorGraphTransformer:
-    def __init__(self, executor: ModelExecutor):
+    def __init__(self, executor: ModelExecutor, vocabulary: EntityVocabulary | None = None):
         self.executor = executor
+        self.vocabulary = vocabulary
 
     async def transform(self, text: str, parent_id: str) -> Any:
+        vocabulary = f"{self.vocabulary.prompt_block()}\n\n" if self.vocabulary else ""
         result = await self.executor.aexecute_json(
             ModelRequest(
                 role=GRAPH_EXTRACTION_ROLE,
@@ -121,7 +124,7 @@ class ExecutorGraphTransformer:
                     "Use stable concise entity IDs. Return nodes with exactly the fields id, type, and optional "
                     "properties. Return relationships with exactly the fields source_id, target_id, type, and "
                     "optional properties; source_id and target_id must name extracted node IDs.\n\n"
-                    f"Parent ID: {parent_id}\n\n{text}"
+                    f"{vocabulary}Parent ID: {parent_id}\n\n{text}"
                 ),
                 system_instruction="Return a source-grounded property graph only.",
                 response_schema=GRAPH_SCHEMA,
@@ -156,7 +159,8 @@ class ExecutorGraphTransformer:
                     properties=dict(raw.get("properties") or {}),
                 )
             )
-        return SimpleNamespace(nodes=list(nodes.values()), relationships=relationships)
+        graph = SimpleNamespace(nodes=list(nodes.values()), relationships=relationships)
+        return self.vocabulary.apply(graph, text) if self.vocabulary else graph
 
 
 @dataclass
@@ -165,6 +169,7 @@ class GraphExtractionWorker:
     transformer: GraphTransformer
     capacity_guard: Callable[[int, int], None] | None = None
     max_concurrency: int = 4
+    vocabulary: EntityVocabulary | None = None
 
     @classmethod
     def from_routing_config(
@@ -176,6 +181,7 @@ class GraphExtractionWorker:
         cache_path: str | None = None,
         metrics_path: str | None = None,
         max_concurrency: int = 4,
+        vocabulary: EntityVocabulary | None = None,
     ) -> "GraphExtractionWorker":
         role = resolve_prompt_role(
             config_path,
@@ -196,12 +202,44 @@ class GraphExtractionWorker:
             cache_path=cache_path,
             metrics_path=metrics_path,
         )
-        return cls(store, ExecutorGraphTransformer(executor), capacity_guard, max_concurrency=max_concurrency)
+        return cls(
+            store,
+            ExecutorGraphTransformer(executor, vocabulary),
+            capacity_guard,
+            max_concurrency=max_concurrency,
+            vocabulary=vocabulary,
+        )
 
     async def run_batch(self, limit: int = 100, *, revision_id: str | None = None) -> dict[str, int]:
         """Extract pending parents; ``revision_id`` confines work to one (staged) revision."""
         parents = self.store.pending_graph_parents(limit, revision_id=revision_id)
+        outcomes = await self._process(parents)
+        finalized = self.store.finalize_graph_revisions(revision_id)
+        return {
+            "requested": len(parents),
+            "completed": outcomes.count("completed"),
+            "failed": outcomes.count("failed"),
+            "revisions_finalized": finalized,
+        }
+
+    async def run_vocabulary_backfill(self, limit: int = 100) -> dict[str, int]:
+        """Re-extract active parents that mention the vocabulary but predate its fingerprint."""
+        if self.vocabulary is None:
+            raise ValueError("Vocabulary backfill requires an entity vocabulary.")
+        parents = self.store.vocabulary_graph_parents(
+            self.vocabulary.mention_pattern, self.vocabulary.fingerprint, limit
+        )
+        outcomes = await self._process(parents)
+        return {
+            "requested": len(parents),
+            "completed": outcomes.count("completed"),
+            "failed": outcomes.count("failed"),
+        }
+
+    async def _process(self, parents: list[dict[str, Any]]) -> list[str]:
         semaphore = asyncio.Semaphore(self.max_concurrency)
+        # Parents extracted with a vocabulary record its fingerprint so a backfill skips them.
+        marker = {"vocabulary_fingerprint": self.vocabulary.fingerprint} if self.vocabulary else {}
 
         async def process(parent: dict[str, Any]) -> str:
             async with semaphore:
@@ -214,6 +252,7 @@ class GraphExtractionWorker:
                         parent["child_ids"],
                         graph_document,
                         revision_id=parent.get("revision_id"),
+                        **marker,
                     )
                     return "completed"
                 except GraphCapacityError:
@@ -235,10 +274,4 @@ class GraphExtractionWorker:
                     task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             raise
-        finalized = self.store.finalize_graph_revisions(revision_id)
-        return {
-            "requested": len(parents),
-            "completed": outcomes.count("completed"),
-            "failed": outcomes.count("failed"),
-            "revisions_finalized": finalized,
-        }
+        return outcomes
