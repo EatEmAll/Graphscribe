@@ -62,7 +62,17 @@ class GroundedAnswerer:
         )
         return cls(retriever, role, client, executor=executor)
 
-    def answer(self, question: str, *, mode: str = "graph_hybrid", graph_hops: int = 1) -> dict[str, Any]:
+    def answer(
+        self,
+        question: str,
+        *,
+        mode: str = "graph_hybrid",
+        graph_hops: int = 1,
+        include_cited_text: bool = False,
+    ) -> dict[str, Any]:
+        """Answer from retrieved context; ``include_cited_text`` adds each cited context verbatim
+        so an evaluation judge sees the evidence the answer model saw, not a 280-character preview.
+        """
         result = self.retriever.search(
             SearchRequest(question, mode=mode, graph_hops=graph_hops, include_diagnostics=True)
         )
@@ -90,7 +100,9 @@ class GroundedAnswerer:
                         prompt=prompt,
                         system_instruction="You are a source-grounded research assistant. Never invent citations.",
                         response_schema=ANSWER_SCHEMA,
-                        max_output_tokens=4096,
+                        # Gemini 2.5 counts thinking tokens against this cap; 4,096
+                        # truncated some answers into "Answer generation failed".
+                        max_output_tokens=16384,
                         cache_namespace="grounded-answer",
                     )
                 ).payload
@@ -104,7 +116,7 @@ class GroundedAnswerer:
                 model_name=self.role.model,
                 prompt=prompt,
                 system_instruction="You are a source-grounded research assistant. Never invent citations.",
-                max_output_tokens=4096,
+                max_output_tokens=16384,
                 temperature=0.0,
                 reasoning_effort=self.role.reasoning_effort,
                 max_attempts=2,
@@ -135,7 +147,12 @@ class GroundedAnswerer:
                 warnings.append("The generated answer did not contain a valid source citation.")
         return {
             "answer": answer,
-            "citations": [valid[citation].citation_payload() for citation in citation_ids],
+            "citations": [
+                {**valid[citation].citation_payload(), "text": valid[citation].text}
+                if include_cited_text
+                else valid[citation].citation_payload()
+                for citation in citation_ids
+            ],
             "retrieval": result.diagnostics,
             "warnings": warnings,
         }

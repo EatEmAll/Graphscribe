@@ -64,6 +64,57 @@ class CorpusService:
             raise RuntimeError("Typed ingestion is not configured.")
         return asdict(self.ingestions.evaluate(ingestion_id, metrics))
 
+    def measure_ingestion(self, ingestion_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+        """Answer fixed questions on the active corpus and on a staged-revision preview."""
+        from dataclasses import replace
+
+        from notebooklm_graph_pipe.retrieval.hybrid import HybridRetriever
+        from scripts.run_corpus_evaluation import EvaluationModel
+
+        from .staged_evaluation import measure_staged_revision
+
+        if self.ingestions is None:
+            raise RuntimeError("Typed ingestion is not configured.")
+        record, entry = self.ingestions.staged_preview(ingestion_id)
+        runtime = self.runtimes.get(entry)
+        base = runtime.retriever
+        if base.vector_retriever is not runtime.backend:
+            raise ValueError("Staged preview requires the corpus's Neo4j vector retrieval.")
+        preview = HybridRetriever(
+            runtime.backend.with_preview(record.document_id, record.revision_id),
+            base.embedder,
+            base.reranker,
+            context_tokenizer=base.context_tokenizer,
+            context_budget=base.context_budget,
+            max_parents=base.max_parents,
+        )
+        baseline_answerer = self.runtimes.get_answerer(entry)
+        preview_answerer = replace(baseline_answerer, retriever=preview)
+        measurement = measure_staged_revision(
+            list(payload["questions"]),
+            staged_document_id=record.document_id,
+            baseline_answer=lambda question, mode: baseline_answerer.answer(
+                question, mode=mode, include_cited_text=True
+            ),
+            preview_answer=lambda question, mode: preview_answerer.answer(
+                question, mode=mode, include_cited_text=True
+            ),
+            judge=EvaluationModel.from_routing_config(self.runtimes.llm_routing_config).judge,
+        )
+        binding = self.ingestions.record_measurement(ingestion_id, measurement)
+        return {
+            "schema_version": "graphscribe-staged-measurement-v1",
+            "id": record.id,
+            "corpus_key": record.corpus_key,
+            "document_id": record.document_id,
+            "revision_id": record.revision_id,
+            "report_sha256": binding["report_sha256"],
+            "question_set_sha256": measurement["question_set_sha256"],
+            "metrics": measurement["metrics"],
+            "diagnostics": measurement["diagnostics"],
+            "questions": measurement["questions"],
+        }
+
     def accept_ingestion(self, ingestion_id: str) -> dict[str, Any]:
         if self.ingestions is None:
             raise RuntimeError("Typed ingestion is not configured.")

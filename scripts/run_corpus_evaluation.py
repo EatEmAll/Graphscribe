@@ -168,7 +168,8 @@ class EvaluationModel:
             model_name=self.judge_role.model,
             prompt=prompt,
             system_instruction="You are a strict retrieval evaluation judge. Use no outside knowledge.",
-            max_output_tokens=2048,
+            # Gemini 2.5 counts thinking tokens against this cap; 2,048 truncated judgments.
+            max_output_tokens=8192,
             temperature=0.0,
             reasoning_effort=self.judge_role.reasoning_effort,
             max_attempts=2,

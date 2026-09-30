@@ -92,6 +92,22 @@ def test_grounded_answerer_removes_invalid_citations() -> None:
     assert "invalid model citations" in answer["warnings"][0]
 
 
+def test_evaluation_answers_carry_the_full_cited_context_and_room_for_thinking() -> None:
+    seen = {}
+
+    def generator(client, **kwargs):
+        seen.update(kwargs)
+        return {"answer": "Supported [S1].", "citation_ids": ["S1"]}, ""
+
+    answerer = GroundedAnswerer(retriever(), PromptRoleConfig("genai", "test"), object(), generator)
+    plain = answerer.answer("question")
+    judged = answerer.answer("question", include_cited_text=True)
+
+    assert "text" not in plain["citations"][0]
+    assert judged["citations"][0]["text"].startswith(judged["citations"][0]["quote_preview"])
+    assert seen["max_output_tokens"] == 16384
+
+
 def test_no_context_returns_insufficient_evidence() -> None:
     backend = Backend()
     backend.vector_search = lambda embedding, limit, filters=None: []
@@ -312,3 +328,47 @@ def test_parent_backend_uses_declared_indexes_and_parent_paths() -> None:
 def test_backend_rejects_unsafe_index_names() -> None:
     with pytest.raises(ValueError, match="index names"):
         Neo4jRetrievalBackend(object(), "neo4j", "corpus", vector_index="bad-name")
+
+
+def test_preview_backend_exposes_only_the_named_staged_revision() -> None:
+    from types import SimpleNamespace
+
+    from notebooklm_graph_pipe.retrieval.neo4j_backend import Neo4jRetrievalBackend
+
+    calls: list[tuple[str, dict]] = []
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return iter(())
+
+    driver = SimpleNamespace(session=lambda **kwargs: Session())
+    active = Neo4jRetrievalBackend(
+        driver, "neo4j", "corpus", retrieval_unit="parent",
+        vector_index="parent_embedding_v1", keyword_index="parent_keyword_v1",
+    )
+    preview = active.with_preview("document", "revision")
+
+    active.parent_contexts(["p"])
+    preview.parent_contexts(["p"])
+    preview.graph_expand(["p"], 1, 5)
+    (active_query, active_parameters), (preview_query, preview_parameters), (graph_query, _) = calls
+
+    assert "-[:ACTIVE_REVISION]->(revision:DocumentRevision)" in active_query
+    assert "document.status = 'READY'" in active_query
+    assert active_parameters["preview_revision_id"] is None
+    assert "-[:HAS_REVISION]->(revision:DocumentRevision)" in preview_query
+    assert "revision.id = $preview_revision_id" in preview_query
+    assert "document.id <> $preview_document_id" in preview_query
+    assert preview_parameters["preview_document_id"] == "document"
+    assert preview_parameters["preview_revision_id"] == "revision"
+    assert "(seed_revision.id = $preview_revision_id" in graph_query
+    assert "(source_revision.id = $preview_revision_id" in graph_query
+    with pytest.raises(ValueError, match="parent retrieval"):
+        Neo4jRetrievalBackend(driver, "neo4j", "corpus", preview=("d", "r"))

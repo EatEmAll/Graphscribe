@@ -104,6 +104,14 @@ Key endpoints:
 - `GET /v1/jobs/{job_id}`
 - `GET/DELETE /v1/corpora/{key}/documents/{document_id}`
 
+Typed source-package ingestion uses the separate write token (`--write-token-path`):
+
+- `POST /v1/corpora/{key}/ingestions` stages a package. Staging embeds the parents and extracts the graph of that revision only, with the capacity-headroom guard; the revision stays invisible to active search.
+- `GET /v1/ingestions/{id}` and `GET /v1/ingestions/{id}/evaluation-context` report status and the measured graph, canary, and capacity metrics.
+- `POST /v1/ingestions/{id}:measure` takes up to 20 fixed questions, answers each in `hybrid` and `graph_hybrid` on the active corpus and on a read-only preview in which the staged revision replaces its document's active one, judges both with each cited context in full, and returns `baseline_quality_ratio`, `effective_citation_ratio`, and `unsupported_claim_delta` plus per-question scores. Identical answers reuse one judgment. The full report is kept beside the ingestion record.
+- `POST /v1/ingestions/{id}:evaluate` gates those metrics; `:accept` activates a passing revision atomically.
+- `POST /v1/ingestions/{id}:rollback` retires a pre-acceptance revision and removes a `Document` left with no revision. Repeating it on a rolled-back ingestion reruns only that cleanup.
+
 Retrieval modes are `vector`, `lexical`, `hybrid`, and `graph_hybrid`. `graph_hybrid` is the default. These four are the only accepted values; any other `mode` is rejected with `Unsupported retrieval mode`. Evaluation output and prose elsewhere call `hybrid` "text-hybrid" to contrast it with `graph_hybrid`, but `hybrid` is the value the API accepts.
 
 Candidates carry `rrf_score`, `reranker_score`, and per-channel `channel_ranks` rather than a single `score` field. Rank on those; a bare `score` key is absent from search results.

@@ -16,9 +16,12 @@ class Neo4jRetrievalBackend:
         retrieval_unit: str = "chunk",
         vector_index: str = "chunk_embedding_v1",
         keyword_index: str = "chunk_keyword_v1",
+        preview: tuple[str, str] | None = None,
     ):
         if retrieval_unit not in {"chunk", "parent"}:
             raise ValueError(f"Unsupported retrieval unit: {retrieval_unit}")
+        if preview is not None and retrieval_unit != "parent":
+            raise ValueError("Staged-revision preview requires parent retrieval.")
         if any(not re.fullmatch(r"[A-Za-z0-9_]+", name) for name in (vector_index, keyword_index)):
             raise ValueError("Retrieval index names may contain only letters, digits, and underscores.")
         self.driver = driver
@@ -27,12 +30,49 @@ class Neo4jRetrievalBackend:
         self.retrieval_unit = retrieval_unit
         self.vector_index = vector_index
         self.keyword_index = keyword_index
+        self.preview = preview
+
+    def with_preview(self, document_id: str, revision_id: str) -> "Neo4jRetrievalBackend":
+        """Return a read-only view where one staged revision replaces its document's active one."""
+        return Neo4jRetrievalBackend(
+            self.driver,
+            self.database,
+            self.corpus_id,
+            retrieval_unit=self.retrieval_unit,
+            vector_index=self.vector_index,
+            keyword_index=self.keyword_index,
+            preview=(document_id, revision_id),
+        )
+
+    def _revision_edge(self) -> str:
+        return "HAS_REVISION" if self.preview else "ACTIVE_REVISION"
+
+    def _visible(self, document: str, revision: str) -> str:
+        """Preview visibility: the staged revision, or another document's active revision."""
+        return (
+            f"({revision}.id = $preview_revision_id OR ({document}.id <> $preview_document_id "
+            f"AND EXISTS {{ ({document})-[:ACTIVE_REVISION]->({revision}) }}))"
+        )
+
+    def _ready(self, document: str = "document", revision: str = "revision") -> str:
+        """Readiness predicate; without a preview it is the unchanged active-corpus predicate."""
+        if not self.preview:
+            return f"{document}.status = 'READY'"
+        return (
+            f"({revision}.id = $preview_revision_id OR ({document}.status = 'READY' "
+            f"AND {document}.id <> $preview_document_id "
+            f"AND EXISTS {{ ({document})-[:ACTIVE_REVISION]->({revision}) }}))"
+        )
+
+    def _preview_parameters(self) -> dict[str, str | None]:
+        document_id, revision_id = self.preview or (None, None)
+        return {"preview_document_id": document_id, "preview_revision_id": revision_id}
 
     def _retrieval_match(self) -> str:
         if self.retrieval_unit == "parent":
             return (
                 "MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)"
-                "-[:ACTIVE_REVISION]->(revision:DocumentRevision)-[:HAS_PARENT]->(unit:ParentChunk)"
+                f"-[:{self._revision_edge()}]->(revision:DocumentRevision)-[:HAS_PARENT]->(unit:ParentChunk)"
             )
         return (
             "MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)"
@@ -117,7 +157,7 @@ class Neo4jRetrievalBackend:
                         CALL db.index.vector.queryNodes('{self.vector_index}', $query_limit, $embedding)
                         YIELD node AS unit, score
                         {retrieval_match}
-                        WHERE revision.vector_ready = true AND document.status = 'READY'
+                        WHERE revision.vector_ready = true AND {self._ready()}
                           AND ($document_ids = [] OR document.id IN $document_ids)
                           AND ($source_types = [] OR document.source_type IN $source_types)
                           AND ($language IS NULL OR document.language = $language)
@@ -130,6 +170,7 @@ class Neo4jRetrievalBackend:
                         limit=limit,
                         corpus_id=self.corpus_id,
                         **filter_values,
+                        **self._preview_parameters(),
                     )
                 )
                 candidates = [self._candidate(dict(row)) for row in rows]
@@ -161,7 +202,7 @@ class Neo4jRetrievalBackend:
                         CALL db.index.fulltext.queryNodes('{self.keyword_index}', $search_text, {{limit: $query_limit}})
                         YIELD node AS unit, score
                         {retrieval_match}
-                        WHERE revision.vector_ready = true AND document.status = 'READY'
+                        WHERE revision.vector_ready = true AND {self._ready()}
                           AND ($document_ids = [] OR document.id IN $document_ids)
                           AND ($source_types = [] OR document.source_type IN $source_types)
                           AND ($language IS NULL OR document.language = $language)
@@ -174,6 +215,7 @@ class Neo4jRetrievalBackend:
                         limit=limit,
                         corpus_id=self.corpus_id,
                         **filter_values,
+                        **self._preview_parameters(),
                     )
                 )
                 candidates = [self._candidate(dict(row)) for row in rows]
@@ -204,12 +246,14 @@ class Neo4jRetrievalBackend:
         if self.retrieval_unit == "parent":
             seed_match = (
                 "MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(seed_document:Document)"
-                "-[:ACTIVE_REVISION]->(seed_revision:DocumentRevision)-[:HAS_PARENT]->"
+                f"-[:{self._revision_edge()}]->(seed_revision:DocumentRevision)-[:HAS_PARENT]->"
                 "(seed_parent:ParentChunk {id: seed_id})"
             )
+            if self.preview:
+                seed_match += f"\nWHERE {self._visible('seed_document', 'seed_revision')}"
             evidence_match = (
                 "MATCH (reached)<-[evidence_mention:HAS_ENTITY]-(unit:ParentChunk)"
-                "<-[:HAS_PARENT]-(revision:DocumentRevision)<-[:ACTIVE_REVISION]-(document:Document)"
+                f"<-[:HAS_PARENT]-(revision:DocumentRevision)<-[:{self._revision_edge()}]-(document:Document)"
                 "<-[:HAS_DOCUMENT]-(corpus)"
             )
             candidate_projection = self._candidate_projection().replace("unit.", "unit.")
@@ -228,6 +272,17 @@ class Neo4jRetrievalBackend:
             )
             candidate_projection = self._candidate_projection()
             seed_exclusion = "NOT unit.id IN $seed_ids"
+        source_support = (
+            "MATCH (source_parent:ParentChunk {id: parent_id})<-[:HAS_PARENT]-"
+            "(source_revision:DocumentRevision)<-[:ACTIVE_REVISION]-(:Document)<-[:HAS_DOCUMENT]-(corpus)"
+        )
+        if self.preview:
+            source_support = (
+                "MATCH (source_parent:ParentChunk {id: parent_id})<-[:HAS_PARENT]-"
+                "(source_revision:DocumentRevision)<-[:HAS_REVISION]-(source_document:Document)"
+                "<-[:HAS_DOCUMENT]-(corpus) "
+                f"WHERE {self._visible('source_document', 'source_revision')}"
+            )
         query = f"""
             UNWIND $seed_ids AS seed_id
             {seed_match}
@@ -239,7 +294,7 @@ class Neo4jRetrievalBackend:
               }} <= $max_entity_degree
             MATCH path=(origin)-[*0..{max_path}]-(reached:__Entity__)
             {evidence_match}
-            WHERE revision.graph_ready = true AND document.status = 'READY' AND {seed_exclusion}
+            WHERE revision.graph_ready = true AND {self._ready()} AND {seed_exclusion}
               AND coalesce(evidence_mention.extraction_state, 'VERIFIED') = 'VERIFIED'
               AND ($document_ids = [] OR document.id IN $document_ids)
               AND ($source_types = [] OR document.source_type IN $source_types)
@@ -252,7 +307,7 @@ class Neo4jRetrievalBackend:
                   WHERE NOT type(rel) IN $excluded_relationships
                     AND any(parent_id IN coalesce(rel.source_parent_ids, [])
                             WHERE NOT parent_id IN coalesce(rel.provisional_parent_ids, []) AND EXISTS {{
-                        MATCH (source_parent:ParentChunk {{id: parent_id}})<-[:HAS_PARENT]-(source_revision:DocumentRevision)<-[:ACTIVE_REVISION]-(:Document)<-[:HAS_DOCUMENT]-(corpus)
+                        {source_support}
                     }}))
             RETURN DISTINCT {candidate_projection}, origin.id AS origin_entity,
                    reached.id AS reached_entity, length(path) AS hops
@@ -269,6 +324,7 @@ class Neo4jRetrievalBackend:
                     max_entity_degree=1000,
                     excluded_relationships=["HAS_ENTITY", "PART_OF", "NEXT_CHUNK", "IN_REVISION", "HAS_CHILD"],
                     **self._filters(filters),
+                    **self._preview_parameters(),
                 )
             )
         candidates: dict[str, Candidate] = {}
@@ -300,10 +356,10 @@ class Neo4jRetrievalBackend:
     def parent_contexts(self, parent_ids: Sequence[str]) -> dict[str, dict[str, Any]]:
         with self._session() as session:
             rows = session.run(
-                """
+                f"""
                 UNWIND $parent_ids AS parent_id
-                MATCH (corpus:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)-[:ACTIVE_REVISION]->(revision:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk {id: parent_id})
-                WHERE revision.vector_ready = true AND document.status = 'READY'
+                MATCH (corpus:Corpus {{id: $corpus_id}})-[:HAS_DOCUMENT]->(document:Document)-[:{self._revision_edge()}]->(revision:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk {{id: parent_id}})
+                WHERE revision.vector_ready = true AND {self._ready()}
                 RETURN parent.id AS parent_id, parent.text AS text,
                        parent.page_start AS page_start, parent.page_end AS page_end,
                        parent.timestamp_start_ms AS timestamp_start_ms,
@@ -313,6 +369,7 @@ class Neo4jRetrievalBackend:
                 """,
                 parent_ids=list(parent_ids),
                 corpus_id=self.corpus_id,
+                **self._preview_parameters(),
             )
             return {str(row["parent_id"]): dict(row) for row in rows}
 

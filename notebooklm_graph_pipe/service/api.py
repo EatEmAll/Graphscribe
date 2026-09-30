@@ -62,6 +62,20 @@ class EvaluationBody(BaseModel):
     unsupported_claim_delta: float = Field(allow_inf_nan=False)
 
 
+class MeasurementQuestion(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    question_id: str = Field(min_length=1, max_length=100)
+    text: str = Field(min_length=1, max_length=2000)
+    category: str = Field(default="general", max_length=100)
+
+
+class MeasurementBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    questions: list[MeasurementQuestion] = Field(min_length=1, max_length=20)
+
+
 def create_app(service: CorpusServiceApi, token: str, write_token: str | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -125,6 +139,10 @@ def create_app(service: CorpusServiceApi, token: str, write_token: str | None = 
     )
     def ingestion_evaluation_context(ingestion_id: str):
         return _call(service.get_ingestion_evaluation_context, ingestion_id)
+
+    @app.post("/v1/ingestions/{ingestion_id}:measure", dependencies=[Depends(authorize_write)])
+    def measure_ingestion(ingestion_id: str, body: MeasurementBody):
+        return _call(service.measure_ingestion, ingestion_id, body.model_dump())
 
     @app.post("/v1/ingestions/{ingestion_id}:evaluate", dependencies=[Depends(authorize_write)])
     def evaluate_ingestion(ingestion_id: str, body: EvaluationBody):

@@ -55,6 +55,9 @@ class Service:
             "schema_version": "graphscribe-staged-evaluation-context-v1",
         }
 
+    def measure_ingestion(self, ingestion_id, payload):
+        return {"id": ingestion_id, "questions": payload["questions"]}
+
     def evaluate_ingestion(self, ingestion_id, metrics):
         return {"id": ingestion_id, "status": "evaluated", "metrics": metrics}
 
@@ -375,3 +378,21 @@ def test_document_delete_is_locked_suppressed_and_garbage_collected(monkeypatch,
     with FileLock(str(manifest_path.parent / "sync.lock"), timeout=0):
         with pytest.raises(RuntimeError, match="mutating job"):
             service.delete_document("demo", "missing")
+
+
+def test_staged_measurement_requires_write_authority_and_bounded_questions() -> None:
+    client = TestClient(create_app(Service(), "r" * 32, "w" * 32))
+    read_headers = {"Authorization": f"Bearer {'r' * 32}"}
+    write_headers = {"Authorization": f"Bearer {'w' * 32}"}
+    path = "/v1/ingestions/ingestion:measure"
+    body = {"questions": [{"question_id": "Q1", "text": "What changed?"}]}
+
+    assert client.post(path, headers=read_headers, json=body).status_code == 401
+    assert client.post(path, headers=write_headers, json={"questions": []}).status_code == 422
+    too_many = {"questions": [{"question_id": f"Q{i}", "text": "x"} for i in range(21)]}
+    assert client.post(path, headers=write_headers, json=too_many).status_code == 422
+    response = client.post(path, headers=write_headers, json=body)
+    assert response.status_code == 200
+    assert response.json()["questions"] == [
+        {"question_id": "Q1", "text": "What changed?", "category": "general"}
+    ]

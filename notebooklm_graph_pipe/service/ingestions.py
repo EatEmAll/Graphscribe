@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import threading
@@ -27,6 +28,10 @@ from .runtime import RuntimeFactory
 TERMINAL = frozenset({"duplicate", "accepted", "rolled_back", "failed", "quarantined"})
 DEFAULT_MAXIMUM_NODES = 200_000
 DEFAULT_MAXIMUM_RELATIONSHIPS = 400_000
+# The evaluation gate requires this capacity headroom, so staging never graphs past it.
+CAPACITY_HEADROOM = 0.25
+# Graph extraction passes per staged revision; each pass retries only still-pending parents.
+GRAPH_EXTRACTION_PASSES = 3
 
 
 def utc_now() -> str:
@@ -68,6 +73,9 @@ class IngestionRecord:
     ledger: dict[str, Any] | None = None
     ledger_match: dict[str, Any] | None = None
     evaluation: dict[str, Any] = field(default_factory=dict)
+    graph_extraction: dict[str, Any] = field(default_factory=dict)
+    measurement: dict[str, Any] = field(default_factory=dict)
+    rollback_cleanups: list[dict[str, Any]] = field(default_factory=list)
     error: str = ""
 
 
@@ -83,6 +91,7 @@ class CorpusIngestionManager:
         chunker_factory: Callable[[], HierarchicalChunker] | None = None,
         maximum_nodes: int = DEFAULT_MAXIMUM_NODES,
         maximum_relationships: int = DEFAULT_MAXIMUM_RELATIONSHIPS,
+        graph_worker_factory: Callable[[Neo4jCorpusStore, CorpusRegistryEntry], Any] | None = None,
     ):
         if maximum_nodes <= 0 or maximum_relationships <= 0:
             raise ValueError("Neo4j capacity limits must be positive.")
@@ -94,6 +103,7 @@ class CorpusIngestionManager:
         self.chunker_factory = chunker_factory or (lambda: HierarchicalChunker(load_minilm_tokenizer()))
         self.maximum_nodes = maximum_nodes
         self.maximum_relationships = maximum_relationships
+        self.graph_worker_factory = graph_worker_factory or self._graph_worker
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="corpus-ingestion")
         self._records: dict[str, IngestionRecord] = {}
         self._active_corpora: set[str] = set()
@@ -127,6 +137,53 @@ class CorpusIngestionManager:
             self._active_corpora.add(record.corpus_key)
             self._save(entry, record)
             self._executor.submit(self._stage, entry, record)
+
+    def _graph_worker(self, store: Neo4jCorpusStore, entry: CorpusRegistryEntry) -> Any:
+        """Build the corpus's graph-extraction worker with the hosted-capacity guard."""
+        from notebooklm_graph_pipe.retrieval.graph_extraction import (
+            GraphCapacityError,
+            GraphExtractionWorker,
+        )
+
+        guarded_nodes = int(self.maximum_nodes * (1 - CAPACITY_HEADROOM))
+        guarded_relationships = int(self.maximum_relationships * (1 - CAPACITY_HEADROOM))
+
+        def capacity_guard(node_count: int, relationship_count: int) -> None:
+            capacity = store.capacity_counts()
+            nodes = capacity["nodes"] + node_count
+            relationships = capacity["relationships"] + relationship_count + node_count
+            if nodes >= guarded_nodes or relationships >= guarded_relationships:
+                raise GraphCapacityError(
+                    "Projected graph extraction exceeds capacity headroom: "
+                    f"nodes={nodes}/{guarded_nodes}, "
+                    f"relationships={relationships}/{guarded_relationships}"
+                )
+
+        execution = getattr(entry.manifest, "execution", {}) or {}
+        root = entry.manifest_path.parent
+        return GraphExtractionWorker.from_routing_config(
+            store,
+            self.runtimes.llm_routing_config,
+            capacity_guard=capacity_guard,
+            cache_path=str(root / str(execution.get("cache_path") or ".local/model-cache.sqlite3")),
+            metrics_path=str(root / str(execution.get("metrics_path") or ".local/model-metrics.jsonl")),
+            max_concurrency=int(execution.get("default_max_concurrency") or 4),
+        )
+
+    def _extract_staged_graph(
+        self, store: Neo4jCorpusStore, entry: CorpusRegistryEntry, record: IngestionRecord
+    ) -> dict[str, Any]:
+        """Graph only this staged revision; failures stay visible to the evaluation context."""
+        worker = self.graph_worker_factory(store, entry)
+        passes: list[dict[str, int]] = []
+        for _ in range(GRAPH_EXTRACTION_PASSES):
+            summary = asyncio.run(
+                worker.run_batch(record.expected_parents, revision_id=record.revision_id)
+            )
+            passes.append(summary)
+            if summary["requested"] == 0 or summary["failed"] == 0:
+                break
+        return {"passes": passes}
 
     def _package_path(self, relative_path: str) -> Path:
         candidate = Path(relative_path)
@@ -253,6 +310,8 @@ class CorpusIngestionManager:
                 parent_embeddings=parent_vectors,
             )
             store.stage_compact_revision(document.document_id, document.revision_id, len(chunks.parents))
+            record.expected_parents = len(chunks.parents)
+            record.graph_extraction = self._extract_staged_graph(store, entry, record)
             source_key = next(
                 (
                     key
@@ -366,6 +425,32 @@ class CorpusIngestionManager:
             },
         }
 
+    def staged_preview(self, record_id: str) -> tuple[IngestionRecord, CorpusRegistryEntry]:
+        """Return a staged record and its corpus entry for a read-only preview measurement."""
+        record = self.get(record_id)
+        if record.status not in {"staged", "evaluated"} or not record.document_id or not record.revision_id:
+            raise RuntimeError("Only a staged ingestion can be measured.")
+        return record, self.registry.get(record.corpus_key)
+
+    def record_measurement(self, record_id: str, measurement: dict[str, Any]) -> dict[str, Any]:
+        """Persist the full measurement report beside the record and bind its digest."""
+        record, entry = self.staged_preview(record_id)
+        payload = json.dumps(measurement, indent=2, sort_keys=True, ensure_ascii=False)
+        # A subdirectory keeps reports out of the record glob in ``_load_records``.
+        path = self._record_path(entry, record.id).parent / "measurements" / f"{record.id}.json"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(path)
+        record.measurement = {
+            "report_sha256": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            "question_set_sha256": measurement["question_set_sha256"],
+            "metrics": measurement["metrics"],
+            "measured_at": utc_now(),
+        }
+        self._save(entry, record)
+        return record.measurement
+
     def evaluate(self, record_id: str, metrics: dict[str, Any]) -> IngestionRecord:
         import math
 
@@ -457,9 +542,12 @@ class CorpusIngestionManager:
         return record
 
     def rollback(self, record_id: str) -> IngestionRecord:
+        """Retire a pre-acceptance revision and any Document it alone created.
+
+        Repeating the call on a rolled-back record reruns only the idempotent cleanup, so residue
+        left by an earlier rollback is removed through this governed path.
+        """
         record = self.get(record_id)
-        if record.status == "rolled_back":
-            return record
         if record.status == "accepted":
             raise RuntimeError("Accepted ingestions require the existing document rollback workflow.")
         if not record.revision_id:
@@ -468,11 +556,23 @@ class CorpusIngestionManager:
         runtime = self.runtimes.get(entry)
         store = self.store_factory(runtime.driver, entry.manifest.neo4j.get("database") or "neo4j", corpus_id=entry.manifest.corpus_id)
         try:
-            store.fail_revision(record.revision_id, "Rolled back before acceptance.")
-            store.garbage_collect(revision_ids=[record.revision_id])
+            # Revision IDs derive from content, so a later ingestion of the same package may have
+            # activated this revision; a stale record must never fail or collect it.
+            active = store.active_revision_for_document(record.document_id) if record.document_id else None
+            if active and str(active.get("revision_id")) == record.revision_id:
+                raise RuntimeError("The ingestion's revision is active; use the document rollback workflow.")
+            if record.status != "rolled_back":
+                store.fail_revision(record.revision_id, "Rolled back before acceptance.")
+            collected = store.garbage_collect(revision_ids=[record.revision_id])
+            documents = (
+                store.remove_unrevisioned_document(record.document_id)
+                if record.document_id and record.previous_revision_id is None
+                else 0
+            )
         finally:
             store.close()
         record.status = "rolled_back"
+        record.rollback_cleanups.append({**collected, "documents": documents, "at": utc_now()})
         self._save(entry, record)
         return record
 
