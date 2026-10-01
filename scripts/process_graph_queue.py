@@ -29,6 +29,7 @@ def main() -> int:
     parser.add_argument("--max-nodes", type=int)
     parser.add_argument("--max-relationships", type=int)
     parser.add_argument("--capacity-headroom", type=float, default=0.25)
+    parser.add_argument("--max-concurrency", type=int, help="Override the manifest's default_max_concurrency.")
     parser.add_argument("--vocabulary", help="Canonical entity vocabulary JSON applied to extraction.")
     parser.add_argument(
         "--vocabulary-backfill",
@@ -92,7 +93,7 @@ def main() -> int:
             capacity_guard=capacity_guard,
             cache_path=str(Path(args.manifest_path).resolve().parent / str(manifest.execution["cache_path"])),
             metrics_path=str(Path(args.manifest_path).resolve().parent / str(manifest.execution["metrics_path"])),
-            max_concurrency=int(manifest.execution["default_max_concurrency"]),
+            max_concurrency=args.max_concurrency or int(manifest.execution["default_max_concurrency"]),
             vocabulary=vocabulary,
         )
         batch = worker.run_vocabulary_backfill if args.vocabulary_backfill else worker.run_batch
