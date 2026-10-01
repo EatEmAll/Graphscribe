@@ -115,6 +115,35 @@ class Neo4jCorpusStore:
             session.run(community_report_vector_index_query(dimension)).consume()
             session.run("DROP INDEX community_keyword IF EXISTS").consume()
 
+    def bootstrap_compact_corpus(
+        self, *, corpus_key: str, corpus_title: str, embedding_fingerprint: str, dimension: int
+    ) -> None:
+        """Seed an empty database with the compact parent schema and its one Corpus node.
+
+        Refuses a database that already holds any node, so it never resets or overwrites a corpus.
+        """
+        with self._session() as session:
+            nodes = int(session.run("MATCH (n) RETURN count(n) AS nodes").single()["nodes"])
+        if nodes:
+            raise ValueError(f"Bootstrap requires an empty database; it holds {nodes} nodes.")
+        self.ensure_parent_retrieval_schema(dimension)
+        with self._session() as session:
+            session.run("CALL db.awaitIndexes(300)").consume()
+            session.run(
+                """
+                CREATE (corpus:Corpus {id: $corpus_id})
+                SET corpus.key = $corpus_key,
+                    corpus.title = $corpus_title,
+                    corpus.schema_version = $schema_version,
+                    corpus.embedding_fingerprint = $embedding_fingerprint
+                """,
+                corpus_id=self.corpus_id,
+                corpus_key=corpus_key,
+                corpus_title=corpus_title,
+                schema_version=GRAPH_SCHEMA_VERSION,
+                embedding_fingerprint=embedding_fingerprint,
+            ).consume()
+
     def assert_embedding_fingerprint(self, corpus_key: str, fingerprint: str) -> None:
         with self._session() as session:
             row = session.run(
