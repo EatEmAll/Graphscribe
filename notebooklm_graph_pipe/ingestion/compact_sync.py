@@ -4,7 +4,7 @@ from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from .adapters import DEFAULT_ADAPTERS, ExtractionContext, SourceAdapter, adapter_for
+from .adapters import DEFAULT_ADAPTERS, ExtractionContext, SourceAdapter, SourcePackage, adapter_for
 from .chunking import HierarchicalChunker
 from .embeddings import MiniLMEmbedder, weighted_parent_embedding
 from .ids import block_id, canonical_file_identity, revision_id
@@ -116,6 +116,10 @@ class CompactCorpusUpdater:
                 ledger_match = self.store.resolve_ledger_source(identity)
                 if ledger_match:
                     identity = replace(identity, ledger_id=str(ledger_match["ledger_source_id"]))
+                if isinstance(source, SourcePackage):
+                    # Key packages by ledger identity, as accepted staged ingestions are.
+                    key = f"source-package/{identity.id}"
+                    previous_entry = manifest.sources.get(key)
                 if ledger_match and ledger_match.get("retrieval_status") == "LEGACY_ONLY" and not force_refresh:
                     report.legacy_only += 1
                     report.events.append(CompactUpdateEvent(key, "legacy_only", message="Use --force-refresh to materialize this historical source."))

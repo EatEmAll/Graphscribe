@@ -6,6 +6,8 @@ See [Local Neo4j Corpus RAG](docs/LOCAL_CORPUS_RAG.md) for the primary setup, mi
 
 For routine additions to an Aura-authoritative compact parent-vector corpus, the `update-aura-compact-corpus` skill drives a revision-scoped workflow that updates parent embeddings and graph evidence without rerunning full consolidation.
 
+To seed a new compact corpus from content-addressed source packages, for example to rebuild a projection into a fresh database, run `scripts/bootstrap_compact_corpus.py` and then `scripts/process_graph_queue.py`. The bootstrap copies a template manifest's settings under a new corpus key and writes them to a new target manifest. It refuses the template's own database and any database that already holds a node.
+
 ## Primary Local Pipeline
 
 ```mermaid
