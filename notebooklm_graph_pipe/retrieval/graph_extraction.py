@@ -129,9 +129,10 @@ class ExecutorGraphTransformer:
                 ),
                 system_instruction="Return a source-grounded property graph only.",
                 response_schema=GRAPH_SCHEMA,
-                # Gemini 2.5 counts thinking tokens against this cap; a dense 879-character
-                # parent spent 4,739 thinking and 1,816 answer tokens, so 4,096 truncated it.
-                max_output_tokens=16384,
+                # Gemini 2.5 counts thinking tokens against this cap, and Flash's dynamic thinking
+                # budget reaches 24,576 tokens. Dense parents spent 15,727 thinking tokens and hit
+                # MAX_TOKENS at 16,384, so the cap leaves room for the full budget plus an answer.
+                max_output_tokens=32768,
                 cache_namespace="graph-extraction",
                 idempotency_key=parent_id,
             )
