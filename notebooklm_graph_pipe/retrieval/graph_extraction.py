@@ -198,6 +198,9 @@ class GraphExtractionWorker:
                 GRAPH_EXTRACTION_ROLE: ExecutionPolicy(
                     max_concurrency=max_concurrency,
                     max_attempts=2,
+                    # The timeout spans both attempts. Dense parents spend up to the 16,384-token
+                    # thinking-plus-answer budget, and half of them overran the 120-second default.
+                    timeout_seconds=360.0,
                 )
             },
             cache_path=cache_path,
