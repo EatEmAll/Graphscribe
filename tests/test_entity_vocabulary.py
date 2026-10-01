@@ -62,7 +62,7 @@ def test_vocabulary_fingerprint_tracks_content() -> None:
 
 def test_apply_canonicalizes_variants_merges_duplicates_and_adds_literal_mentions() -> None:
     vocabulary = EntityVocabulary.from_payload(PAYLOAD)
-    first, second, strategy = node("Walk Forward Optimization"), node("walk_forward"), node("Momentum Strategy")
+    first, second, strategy = node("Walk Forward Optimization"), node("WalkForward"), node("Momentum Strategy")
     graph = SimpleNamespace(
         nodes=[first, second, strategy],
         relationships=[
@@ -103,7 +103,8 @@ def test_executor_transformer_prompts_with_and_applies_the_vocabulary() -> None:
 
     graph = asyncio.run(ExecutorGraphTransformer(executor, vocabulary).transform("Lookahead bias.", "p"))
 
-    assert "- Look-Ahead Bias (Concept): lookahead bias" in adapter.request.prompt
+    assert "- Look-Ahead Bias (Concept)" in adapter.request.prompt
+    assert "Walk-Forward Analysis" not in adapter.request.prompt
     assert [(n.id, n.type) for n in graph.nodes] == [("Look-Ahead Bias", "Concept")]
 
 

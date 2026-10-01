@@ -24,6 +24,10 @@ def normalize_term(value: str) -> str:
     return _SEPARATORS.sub(" ", value.casefold()).strip()
 
 
+def _compact(value: str) -> str:
+    return normalize_term(value).replace(" ", "")
+
+
 def _alias_pattern(alias: str) -> str:
     return r"[\s_/-]+".join(re.escape(token) for token in normalize_term(alias).split(" "))
 
@@ -66,7 +70,8 @@ class EntityVocabulary:
             for term in concept.terms:
                 if not _ALIAS_SHAPE.match(term):
                     raise ValueError(f"Vocabulary term {term!r} of {concept_id!r} has an unsupported shape.")
-                owner = owners.setdefault(term, concept_id)
+                # Compact keys also catch CamelCase ids such as "PurgedCrossValidation".
+                owner = owners.setdefault(_compact(term), concept_id)
                 if owner != concept_id:
                     raise ValueError(f"Vocabulary term {term!r} is claimed by {owner!r} and {concept_id!r}.")
             concepts.append(concept)
@@ -100,17 +105,22 @@ class EntityVocabulary:
         ]
 
     def canonical(self, entity_id: str) -> VocabularyConcept | None:
-        key = normalize_term(entity_id)
-        return next((concept for concept in self.concepts if key in concept.terms), None)
+        key = _compact(entity_id)
+        return next(
+            (concept for concept in self.concepts if key in {_compact(term) for term in concept.terms}),
+            None,
+        )
 
-    def prompt_block(self) -> str:
+    def prompt_block(self, text: str) -> str:
+        """Name only the concepts this text mentions, keeping the extraction prompt short."""
+        concepts = self.mentioned(text)
+        if not concepts:
+            return ""
         lines = [
-            "Canonical vocabulary: when the text discusses one of these concepts, name its node with "
+            "Canonical vocabulary: this text discusses the concepts below. Name each one's node with "
             "exactly the id and type given here instead of a variant spelling."
         ]
-        lines.extend(
-            f"- {concept.id} ({concept.type}): {', '.join(concept.aliases)}" for concept in self.concepts
-        )
+        lines.extend(f"- {concept.id} ({concept.type})" for concept in concepts)
         return "\n".join(lines)
 
     def apply(self, graph_document: Any, text: str) -> SimpleNamespace:

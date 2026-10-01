@@ -115,7 +115,8 @@ class ExecutorGraphTransformer:
         self.vocabulary = vocabulary
 
     async def transform(self, text: str, parent_id: str) -> Any:
-        vocabulary = f"{self.vocabulary.prompt_block()}\n\n" if self.vocabulary else ""
+        block = self.vocabulary.prompt_block(text) if self.vocabulary else ""
+        vocabulary = f"{block}\n\n" if block else ""
         result = await self.executor.aexecute_json(
             ModelRequest(
                 role=GRAPH_EXTRACTION_ROLE,
