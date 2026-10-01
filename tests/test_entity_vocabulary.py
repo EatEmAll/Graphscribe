@@ -162,6 +162,9 @@ def test_store_marks_fingerprint_and_scopes_backfill_to_active_revisions() -> No
         def __exit__(self, *args):
             return False
 
+        def begin_transaction(self):
+            return self
+
         def run(self, query, **parameters):
             calls.append((query, parameters))
             return Result()

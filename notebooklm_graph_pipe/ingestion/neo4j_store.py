@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections import defaultdict
 from dataclasses import asdict
@@ -71,6 +72,32 @@ def _cypher_identifier(value: str, fallback: str) -> str:
     if normalized[0].isdigit():
         normalized = f"{fallback}_{normalized}"
     return normalized[:100]
+
+
+def _property_kind(value: Any) -> str | None:
+    if isinstance(value, bool):
+        return "bool"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "string"
+    return None
+
+
+def _neo4j_properties(properties: Any) -> dict[str, Any]:
+    """Keep primitives and homogeneous primitive lists; JSON-encode any other extracted value.
+
+    Neo4j rejects maps and mixed or nested lists as property values, so encoding them keeps the
+    extracted content instead of failing the whole parent.
+    """
+    stored: dict[str, Any] = {}
+    for key, value in dict(properties or {}).items():
+        kinds = {_property_kind(item) for item in value} if isinstance(value, list) else set()
+        if value is None or _property_kind(value) or (isinstance(value, list) and len(kinds) <= 1 and None not in kinds):
+            stored[str(key)] = value
+        else:
+            stored[str(key)] = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return stored
 
 
 class Neo4jCorpusStore:
@@ -789,7 +816,7 @@ class Neo4jCorpusStore:
             {
                 "id": str(node.id),
                 "type": str(node.type or "Entity"),
-                "properties": dict(getattr(node, "properties", None) or {}),
+                "properties": _neo4j_properties(getattr(node, "properties", None)),
             }
             for node in graph_document.nodes
         ]
@@ -798,7 +825,7 @@ class Neo4jCorpusStore:
                 "source_id": str(relationship.source.id),
                 "target_id": str(relationship.target.id),
                 "type": str(relationship.type or "RELATED_TO"),
-                "properties": dict(getattr(relationship, "properties", None) or {}),
+                "properties": _neo4j_properties(getattr(relationship, "properties", None)),
             }
             for relationship in graph_document.relationships
         ]
@@ -808,15 +835,16 @@ class Neo4jCorpusStore:
         relationships_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in relationship_rows:
             relationships_by_type[_cypher_identifier(row["type"], "RELATED_TO")].append(row)
-        with self._session() as session:
-            session.run(
+        # One transaction, so a failed write keeps the parent's earlier mentions.
+        with self._session() as session, session.begin_transaction() as tx:
+            tx.run(
                 """
                 MATCH (parent:ParentChunk {id: $parent_id})-[mention:HAS_ENTITY]->()
                 DELETE mention
                 """,
                 parent_id=parent_id,
             ).consume()
-            session.run(
+            tx.run(
                 """
                 MATCH ()-[relation]->()
                 WHERE $parent_id IN coalesce(relation.source_parent_ids, [])
@@ -835,7 +863,7 @@ class Neo4jCorpusStore:
                 revision_id=revision_id,
             ).consume()
             for label, rows in nodes_by_label.items():
-                session.run(
+                tx.run(
                     f"""
                     UNWIND $nodes AS row
                     MERGE (node:__Entity__ {{id: row.id}})
@@ -850,7 +878,7 @@ class Neo4jCorpusStore:
                     revision_id=revision_id,
                 ).consume()
             for relationship_type, rows in relationships_by_type.items():
-                session.run(
+                tx.run(
                     f"""
                     UNWIND $relationships AS row
                     MATCH (source:__Entity__ {{id: row.source_id}})
@@ -877,7 +905,7 @@ class Neo4jCorpusStore:
                     revision_id=revision_id,
                     extraction_state=extraction_state,
                 ).consume()
-            session.run(
+            tx.run(
                 """
                 MATCH (parent:ParentChunk {id: $parent_id})
                 UNWIND $entity_ids AS entity_id
@@ -889,7 +917,7 @@ class Neo4jCorpusStore:
                 entity_ids=[row["id"] for row in node_rows],
                 extraction_state=extraction_state,
             ).consume()
-            session.run(
+            tx.run(
                 "MATCH (parent:ParentChunk {id: $parent_id}) "
                 "SET parent.graph_status = CASE WHEN $extraction_state = 'PROVISIONAL' "
                 "THEN 'PROVISIONAL' ELSE 'COMPLETED' END, parent.graph_error = null, "

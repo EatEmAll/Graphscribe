@@ -31,7 +31,8 @@ GRAPH_SCHEMA: dict[str, object] = {
                 "properties": {
                     "id": {"type": "string"},
                     "type": {"type": "string"},
-                    "properties": {"type": "object"},
+                    # Without additionalProperties, schema-constrained Gemini returns empty properties.
+                    "properties": {"type": "object", "additionalProperties": True},
                 },
             },
         },
@@ -44,7 +45,7 @@ GRAPH_SCHEMA: dict[str, object] = {
                     "source_id": {"type": "string"},
                     "target_id": {"type": "string"},
                     "type": {"type": "string"},
-                    "properties": {"type": "object"},
+                    "properties": {"type": "object", "additionalProperties": True},
                 },
             },
         },

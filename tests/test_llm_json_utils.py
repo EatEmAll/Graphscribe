@@ -94,3 +94,30 @@ def test_run_cli_uses_argument_list_stdin_and_timeout(monkeypatch: pytest.Monkey
     assert kwargs["input"] == "$(unsafe)"
     assert kwargs["shell"] is False
     assert kwargs["timeout"] == 12
+
+
+def test_routed_adapter_constrains_gemini_to_the_request_schema() -> None:
+    from types import SimpleNamespace
+
+    from notebooklm_graph_pipe.runtime.llm_routing import PromptRoleConfig
+    from notebooklm_graph_pipe.runtime.model_adapters import RoutedJsonAdapter
+    from notebooklm_graph_pipe.runtime.model_executor import ModelRequest
+
+    configs = []
+
+    class Models:
+        def generate_content(self, *, model, contents, config):
+            configs.append(config)
+            return SimpleNamespace(text='{"nodes": [], "relationships": []}')
+
+    schema = {"type": "object", "required": ["nodes"], "properties": {"nodes": {"type": "array"}}}
+    adapter = RoutedJsonAdapter(
+        PromptRoleConfig(client="genai", model="gemini-2.5-flash"), SimpleNamespace(models=Models())
+    )
+    _, payload, _ = adapter.execute(
+        ModelRequest(role="r", prompt="p", system_instruction="s", response_schema=schema, max_output_tokens=64)
+    )
+
+    assert payload == {"nodes": [], "relationships": []}
+    assert configs[0].response_mime_type == "application/json"
+    assert configs[0].response_json_schema == schema
