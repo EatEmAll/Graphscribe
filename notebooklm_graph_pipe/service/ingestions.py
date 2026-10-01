@@ -159,8 +159,12 @@ class CorpusIngestionManager:
                     f"relationships={relationships}/{guarded_relationships}"
                 )
 
+        from notebooklm_graph_pipe.retrieval.entity_vocabulary import EntityVocabulary
+
         execution = getattr(entry.manifest, "execution", {}) or {}
         root = entry.manifest_path.parent
+        vocabulary_path = (getattr(entry.manifest, "graph", {}) or {}).get("entity_vocabulary_path")
+        vocabulary = EntityVocabulary.from_path(root / vocabulary_path) if vocabulary_path else None
         return GraphExtractionWorker.from_routing_config(
             store,
             self.runtimes.llm_routing_config,
@@ -168,6 +172,7 @@ class CorpusIngestionManager:
             cache_path=str(root / str(execution.get("cache_path") or ".local/model-cache.sqlite3")),
             metrics_path=str(root / str(execution.get("metrics_path") or ".local/model-metrics.jsonl")),
             max_concurrency=int(execution.get("default_max_concurrency") or 4),
+            vocabulary=vocabulary,
         )
 
     def _extract_staged_graph(

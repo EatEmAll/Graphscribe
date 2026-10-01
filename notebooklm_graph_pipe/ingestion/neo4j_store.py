@@ -752,6 +752,7 @@ class Neo4jCorpusStore:
         graph_document: Any,
         revision_id: str | None = None,
         extraction_state: str = "VERIFIED",
+        vocabulary_fingerprint: str | None = None,
     ) -> None:
         if extraction_state not in {"VERIFIED", "PROVISIONAL"}:
             raise ValueError("extraction_state must be VERIFIED or PROVISIONAL.")
@@ -863,10 +864,65 @@ class Neo4jCorpusStore:
                 "MATCH (parent:ParentChunk {id: $parent_id}) "
                 "SET parent.graph_status = CASE WHEN $extraction_state = 'PROVISIONAL' "
                 "THEN 'PROVISIONAL' ELSE 'COMPLETED' END, parent.graph_error = null, "
-                "parent.graph_extraction_state = $extraction_state",
+                "parent.graph_extraction_state = $extraction_state, "
+                "parent.graph_vocabulary_fingerprint = $vocabulary_fingerprint",
                 parent_id=parent_id,
                 extraction_state=extraction_state,
+                vocabulary_fingerprint=vocabulary_fingerprint,
             ).consume()
+
+    def vocabulary_graph_parents(
+        self, mention_pattern: str, vocabulary_fingerprint: str, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        """Active parents whose text matches the vocabulary and was not extracted with it."""
+        if not self.corpus_id:
+            raise ValueError("Vocabulary backfill requires a corpus-scoped store.")
+        with self._session() as session:
+            rows = session.run(
+                """
+                MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:ACTIVE_REVISION]->
+                      (revision:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk)
+                WHERE coalesce(parent.graph_vocabulary_fingerprint, '') <> $vocabulary_fingerprint
+                  AND parent.text =~ $mention_pattern
+                WITH revision, parent
+                ORDER BY revision.id, parent.position, parent.id
+                LIMIT $limit
+                OPTIONAL MATCH (parent)-[:HAS_CHILD]->(chunk:Chunk)
+                RETURN revision.id AS revision_id, parent.id AS parent_id, parent.text AS text,
+                       collect(chunk.id) AS child_ids
+                ORDER BY revision_id, parent_id
+                """,
+                corpus_id=self.corpus_id,
+                mention_pattern=mention_pattern,
+                vocabulary_fingerprint=vocabulary_fingerprint,
+                limit=limit,
+            )
+            return [dict(row) for row in rows]
+
+    def vocabulary_coverage(self, vocabulary: Any) -> list[dict[str, Any]]:
+        """Per concept: active parents mentioning it and those linked to its canonical entity."""
+        if not self.corpus_id:
+            raise ValueError("Vocabulary coverage requires a corpus-scoped store.")
+        rows: list[dict[str, Any]] = []
+        with self._session() as session:
+            for concept in vocabulary.concepts:
+                row = session.run(
+                    """
+                    MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(:Document)-[:ACTIVE_REVISION]->
+                          (:DocumentRevision)-[:HAS_PARENT]->(parent:ParentChunk)
+                    WITH parent, parent.text =~ $pattern AS mentioned,
+                         EXISTS { MATCH (parent)-[:HAS_ENTITY]->(:__Entity__ {id: $entity_id}) } AS linked
+                    WHERE mentioned OR linked
+                    RETURN count(CASE WHEN mentioned THEN 1 END) AS mentioning_parents,
+                           count(CASE WHEN linked THEN 1 END) AS linked_parents,
+                           count(CASE WHEN mentioned AND linked THEN 1 END) AS covered_parents
+                    """,
+                    corpus_id=self.corpus_id,
+                    pattern="(?is).*" + concept.pattern + ".*",
+                    entity_id=concept.id,
+                ).single()
+                rows.append({"concept": concept.id, **dict(row)})
+        return rows
 
     def fail_parent_graph(self, parent_id: str, message: str) -> None:
         with self._session() as session:

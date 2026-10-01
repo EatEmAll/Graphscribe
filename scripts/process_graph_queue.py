@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from notebooklm_graph_pipe.ingestion.manifest import load_manifest
 from notebooklm_graph_pipe.ingestion.neo4j_store import Neo4jCorpusStore
+from notebooklm_graph_pipe.retrieval.entity_vocabulary import EntityVocabulary
 from notebooklm_graph_pipe.retrieval.graph_extraction import GraphCapacityError, GraphExtractionWorker
 from notebooklm_graph_pipe.runtime.neo4j_connection import resolve_connection_mapping, verify_corpus_connection
 
@@ -28,7 +29,17 @@ def main() -> int:
     parser.add_argument("--max-nodes", type=int)
     parser.add_argument("--max-relationships", type=int)
     parser.add_argument("--capacity-headroom", type=float, default=0.25)
+    parser.add_argument("--max-concurrency", type=int, help="Override the manifest's default_max_concurrency.")
+    parser.add_argument("--vocabulary", help="Canonical entity vocabulary JSON applied to extraction.")
+    parser.add_argument(
+        "--vocabulary-backfill",
+        action="store_true",
+        help="Re-extract active parents that mention the vocabulary instead of pending parents.",
+    )
     args = parser.parse_args()
+    if args.vocabulary_backfill and not args.vocabulary:
+        parser.error("--vocabulary-backfill requires --vocabulary.")
+    vocabulary = EntityVocabulary.from_path(args.vocabulary) if args.vocabulary else None
     manifest = load_manifest(Path(args.manifest_path))
     if manifest is None:
         parser.error("Corpus manifest was not found.")
@@ -82,9 +93,11 @@ def main() -> int:
             capacity_guard=capacity_guard,
             cache_path=str(Path(args.manifest_path).resolve().parent / str(manifest.execution["cache_path"])),
             metrics_path=str(Path(args.manifest_path).resolve().parent / str(manifest.execution["metrics_path"])),
-            max_concurrency=int(manifest.execution["default_max_concurrency"]),
+            max_concurrency=args.max_concurrency or int(manifest.execution["default_max_concurrency"]),
+            vocabulary=vocabulary,
         )
-        summary = asyncio.run(worker.run_batch(args.limit))
+        batch = worker.run_vocabulary_backfill if args.vocabulary_backfill else worker.run_batch
+        summary = asyncio.run(batch(args.limit))
     finally:
         store.close()
     print(json.dumps(summary, indent=2))
