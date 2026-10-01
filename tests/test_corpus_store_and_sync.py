@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -298,6 +299,9 @@ def test_parent_graph_mentions_are_not_copied_to_every_child() -> None:
         def __exit__(self, *args):
             return False
 
+        def begin_transaction(self):
+            return self
+
         def run(self, query, **parameters):
             calls.append((query, parameters))
             return Result()
@@ -405,3 +409,59 @@ def test_graph_queue_queries_are_scoped_to_store_corpus() -> None:
     assert store.finalize_graph_revisions() == 0
     assert all("(:Corpus {id: $corpus_id})" in query for query, _ in calls)
     assert all(parameters["corpus_id"] == "corpus-id" for _, parameters in calls)
+
+
+def test_parent_graph_encodes_values_neo4j_cannot_store_in_one_transaction() -> None:
+    calls = []
+    transactions = []
+
+    class Result:
+        def consume(self):
+            return None
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            transactions.append("closed")
+            return False
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return Result()
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def begin_transaction(self):
+            transactions.append("begin")
+            return Transaction()
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+    period = {"symbol": "A", "start": "2014-01-01", "end": "2014-01-05"}
+    node = SimpleNamespace(
+        id="window",
+        type="Period",
+        properties={"period": period, "tickers": ["A", "B"], "mixed": ["A", 1], "rows": [period], "n": 3, "gone": None},
+    )
+    target = SimpleNamespace(id="target", type="Concept", properties={})
+    relationship = SimpleNamespace(source=node, target=target, type="COVERS", properties={"window": period, "weight": 0.5})
+
+    store.persist_parent_graph("parent", [], SimpleNamespace(nodes=[node, target], relationships=[relationship]))
+
+    assert transactions == ["begin", "closed"]
+    node_rows = next(parameters["nodes"] for query, parameters in calls if "MERGE (node:__Entity__" in query and parameters["nodes"][0]["id"] == "window")
+    properties = node_rows[0]["properties"]
+    assert json.loads(properties["period"]) == period
+    assert properties["tickers"] == ["A", "B"]
+    assert json.loads(properties["mixed"]) == ["A", 1]
+    assert json.loads(properties["rows"]) == [period]
+    assert properties["n"] == 3 and properties["gone"] is None
+    relationship_rows = next(parameters["relationships"] for query, parameters in calls if "MERGE (source)" in query)
+    assert json.loads(relationship_rows[0]["properties"]["window"]) == period
+    assert relationship_rows[0]["properties"]["weight"] == 0.5

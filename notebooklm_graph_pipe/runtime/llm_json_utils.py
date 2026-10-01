@@ -165,6 +165,7 @@ def generate_json_payload(
     max_attempts: int = 1,
     retry_sleep_seconds: float = 0.0,
     retry_on_exception: Callable[[Exception], bool] | None = None,
+    response_schema: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any] | None, str]:
     last_error = "Invalid or empty JSON response"
     attempts = max(max_attempts, 1)
@@ -179,6 +180,7 @@ def generate_json_payload(
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
                 reasoning_effort=reasoning_effort,
+                response_schema=response_schema,
             )
         except Exception as exc:
             last_error = f"{type(exc).__name__}: {exc}"
@@ -260,9 +262,11 @@ def _generate_structured_response(
     max_output_tokens: int,
     temperature: float,
     reasoning_effort: str | None = None,
+    response_schema: dict[str, Any] | None = None,
 ) -> Any:
     normalized_client = client_name.strip().lower()
     if normalized_client == "genai":
+        # Without the schema, Gemini can return a bare JSON array where the caller expects an object.
         return client.models.generate_content(
             model=model_name,
             contents=prompt,
@@ -271,6 +275,7 @@ def _generate_structured_response(
                 max_output_tokens=max_output_tokens,
                 temperature=temperature,
                 response_mime_type="application/json",
+                response_json_schema=response_schema,
             ),
         )
     if normalized_client in {"openai", "openrouter"}:

@@ -32,6 +32,7 @@ class RoutedJsonAdapter:
             temperature=request.temperature,
             reasoning_effort=self.role.reasoning_effort,
             max_attempts=1,
+            response_schema=request.response_schema,
         )
         if payload is None:
             raise RuntimeError(error)
