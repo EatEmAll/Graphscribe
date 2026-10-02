@@ -84,6 +84,37 @@ def test_apply_canonicalizes_variants_merges_duplicates_and_adds_literal_mention
     ]
 
 
+def test_apply_canonicalizes_an_extracted_id_property_like_the_node_id() -> None:
+    """A variant ``id`` property cannot give a vocabulary concept a second identity in the store."""
+    vocabulary = EntityVocabulary.from_payload(PAYLOAD)
+    named = SimpleNamespace(id="wfa_1", type="Entity", properties={"id": "walk_forward", "window": 3})
+    canonical_id = SimpleNamespace(id="LOOK-AHEAD_BIAS", type="Risk", properties={"id": "lab-1"})
+    plain = SimpleNamespace(id="momentum_strategy", type="Strategy", properties={"id": " Momentum-Strategy "})
+    blank = SimpleNamespace(id="Universe", type="Entity", properties={"id": "  "})
+    graph = SimpleNamespace(
+        nodes=[named, canonical_id, plain, blank],
+        relationships=[
+            SimpleNamespace(source=plain, target=named, type="VALIDATED_BY", properties={}),
+            SimpleNamespace(source=plain, target=canonical_id, type="AVOIDS", properties={}),
+            SimpleNamespace(source=blank, target=plain, type="HOLDS", properties={}),
+        ],
+    )
+
+    result = vocabulary.apply(graph, "no literal mentions")
+
+    assert [(n.id, n.type, n.properties) for n in result.nodes] == [
+        ("Walk-Forward Analysis", "Method", {"window": 3}),
+        ("Look-Ahead Bias", "Concept", {}),
+        ("Momentum-Strategy", "Strategy", {}),
+        ("Universe", "Entity", {}),
+    ]
+    assert [(r.source.id, r.type, r.target.id) for r in result.relationships] == [
+        ("Momentum-Strategy", "VALIDATED_BY", "Walk-Forward Analysis"),
+        ("Momentum-Strategy", "AVOIDS", "Look-Ahead Bias"),
+        ("Universe", "HOLDS", "Momentum-Strategy"),
+    ]
+
+
 class Adapter:
     provider = "test"
     model = "test"
