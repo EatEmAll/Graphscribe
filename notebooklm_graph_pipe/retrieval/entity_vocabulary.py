@@ -128,13 +128,16 @@ class EntityVocabulary:
         nodes: dict[str, SimpleNamespace] = {}
         renamed: dict[str, str] = {}
         for node in graph_document.nodes:
-            concept = self.canonical(str(node.id))
-            node_id, node_type = (concept.id, concept.type) if concept else (str(node.id), str(node.type))
+            # The store merges on a non-empty string ``id`` property, so that name is canonicalized
+            # here like the node id and then dropped; a concept named by either id wins.
+            properties = dict(getattr(node, "properties", None) or {})
+            named_id = properties.pop("id", None)
+            extracted_id = named_id.strip() if isinstance(named_id, str) and named_id.strip() else str(node.id)
+            concept = self.canonical(extracted_id) or self.canonical(str(node.id))
+            node_id, node_type = (concept.id, concept.type) if concept else (extracted_id, str(node.type))
             renamed[str(node.id)] = node_id
             if node_id not in nodes:
-                nodes[node_id] = SimpleNamespace(
-                    id=node_id, type=node_type, properties=dict(getattr(node, "properties", None) or {})
-                )
+                nodes[node_id] = SimpleNamespace(id=node_id, type=node_type, properties=properties)
         for concept in self.mentioned(text):
             nodes.setdefault(concept.id, SimpleNamespace(id=concept.id, type=concept.type, properties={}))
         relationships: list[SimpleNamespace] = []
