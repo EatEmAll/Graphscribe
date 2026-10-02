@@ -812,23 +812,37 @@ class Neo4jCorpusStore:
     ) -> None:
         if extraction_state not in {"VERIFIED", "PROVISIONAL"}:
             raise ValueError("extraction_state must be VERIFIED or PROVISIONAL.")
-        node_rows = [
-            {
-                "id": str(node.id),
-                "type": str(node.type or "Entity"),
-                "properties": _neo4j_properties(getattr(node, "properties", None)),
-            }
-            for node in graph_document.nodes
-        ]
-        relationship_rows = [
-            {
-                "source_id": str(relationship.source.id),
-                "target_id": str(relationship.target.id),
-                "type": str(relationship.type or "RELATED_TO"),
-                "properties": _neo4j_properties(getattr(relationship, "properties", None)),
-            }
-            for relationship in graph_document.relationships
-        ]
+        # An extracted ``id`` property names the entity. Writing it as a property would rename a
+        # newly created node onto an existing entity's id and violate the uniqueness constraint,
+        # so it becomes the merge key instead and the node merges into that entity.
+        node_rows = []
+        entity_ids: dict[str, str] = {}
+        for node in graph_document.nodes:
+            properties = dict(getattr(node, "properties", None) or {})
+            named_id = properties.pop("id", None)
+            entity_id = named_id.strip() if isinstance(named_id, str) and named_id.strip() else str(node.id)
+            entity_ids[str(node.id)] = entity_id
+            node_rows.append(
+                {
+                    "id": entity_id,
+                    "type": str(node.type or "Entity"),
+                    "properties": _neo4j_properties(properties),
+                }
+            )
+        relationship_rows = []
+        for relationship in graph_document.relationships:
+            source_id = entity_ids.get(str(relationship.source.id), str(relationship.source.id))
+            target_id = entity_ids.get(str(relationship.target.id), str(relationship.target.id))
+            if source_id == target_id:
+                continue
+            relationship_rows.append(
+                {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "type": str(relationship.type or "RELATED_TO"),
+                    "properties": _neo4j_properties(getattr(relationship, "properties", None)),
+                }
+            )
         nodes_by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in node_rows:
             nodes_by_label[_cypher_identifier(row["type"], "Entity")].append(row)
@@ -914,7 +928,7 @@ class Neo4jCorpusStore:
                 SET mention.extraction_scope = 'parent', mention.extraction_state = $extraction_state
                 """,
                 parent_id=parent_id,
-                entity_ids=[row["id"] for row in node_rows],
+                entity_ids=list(dict.fromkeys(row["id"] for row in node_rows)),
                 extraction_state=extraction_state,
             ).consume()
             tx.run(
