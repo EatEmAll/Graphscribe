@@ -465,3 +465,49 @@ def test_parent_graph_encodes_values_neo4j_cannot_store_in_one_transaction() -> 
     relationship_rows = next(parameters["relationships"] for query, parameters in calls if "MERGE (source)" in query)
     assert json.loads(relationship_rows[0]["properties"]["window"]) == period
     assert relationship_rows[0]["properties"]["weight"] == 0.5
+
+
+def test_parent_graph_merges_a_node_whose_extracted_id_names_an_existing_entity() -> None:
+    """An extracted ``id`` property is the node's identity, never a property that rewrites it."""
+    calls = []
+
+    class Result:
+        def consume(self):
+            return None
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def begin_transaction(self):
+            return self
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return Result()
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+    alias = SimpleNamespace(id="evidence_2026_003", type="Document", properties={"id": "evidence-2026-003", "n": 1})
+    named = SimpleNamespace(id="evidence-2026-003", type="Evidence", properties={})
+    study = SimpleNamespace(id="study", type="Study", properties={"id": "  "})
+    graph = SimpleNamespace(
+        nodes=[alias, named, study],
+        relationships=[
+            SimpleNamespace(source=study, target=alias, type="CITES", properties={}),
+            SimpleNamespace(source=alias, target=named, type="SAME_AS", properties={}),
+        ],
+    )
+
+    store.persist_parent_graph("parent", [], graph, revision_id="revision")
+
+    node_rows = [row for query, parameters in calls if "MERGE (node:__Entity__" in query for row in parameters["nodes"]]
+    assert sorted(row["id"] for row in node_rows) == ["evidence-2026-003", "evidence-2026-003", "study"]
+    assert all("id" not in row["properties"] for row in node_rows)
+    assert next(row for row in node_rows if row["type"] == "Document")["properties"] == {"n": 1}
+    relationship_rows = [row for query, parameters in calls if "MERGE (source)" in query for row in parameters["relationships"]]
+    assert [(row["source_id"], row["target_id"]) for row in relationship_rows] == [("study", "evidence-2026-003")]
+    mention_ids = next(parameters["entity_ids"] for query, parameters in calls if "HAS_ENTITY]->(entity)" in query)
+    assert mention_ids == ["evidence-2026-003", "study"]
