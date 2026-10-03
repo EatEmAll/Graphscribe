@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 
 AGENT_CLIENTS = {"codex", "claude", "opencode"}
-SINGLE_PROMPT_CLIENTS = {"genai", "openai", "openrouter", "codex", "claude"}
+SINGLE_PROMPT_CLIENTS = {"genai", "openai", "openrouter", "openrouter_decisions", "codex", "claude"}
 EMBEDDING_CLIENTS = {"genai", "openai", "openrouter"}
 
 AGENT_REVIEW_ROLE = "agents.review"
@@ -71,6 +71,7 @@ def api_key_env_var_for_client(client: str) -> str | None:
         "genai": "GOOGLE_API_KEY",
         "openai": "OPENAI_API_KEY",
         "openrouter": "OPENROUTER_API_KEY",
+        "openrouter_decisions": "OPENROUTER_API_KEY",
     }.get(client)
 
 

@@ -121,3 +121,46 @@ def test_routed_adapter_constrains_gemini_to_the_request_schema() -> None:
     assert payload == {"nodes": [], "relationships": []}
     assert configs[0].response_mime_type == "application/json"
     assert configs[0].response_json_schema == schema
+
+
+class _DecisionsResponse:
+    def __init__(self, status_code: int, payload: dict) -> None:
+        self.status_code = status_code
+        self._payload = payload
+        self.text = json.dumps(payload)
+
+    def json(self) -> dict:
+        return self._payload
+
+
+def test_decisions_client_hides_key_and_routes_only_to_non_retaining_providers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-test-secret")
+    client = utils.build_single_prompt_clients("openrouter_decisions")["openrouter_decisions"]
+    assert "sk-or-test-secret" not in repr(client)
+    captured: dict[str, object] = {}
+
+    def fake_post(url, *, json, headers, timeout):
+        captured.update(url=url, body=json, headers=headers, timeout=timeout)
+        return _DecisionsResponse(200, {"answers": {"same": {"type": "noul", "noul": 0.9}}})
+
+    monkeypatch.setattr(utils.httpx, "post", fake_post)
+    questions = {"same": {"type": "noul", "instructions": "Same?", "criteria": {"true": "yes", "false": "no"}}}
+
+    answers = utils.request_decisions(client, model_name="typesafe/jev-1.13", state={"a": 1}, questions=questions)
+
+    assert answers == {"same": {"type": "noul", "noul": 0.9}}
+    assert captured["url"] == "https://openrouter.ai/api/alpha/decisions"
+    assert captured["body"] == {
+        "model": "typesafe/jev-1.13",
+        "state": {"a": 1},
+        "questions": questions,
+        "provider": {"data_collection": "deny", "zdr": True},
+    }
+    assert captured["headers"] == {"Authorization": "Bearer sk-or-test-secret"}
+
+
+def test_decisions_client_raises_on_http_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(utils.httpx, "post", lambda *a, **k: _DecisionsResponse(429, {"error": {"message": "rate limit"}}))
+
+    with pytest.raises(RuntimeError, match="429"):
+        utils.request_decisions(utils.OpenRouterDecisionsClient(api_key="k"), model_name="m", state="s", questions={})

@@ -112,7 +112,7 @@ def resolve_codex_executable(codex_bin: str) -> str:
 
 def _required_consolidation_api_envs(config: ConsolidationConfig) -> list[str]:
     prompt_roles = [
-        resolve_prompt_role(config.llm_routing_config, TIER2_PRIMARY_ROLE, default_client="openrouter", default_model="minimax/minimax-m3"),
+        resolve_prompt_role(config.llm_routing_config, TIER2_PRIMARY_ROLE, default_client="openrouter_decisions", default_model="typesafe/jev-1.13"),
         resolve_prompt_role(config.llm_routing_config, TIER2_SECONDARY_ROLE, default_client="codex", default_model="gpt-5.6-luna", default_reasoning_effort="low"),
         resolve_prompt_role(config.llm_routing_config, TAXONOMY_PRIMARY_ROLE, default_client="openrouter", default_model="minimax/minimax-m3"),
         resolve_prompt_role(config.llm_routing_config, TAXONOMY_SECONDARY_ROLE, default_client="genai", default_model="gemini-3.1-pro-preview"),
