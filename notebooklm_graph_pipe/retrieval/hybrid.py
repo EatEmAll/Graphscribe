@@ -74,9 +74,20 @@ def reciprocal_rank_fusion(channels: dict[str, Sequence[Candidate]], k: int = 60
     return sorted(merged.values(), key=lambda item: (-item.rrf_score, item.chunk_id))
 
 
+# The repository moved from ms-marco-MiniLM-L-6-v2; this revision holds the same weights the old id served.
+RERANKER_MODEL = "cross-encoder/ms-marco-MiniLM-L6-v2"
+RERANKER_REVISION = "233902d25c440f23af6f7d6e94d2946bac0bee0a"
+
+
 class CrossEncoderReranker:
-    def __init__(self, model_name: str = "cross-encoder/ms-marco-MiniLM-L-6-v2", model: Any | None = None):
+    def __init__(
+        self,
+        model_name: str = RERANKER_MODEL,
+        model: Any | None = None,
+        revision: str | None = RERANKER_REVISION,
+    ):
         self.model_name = model_name
+        self.revision = revision
         self._model = model
 
     @property
@@ -84,7 +95,7 @@ class CrossEncoderReranker:
         if self._model is None:
             from sentence_transformers import CrossEncoder
 
-            self._model = CrossEncoder(self.model_name)
+            self._model = CrossEncoder(self.model_name, revision=self.revision)
         return self._model
 
     def rerank(self, query: str, candidates: Sequence[Candidate]) -> list[Candidate]:

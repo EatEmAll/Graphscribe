@@ -204,3 +204,47 @@ def test_run_merges_aliases_and_never_adds_relations(monkeypatch: pytest.MonkeyP
     assert summary["judge_counts"]["ALIAS"] == 1
     assert summary["second_stage_attempts"] == 0
     assert merges and merges[0][2] == "P&L"
+
+
+class _EmbedRecorder:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+        self.models = self
+
+    def embed_content(self, **kwargs):
+        self.calls.append(kwargs)
+        return type("Result", (), {"embeddings": [type("Embedding", (), {"values": [0.6, 0.8]})()]})()
+
+
+def test_embed_text_puts_the_task_in_the_prompt_for_gemini_embedding_2() -> None:
+    client = _EmbedRecorder()
+    role = t3.EmbeddingRoleConfig(client="genai", model="gemini-embedding-2")
+
+    vector = t3._embed_text(client, embedding_role_config=role, text="Sharpe Ratio: risk-adjusted return")
+
+    assert vector.tolist() == [0.6, 0.8]
+    assert client.calls == [
+        {"model": "gemini-embedding-2", "contents": "task: sentence similarity | query: Sharpe Ratio: risk-adjusted return"}
+    ]
+
+
+def test_embed_text_keeps_task_type_for_gemini_embedding_001() -> None:
+    client = _EmbedRecorder()
+    role = t3.EmbeddingRoleConfig(client="genai", model="gemini-embedding-001")
+
+    t3._embed_text(client, embedding_role_config=role, text="Sharpe Ratio")
+
+    assert client.calls[0]["contents"] == "Sharpe Ratio"
+    assert client.calls[0]["config"].task_type == "SEMANTIC_SIMILARITY"
+
+
+def test_run_defaults_route_gemini_embeddings_and_the_openrouter_primary_judge(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    monkeypatch.setattr(t3, "build_single_prompt_clients", lambda *names: {name: object() for name in names})
+    monkeypatch.setattr(t3, "fetch_entities", lambda session, scope_revision_ids=None: [])
+
+    summary = t3.run(dry_run=True, threshold=0.85, max_candidates=10, max_merges=1, sleep_seconds=0.0,
+                     judge_cache_file=str(tmp_path / "judge.json"),
+                     neo4j_uri="bolt://127.0.0.1:1", neo4j_password="unused")
+
+    assert (summary["embed_client_name"], summary["embed_model"]) == ("genai", "gemini-embedding-2")
+    assert (summary["judge_client_name_primary"], summary["judge_model_primary"]) == ("openrouter", "minimax/minimax-m3")

@@ -372,3 +372,20 @@ def test_preview_backend_exposes_only_the_named_staged_revision() -> None:
     assert "(source_revision.id = $preview_revision_id" in graph_query
     with pytest.raises(ValueError, match="parent retrieval"):
         Neo4jRetrievalBackend(driver, "neo4j", "corpus", preview=("d", "r"))
+
+
+def test_cross_encoder_reranker_loads_the_pinned_id_and_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sentence_transformers
+
+    from notebooklm_graph_pipe.retrieval.hybrid import CrossEncoderReranker
+
+    loaded: list[tuple[str, str | None]] = []
+    monkeypatch.setattr(
+        sentence_transformers,
+        "CrossEncoder",
+        lambda name, revision=None: loaded.append((name, revision)) or object(),
+    )
+
+    CrossEncoderReranker().model
+
+    assert loaded == [("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a")]
