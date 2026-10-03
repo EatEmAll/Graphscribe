@@ -123,7 +123,7 @@ def _required_consolidation_api_envs(config: ConsolidationConfig) -> list[str]:
         config.llm_routing_config,
         TIER3_EMBEDDING_ROLE,
         default_client="genai",
-        default_model="gemini-embedding-001",
+        default_model="gemini-embedding-2",
     )
     return missing_required_env_vars(*(role.client for role in [*prompt_roles, embedding_role]))
 

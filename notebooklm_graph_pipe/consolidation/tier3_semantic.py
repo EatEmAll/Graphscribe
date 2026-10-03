@@ -39,7 +39,7 @@ DEFAULT_NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "password123")
 DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-EMBED_MODEL = os.environ.get("TIER3_EMBED_MODEL", "gemini-embedding-001")
+EMBED_MODEL = os.environ.get("TIER3_EMBED_MODEL", "gemini-embedding-2")
 PRIMARY_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_PRIMARY", "openrouter")
 PRIMARY_JUDGE_MODEL = os.environ.get(
     "TIER3_JUDGE_MODEL_PRIMARY",
@@ -246,11 +246,18 @@ def _embedding_cache_key(embedding_role_config: EmbeddingRoleConfig, text: str) 
 
 def _embed_text(client: Any, *, embedding_role_config: EmbeddingRoleConfig, text: str) -> np.ndarray:
     if embedding_role_config.client == "genai":
-        result = client.models.embed_content(
-            model=embedding_role_config.model,
-            contents=text,
-            config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
-        )
+        if embedding_role_config.model.startswith("gemini-embedding-2"):
+            # gemini-embedding-2 rejects task_type; Google's documented form puts the task in the content.
+            result = client.models.embed_content(
+                model=embedding_role_config.model,
+                contents=f"task: sentence similarity | query: {text}",
+            )
+        else:
+            result = client.models.embed_content(
+                model=embedding_role_config.model,
+                contents=text,
+                config=types.EmbedContentConfig(task_type="SEMANTIC_SIMILARITY"),
+            )
         return np.array(result.embeddings[0].values)
     if embedding_role_config.client in {"openai", "openrouter"}:
         request_kwargs: dict[str, Any] = {
@@ -597,13 +604,13 @@ def run(
     embedding_role_config = resolve_embedding_role(
         llm_routing_config,
         TIER3_EMBEDDING_ROLE,
-        default_client=PRIMARY_JUDGE_CLIENT,
+        default_client="genai",
         default_model=EMBED_MODEL,
     )
     primary_judge_role_config = resolve_prompt_role(
         llm_routing_config,
         TIER3_JUDGE_PRIMARY_ROLE,
-        default_client="genai",
+        default_client=PRIMARY_JUDGE_CLIENT,
         default_model=PRIMARY_JUDGE_MODEL,
     )
     secondary_judge_role_config = resolve_prompt_role(
