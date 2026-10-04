@@ -65,6 +65,19 @@ OPTIONS {{indexConfig: {{`vector.dimensions`: {int(dimension)}, `vector.similari
 """.strip()
 
 
+# Labels of the corpus schema. An extracted entity typed like one keeps its type in entity_type but is
+# labelled Entity, so it can neither collide with a schema node's unique id nor pose as a schema node.
+SCHEMA_LABELS = frozenset({
+    "Chunk", "Claim", "Community", "CommunityBuild", "CommunityFinding", "CommunityReport", "Corpus",
+    "CorpusSource", "Document", "DocumentRevision", "ParentChunk",
+})
+
+
+def _entity_label(entity_type: str) -> str:
+    label = _cypher_identifier(entity_type, "Entity")
+    return "Entity" if label in SCHEMA_LABELS else label
+
+
 def _cypher_identifier(value: str, fallback: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
     if not normalized:
@@ -845,7 +858,7 @@ class Neo4jCorpusStore:
             )
         nodes_by_label: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in node_rows:
-            nodes_by_label[_cypher_identifier(row["type"], "Entity")].append(row)
+            nodes_by_label[_entity_label(row["type"])].append(row)
         relationships_by_type: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in relationship_rows:
             relationships_by_type[_cypher_identifier(row["type"], "RELATED_TO")].append(row)

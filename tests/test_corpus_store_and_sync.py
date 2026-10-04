@@ -511,3 +511,53 @@ def test_parent_graph_merges_a_node_whose_extracted_id_names_an_existing_entity(
     assert [(row["source_id"], row["target_id"]) for row in relationship_rows] == [("study", "evidence-2026-003")]
     mention_ids = next(parameters["entity_ids"] for query, parameters in calls if "HAS_ENTITY]->(entity)" in query)
     assert mention_ids == ["evidence-2026-003", "study"]
+
+
+def test_parent_graph_never_gives_an_extracted_entity_a_corpus_schema_label() -> None:
+    calls = []
+
+    class Result:
+        def consume(self):
+            return None
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return Result()
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def begin_transaction(self):
+            return Transaction()
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+    nodes = [
+        SimpleNamespace(id="parent_chunk", type="ParentChunk", properties={}),
+        SimpleNamespace(id="evidence-2026-003", type="Document", properties={}),
+        SimpleNamespace(id="deflated sharpe ratio", type="Metric", properties={}),
+    ]
+
+    store.persist_parent_graph("parent", [], SimpleNamespace(nodes=nodes, relationships=[]))
+
+    labelled = {
+        row["id"]: (query.split("ON CREATE SET node:")[1].split(",")[0], row["type"])
+        for query, parameters in calls
+        if "MERGE (node:__Entity__" in query
+        for row in parameters["nodes"]
+    }
+    assert labelled == {
+        "parent_chunk": ("Entity", "ParentChunk"),
+        "evidence-2026-003": ("Entity", "Document"),
+        "deflated sharpe ratio": ("Metric", "Metric"),
+    }

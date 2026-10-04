@@ -41,3 +41,19 @@ def test_executor_graph_transformer_drops_relationships_with_unknown_endpoints()
     assert len(graph.relationships) == 1
     assert graph.relationships[0].type == "USES"
     assert "source_id and target_id" in adapter.request.prompt
+
+
+def test_executor_graph_transformer_drops_a_node_named_by_the_parent_id() -> None:
+    class SelfNamingAdapter(Adapter):
+        def execute(self, request):
+            return "", {
+                "nodes": [{"id": "parent-1", "type": "ParentChunk"}, {"id": "a", "type": "System"}],
+                "relationships": [{"source_id": "parent-1", "target_id": "a", "type": "MENTIONS"}],
+            }, ModelUsage()
+
+    executor = ModelExecutor({GRAPH_EXTRACTION_ROLE: SelfNamingAdapter()}, {GRAPH_EXTRACTION_ROLE: GRAPH_EXTRACTION_ROLE})
+
+    graph = asyncio.run(ExecutorGraphTransformer(executor).transform("A text.", "parent-1"))
+
+    assert [node.id for node in graph.nodes] == ["a"]
+    assert graph.relationships == []
