@@ -563,6 +563,43 @@ def test_parent_graph_never_gives_an_extracted_entity_a_corpus_schema_label() ->
     }
 
 
+def test_parent_graph_never_stores_a_node_named_by_its_parent_id() -> None:
+    calls = []
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def begin_transaction(self):
+            return self
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return SimpleNamespace(consume=lambda: None)
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+    renamed = SimpleNamespace(id="this chunk", type="Section", properties={"id": "parent"})
+    named = SimpleNamespace(id="parent", type="ParentChunk", properties={})
+    entity = SimpleNamespace(id="sharpe", type="Metric", properties={})
+    graph = SimpleNamespace(
+        nodes=[renamed, named, entity],
+        relationships=[
+            SimpleNamespace(source=renamed, target=entity, type="MENTIONS", properties={}),
+            SimpleNamespace(source=entity, target=named, type="PART_OF", properties={}),
+        ],
+    )
+
+    store.persist_parent_graph("parent", [], graph, revision_id="revision")
+
+    node_ids = [row["id"] for query, parameters in calls if "MERGE (node:__Entity__" in query for row in parameters["nodes"]]
+    assert node_ids == ["sharpe"]
+    assert [row for query, parameters in calls if "MERGE (source)" in query for row in parameters["relationships"]] == []
+    assert next(parameters["entity_ids"] for query, parameters in calls if "HAS_ENTITY]->(entity)" in query) == ["sharpe"]
+
+
 class _RepairTransaction:
     """Applies the repair's label and entity_type statements to an in-memory entity table."""
 

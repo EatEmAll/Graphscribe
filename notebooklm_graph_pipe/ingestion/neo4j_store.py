@@ -911,6 +911,9 @@ class Neo4jCorpusStore:
             named_id = properties.pop("id", None)
             entity_id = named_id.strip() if isinstance(named_id, str) and named_id.strip() else str(node.id)
             entity_ids[str(node.id)] = entity_id
+            if entity_id == parent_id:
+                # The parent chunk itself, not an entity it mentions: drop it and its relationships.
+                continue
             node_rows.append(
                 {
                     "id": entity_id,
@@ -922,7 +925,7 @@ class Neo4jCorpusStore:
         for relationship in graph_document.relationships:
             source_id = entity_ids.get(str(relationship.source.id), str(relationship.source.id))
             target_id = entity_ids.get(str(relationship.target.id), str(relationship.target.id))
-            if source_id == target_id:
+            if source_id == target_id or parent_id in (source_id, target_id):
                 continue
             relationship_rows.append(
                 {
