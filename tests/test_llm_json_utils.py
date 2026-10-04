@@ -164,3 +164,27 @@ def test_decisions_client_raises_on_http_error(monkeypatch: pytest.MonkeyPatch) 
 
     with pytest.raises(RuntimeError, match="429"):
         utils.request_decisions(utils.OpenRouterDecisionsClient(api_key="k"), model_name="m", state="s", questions={})
+
+
+def test_openrouter_json_client_requests_json_from_non_collecting_providers() -> None:
+    captured: list[dict] = []
+
+    class _Responses:
+        def create(self, **kwargs):
+            captured.append(kwargs)
+            return utils.CliResponse(output_text='{"ok": true}')
+
+    class _Client:
+        responses = _Responses()
+
+    schema = {"type": "object", "properties": {"ok": {"type": "boolean"}}}
+    for response_schema in (schema, None):
+        payload, error = utils.generate_json_payload(
+            _Client(), client_name="openrouter_json", model_name="openai/gpt-6-luna", prompt="p",
+            system_instruction="s", max_output_tokens=10, response_schema=response_schema,
+        )
+        assert (payload, error) == ({"ok": True}, "")
+
+    assert captured[0]["text"] == {"format": {"type": "json_schema", "name": "response", "schema": schema, "strict": False}}
+    assert captured[1]["text"] == {"format": {"type": "json_object"}}
+    assert all(call["extra_body"] == {"provider": {"data_collection": "deny"}} for call in captured)

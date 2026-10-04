@@ -93,8 +93,8 @@ class EvaluationModel:
         judge_role = resolve_prompt_role(
             config_path,
             EVALUATION_JUDGE_ROLE,
-            default_client="genai",
-            default_model="gemini-2.5-flash",
+            default_client="openrouter_json",
+            default_model="openai/gpt-6-luna",
         )
         clients = build_single_prompt_clients(question_role.client, judge_role.client)
         return cls(question_role, judge_role, clients)
