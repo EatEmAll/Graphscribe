@@ -190,8 +190,8 @@ class GraphExtractionWorker:
         role = resolve_prompt_role(
             config_path,
             GRAPH_EXTRACTION_ROLE,
-            default_client="genai",
-            default_model="gemini-2.5-flash",
+            default_client="openrouter_json",
+            default_model="deepseek/deepseek-v4.1-flash",
         )
         client = build_single_prompt_clients(role.client)[role.client]
         executor = ModelExecutor(
