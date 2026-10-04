@@ -83,6 +83,8 @@ Vector and full-text retrieval becomes active before graph extraction completes.
 
 The routing file may configure `single_prompt.graph_extraction` and `single_prompt.answer`. Supported clients are `genai`, `openai`, and `openrouter`; set only the API key selected by those roles.
 
+An extracted entity is labelled by its type, except that a type naming a corpus-schema label (`Document`, `Claim`, `Chunk`, `ParentChunk`, `Corpus`, `Community`, and the rest) is kept in `entity_type` and labelled `Entity`. A node named by its parent chunk's own id is dropped with its relationships. Entities written before this rule can be relabelled the same way with `scripts/repair_schema_entity_labels.py --manifest-path <manifest>`. Without flags it only prints the plan. `--apply --journal <path> --confirm-target "<neo4j-uri>|<database>"` relabels every such entity in one transaction and records each one's before and after state in the journal. `--revert` with the same journal restores the before state. Both refuse while the corpus sync lock is held and change only entities still in the state the journal expects.
+
 ## REST API
 
 ```powershell

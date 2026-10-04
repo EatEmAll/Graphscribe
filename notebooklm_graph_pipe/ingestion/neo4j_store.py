@@ -78,6 +78,82 @@ def _entity_label(entity_type: str) -> str:
     return "Entity" if label in SCHEMA_LABELS else label
 
 
+def plan_schema_label_repair(tx) -> list[dict[str, Any]]:
+    """Read the entities that carry a corpus-schema label and the state the repair gives each.
+
+    The repair removes the schema labels, labels the entity Entity when no other type label is left,
+    and keeps the removed type in entity_type when the entity had none, as persist_parent_graph does.
+    """
+    entries = []
+    for row in tx.run(
+        """
+        MATCH (entity:__Entity__)
+        WHERE any(label IN labels(entity) WHERE label IN $schema_labels)
+        RETURN entity.id AS id, labels(entity) AS labels, entity.entity_type AS entity_type
+        ORDER BY id
+        """,
+        schema_labels=sorted(SCHEMA_LABELS),
+    ):
+        labels = sorted(row["labels"])
+        removed = [label for label in labels if label in SCHEMA_LABELS]
+        kept = [label for label in labels if label not in SCHEMA_LABELS]
+        entries.append(
+            {
+                "id": row["id"],
+                "before": {"labels": labels, "entity_type": row["entity_type"]},
+                "after": {
+                    "labels": kept if set(kept) - {"__Entity__"} else sorted([*kept, "Entity"]),
+                    "entity_type": row["entity_type"] if row["entity_type"] is not None else removed[0],
+                },
+            }
+        )
+    return entries
+
+
+def transition_entity_labels(tx, entries: Sequence[dict[str, Any]], source: str, target: str) -> None:
+    """Move each entry's entity from its `source` state to its `target` state, or raise.
+
+    Applying a repair plan is the transition before -> after, and reverting its journal is after -> before.
+    Only schema labels and Entity are ever added or removed, and every entity must be in its source state.
+    """
+    def states() -> dict[str, dict[str, Any]]:
+        rows = tx.run(
+            """
+            UNWIND $ids AS id
+            OPTIONAL MATCH (entity:__Entity__ {id: id})
+            RETURN id, labels(entity) AS labels, entity.entity_type AS entity_type
+            """,
+            ids=[entry["id"] for entry in entries],
+        )
+        return {
+            row["id"]: {"labels": sorted(row["labels"]) if row["labels"] is not None else None, "entity_type": row["entity_type"]}
+            for row in rows
+        }
+
+    current = states()
+    drifted = [entry["id"] for entry in entries if current.get(entry["id"]) != entry[source]]
+    if drifted:
+        raise ValueError(f"{len(drifted)} entities are not in their {source} state: {drifted[:5]}")
+    changes: dict[tuple[str, str], list[str]] = defaultdict(list)
+    for entry in entries:
+        before, after = set(entry[source]["labels"]), set(entry[target]["labels"])
+        for operation, labels in (("REMOVE", before - after), ("SET", after - before)):
+            for label in labels:
+                if label not in SCHEMA_LABELS | {"Entity"}:
+                    raise ValueError(f"Refusing to change label {label!r} on entity {entry['id']!r}.")
+                changes[(operation, label)].append(entry["id"])
+    for (operation, label), ids in sorted(changes.items()):
+        tx.run(
+            f"UNWIND $ids AS id MATCH (entity:__Entity__ {{id: id}}) {operation} entity:{label}", ids=ids
+        ).consume()
+    tx.run(
+        "UNWIND $rows AS row MATCH (entity:__Entity__ {id: row.id}) SET entity.entity_type = row.entity_type",
+        rows=[{"id": entry["id"], "entity_type": entry[target]["entity_type"]} for entry in entries],
+    ).consume()
+    if (written := states()) != {entry["id"]: entry[target] for entry in entries}:
+        raise RuntimeError(f"Entities did not reach their {target} state: {written}")
+
+
 def _cypher_identifier(value: str, fallback: str) -> str:
     normalized = re.sub(r"[^A-Za-z0-9_]+", "_", value).strip("_")
     if not normalized:

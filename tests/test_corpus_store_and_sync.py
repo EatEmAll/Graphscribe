@@ -561,3 +561,93 @@ def test_parent_graph_never_gives_an_extracted_entity_a_corpus_schema_label() ->
         "evidence-2026-003": ("Entity", "Document"),
         "deflated sharpe ratio": ("Metric", "Metric"),
     }
+
+
+class _RepairTransaction:
+    """Applies the repair's label and entity_type statements to an in-memory entity table."""
+
+    def __init__(self, entities):
+        self.entities = entities
+        self.queries = []
+
+    def run(self, query, **parameters):
+        self.queries.append(query)
+        if "WHERE any(label IN labels(entity)" in query:
+            return [
+                {"id": entity_id, "labels": list(state["labels"]), "entity_type": state["entity_type"]}
+                for entity_id, state in sorted(self.entities.items())
+                if set(state["labels"]) & set(parameters["schema_labels"])
+            ]
+        if "OPTIONAL MATCH" in query:
+            return [
+                {
+                    "id": entity_id,
+                    "labels": list(self.entities[entity_id]["labels"]) if entity_id in self.entities else None,
+                    "entity_type": self.entities.get(entity_id, {}).get("entity_type"),
+                }
+                for entity_id in parameters["ids"]
+            ]
+        if "SET entity.entity_type" in query:
+            for row in parameters["rows"]:
+                self.entities[row["id"]]["entity_type"] = row["entity_type"]
+        else:
+            operation, label = query.rsplit(" ", 2)[-2], query.rsplit(":", 1)[-1]
+            for entity_id in parameters["ids"]:
+                labels = self.entities[entity_id]["labels"]
+                if operation == "REMOVE":
+                    labels.remove(label)
+                else:
+                    labels.append(label)
+        return SimpleNamespace(consume=lambda: None)
+
+
+def test_schema_label_repair_relabels_entities_and_reverts_from_its_journal() -> None:
+    from notebooklm_graph_pipe.ingestion.neo4j_store import plan_schema_label_repair, transition_entity_labels
+
+    original = {
+        "tax documents": {"labels": ["__Entity__", "Document"], "entity_type": None},
+        "chunk_1": {"labels": ["__Entity__", "Chunk"], "entity_type": "Chunk"},
+        "the book": {"labels": ["__Entity__", "Document", "Object", "Book"], "entity_type": None},
+        "sharpe": {"labels": ["__Entity__", "Metric"], "entity_type": "Metric"},
+    }
+    tx = _RepairTransaction({key: {"labels": list(value["labels"]), "entity_type": value["entity_type"]} for key, value in original.items()})
+
+    entries = plan_schema_label_repair(tx)
+    transition_entity_labels(tx, entries, "before", "after")
+
+    assert {key: (sorted(value["labels"]), value["entity_type"]) for key, value in tx.entities.items()} == {
+        "tax documents": (["Entity", "__Entity__"], "Document"),
+        "chunk_1": (["Entity", "__Entity__"], "Chunk"),
+        "the book": (["Book", "Object", "__Entity__"], "Document"),
+        "sharpe": (["Metric", "__Entity__"], "Metric"),
+    }
+    assert plan_schema_label_repair(tx) == []
+
+    journal = json.loads(json.dumps(entries))
+    transition_entity_labels(tx, journal, "after", "before")
+
+    assert {key: (sorted(value["labels"]), value["entity_type"]) for key, value in tx.entities.items()} == {
+        key: (sorted(value["labels"]), value["entity_type"]) for key, value in original.items()
+    }
+
+
+def test_schema_label_repair_refuses_drifted_entities_and_foreign_labels() -> None:
+    from notebooklm_graph_pipe.ingestion.neo4j_store import transition_entity_labels
+
+    tx = _RepairTransaction({"paper": {"labels": ["__Entity__", "Document"], "entity_type": None}})
+    drifted = [{
+        "id": "paper",
+        "before": {"labels": ["Document", "__Entity__"], "entity_type": "Document"},
+        "after": {"labels": ["Entity", "__Entity__"], "entity_type": "Document"},
+    }]
+    with pytest.raises(ValueError, match="not in their before state"):
+        transition_entity_labels(tx, drifted, "before", "after")
+
+    foreign = [{
+        "id": "paper",
+        "before": {"labels": ["Document", "__Entity__"], "entity_type": None},
+        "after": {"labels": ["Paper", "__Entity__"], "entity_type": None},
+    }]
+    with pytest.raises(ValueError, match="Refusing to change label 'Paper'"):
+        transition_entity_labels(tx, foreign, "before", "after")
+    assert [query for query in tx.queries if "REMOVE" in query or "SET entity" in query] == []
