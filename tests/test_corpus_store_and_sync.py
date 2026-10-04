@@ -511,3 +511,180 @@ def test_parent_graph_merges_a_node_whose_extracted_id_names_an_existing_entity(
     assert [(row["source_id"], row["target_id"]) for row in relationship_rows] == [("study", "evidence-2026-003")]
     mention_ids = next(parameters["entity_ids"] for query, parameters in calls if "HAS_ENTITY]->(entity)" in query)
     assert mention_ids == ["evidence-2026-003", "study"]
+
+
+def test_parent_graph_never_gives_an_extracted_entity_a_corpus_schema_label() -> None:
+    calls = []
+
+    class Result:
+        def consume(self):
+            return None
+
+    class Transaction:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return Result()
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def begin_transaction(self):
+            return Transaction()
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+    nodes = [
+        SimpleNamespace(id="parent_chunk", type="ParentChunk", properties={}),
+        SimpleNamespace(id="evidence-2026-003", type="Document", properties={}),
+        SimpleNamespace(id="deflated sharpe ratio", type="Metric", properties={}),
+    ]
+
+    store.persist_parent_graph("parent", [], SimpleNamespace(nodes=nodes, relationships=[]))
+
+    labelled = {
+        row["id"]: (query.split("ON CREATE SET node:")[1].split(",")[0], row["type"])
+        for query, parameters in calls
+        if "MERGE (node:__Entity__" in query
+        for row in parameters["nodes"]
+    }
+    assert labelled == {
+        "parent_chunk": ("Entity", "ParentChunk"),
+        "evidence-2026-003": ("Entity", "Document"),
+        "deflated sharpe ratio": ("Metric", "Metric"),
+    }
+
+
+def test_parent_graph_never_stores_a_node_named_by_its_parent_id() -> None:
+    calls = []
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def begin_transaction(self):
+            return self
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return SimpleNamespace(consume=lambda: None)
+
+    store = Neo4jCorpusStore(SimpleNamespace(session=lambda **kwargs: Session()))
+    renamed = SimpleNamespace(id="this chunk", type="Section", properties={"id": "parent"})
+    named = SimpleNamespace(id="parent", type="ParentChunk", properties={})
+    entity = SimpleNamespace(id="sharpe", type="Metric", properties={})
+    graph = SimpleNamespace(
+        nodes=[renamed, named, entity],
+        relationships=[
+            SimpleNamespace(source=renamed, target=entity, type="MENTIONS", properties={}),
+            SimpleNamespace(source=entity, target=named, type="PART_OF", properties={}),
+        ],
+    )
+
+    store.persist_parent_graph("parent", [], graph, revision_id="revision")
+
+    node_ids = [row["id"] for query, parameters in calls if "MERGE (node:__Entity__" in query for row in parameters["nodes"]]
+    assert node_ids == ["sharpe"]
+    assert [row for query, parameters in calls if "MERGE (source)" in query for row in parameters["relationships"]] == []
+    assert next(parameters["entity_ids"] for query, parameters in calls if "HAS_ENTITY]->(entity)" in query) == ["sharpe"]
+
+
+class _RepairTransaction:
+    """Applies the repair's label and entity_type statements to an in-memory entity table."""
+
+    def __init__(self, entities):
+        self.entities = entities
+        self.queries = []
+
+    def run(self, query, **parameters):
+        self.queries.append(query)
+        if "WHERE any(label IN labels(entity)" in query:
+            return [
+                {"id": entity_id, "labels": list(state["labels"]), "entity_type": state["entity_type"]}
+                for entity_id, state in sorted(self.entities.items())
+                if set(state["labels"]) & set(parameters["schema_labels"])
+            ]
+        if "OPTIONAL MATCH" in query:
+            return [
+                {
+                    "id": entity_id,
+                    "labels": list(self.entities[entity_id]["labels"]) if entity_id in self.entities else None,
+                    "entity_type": self.entities.get(entity_id, {}).get("entity_type"),
+                }
+                for entity_id in parameters["ids"]
+            ]
+        if "SET entity.entity_type" in query:
+            for row in parameters["rows"]:
+                self.entities[row["id"]]["entity_type"] = row["entity_type"]
+        else:
+            operation, label = query.rsplit(" ", 2)[-2], query.rsplit(":", 1)[-1]
+            for entity_id in parameters["ids"]:
+                labels = self.entities[entity_id]["labels"]
+                if operation == "REMOVE":
+                    labels.remove(label)
+                else:
+                    labels.append(label)
+        return SimpleNamespace(consume=lambda: None)
+
+
+def test_schema_label_repair_relabels_entities_and_reverts_from_its_journal() -> None:
+    from notebooklm_graph_pipe.ingestion.neo4j_store import plan_schema_label_repair, transition_entity_labels
+
+    original = {
+        "tax documents": {"labels": ["__Entity__", "Document"], "entity_type": None},
+        "chunk_1": {"labels": ["__Entity__", "Chunk"], "entity_type": "Chunk"},
+        "the book": {"labels": ["__Entity__", "Document", "Object", "Book"], "entity_type": None},
+        "sharpe": {"labels": ["__Entity__", "Metric"], "entity_type": "Metric"},
+    }
+    tx = _RepairTransaction({key: {"labels": list(value["labels"]), "entity_type": value["entity_type"]} for key, value in original.items()})
+
+    entries = plan_schema_label_repair(tx)
+    transition_entity_labels(tx, entries, "before", "after")
+
+    assert {key: (sorted(value["labels"]), value["entity_type"]) for key, value in tx.entities.items()} == {
+        "tax documents": (["Entity", "__Entity__"], "Document"),
+        "chunk_1": (["Entity", "__Entity__"], "Chunk"),
+        "the book": (["Book", "Object", "__Entity__"], "Document"),
+        "sharpe": (["Metric", "__Entity__"], "Metric"),
+    }
+    assert plan_schema_label_repair(tx) == []
+
+    journal = json.loads(json.dumps(entries))
+    transition_entity_labels(tx, journal, "after", "before")
+
+    assert {key: (sorted(value["labels"]), value["entity_type"]) for key, value in tx.entities.items()} == {
+        key: (sorted(value["labels"]), value["entity_type"]) for key, value in original.items()
+    }
+
+
+def test_schema_label_repair_refuses_drifted_entities_and_foreign_labels() -> None:
+    from notebooklm_graph_pipe.ingestion.neo4j_store import transition_entity_labels
+
+    tx = _RepairTransaction({"paper": {"labels": ["__Entity__", "Document"], "entity_type": None}})
+    drifted = [{
+        "id": "paper",
+        "before": {"labels": ["Document", "__Entity__"], "entity_type": "Document"},
+        "after": {"labels": ["Entity", "__Entity__"], "entity_type": "Document"},
+    }]
+    with pytest.raises(ValueError, match="not in their before state"):
+        transition_entity_labels(tx, drifted, "before", "after")
+
+    foreign = [{
+        "id": "paper",
+        "before": {"labels": ["Document", "__Entity__"], "entity_type": None},
+        "after": {"labels": ["Paper", "__Entity__"], "entity_type": None},
+    }]
+    with pytest.raises(ValueError, match="Refusing to change label 'Paper'"):
+        transition_entity_labels(tx, foreign, "before", "after")
+    assert [query for query in tx.queries if "REMOVE" in query or "SET entity" in query] == []

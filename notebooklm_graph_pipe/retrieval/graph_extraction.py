@@ -146,7 +146,8 @@ class ExecutorGraphTransformer:
                 properties=dict(raw.get("properties") or {}),
             )
             for raw in payload.get("nodes") or []
-            if str(raw.get("id") or "").strip()
+            # A node named by the parent's own id is the chunk itself, not an entity it mentions.
+            if str(raw.get("id") or "").strip() and str(raw["id"]) != parent_id
         }
         relationships = []
         for raw in payload.get("relationships") or []:
