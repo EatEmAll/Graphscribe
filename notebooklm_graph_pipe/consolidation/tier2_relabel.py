@@ -28,6 +28,7 @@ from notebooklm_graph_pipe.runtime.llm_json_utils import (
     generate_json_payload,
     is_transient_model_error,
     make_cache_key,
+    request_decisions,
 )
 from notebooklm_graph_pipe.runtime.llm_routing import TIER2_PRIMARY_ROLE, TIER2_SECONDARY_ROLE, PromptRoleConfig, resolve_prompt_role
 
@@ -35,8 +36,8 @@ DEFAULT_NEO4J_URI = os.environ.get("NEO4J_URI", "bolt://localhost:7687")
 DEFAULT_NEO4J_USER = os.environ.get("NEO4J_USERNAME", "neo4j")
 DEFAULT_NEO4J_PASSWORD = os.environ.get("NEO4J_PASSWORD", "password123")
 DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
-PRIMARY_CLIENT = os.environ.get("TIER2_PRIMARY_CLIENT", "openrouter")
-MODEL_NAME = os.environ.get("TIER2_MODEL_NAME", "minimax/minimax-m3")
+PRIMARY_CLIENT = os.environ.get("TIER2_PRIMARY_CLIENT", "openrouter_decisions")
+MODEL_NAME = os.environ.get("TIER2_MODEL_NAME", "typesafe/jev-1.13")
 SECOND_STAGE_CLIENT = os.environ.get("TIER2_SECOND_STAGE_CLIENT", "codex")
 SECOND_STAGE_MODEL_NAME = os.environ.get("TIER2_SECOND_STAGE_MODEL_NAME", "gpt-5.6-luna")
 SECOND_STAGE_REASONING_EFFORT = os.environ.get("TIER2_SECOND_STAGE_REASONING_EFFORT", "low")
@@ -223,6 +224,39 @@ def _build_prompt(node: dict[str, Any]) -> str:
     )
 
 
+def build_decision_question(label_catalog: dict[str, Any]) -> dict[str, Any]:
+    """One choice question over the catalog labels, for an OpenRouter decision model."""
+    examples = label_catalog.get("preferred_examples", {})
+    return {
+        "label": {
+            "type": "choice",
+            "instructions": (
+                "Assign the single most specific label for this quantitative-finance knowledge-graph entity. "
+                "Use Concept only as the last-resort fallback."
+            ),
+            "criteria": {
+                label: examples.get(label, "Use only when it is the most specific available fit.")
+                for label in label_catalog["labels"]
+            },
+        }
+    }
+
+
+def _decide_label(client: Any, model_name: str, node: dict[str, Any], label_catalog: dict[str, Any]) -> tuple[dict[str, Any] | None, str]:
+    """Ask a decision model for the label; return a payload shaped like the prompt models' JSON."""
+    try:
+        answers = request_decisions(client, model_name=model_name, state=node, questions=build_decision_question(label_catalog))
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    answer = answers.get("label") or {}
+    label = answer.get("choice")
+    if not isinstance(label, str):
+        return None, "Decision model returned no choice."
+    probabilities = answer.get("probabilities") or {}
+    confidence = probabilities.get(label, answer.get("confidence", 0.0))
+    return {"label": label, "confidence": confidence, "reason": "decision model choice"}, ""
+
+
 def _build_classification_cache_key(
     *,
     client_name: str,
@@ -273,17 +307,22 @@ def _classify_once(
         if isinstance(cached_result, dict):
             return dict(cached_result)
 
-    payload, error_message = generate_json_payload(
-        _resolve_client(clients, role_config.client),
-        client_name=role_config.client,
-        model_name=role_config.model,
-        reasoning_effort=role_config.reasoning_effort,
-        prompt=_build_prompt(normalized_node),
-        system_instruction=system_instruction,
-        max_output_tokens=120,
-        temperature=0.0,
-        max_attempts=1,
-    )
+    if role_config.client == "openrouter_decisions":
+        payload, error_message = _decide_label(
+            _resolve_client(clients, role_config.client), role_config.model, normalized_node, label_catalog
+        )
+    else:
+        payload, error_message = generate_json_payload(
+            _resolve_client(clients, role_config.client),
+            client_name=role_config.client,
+            model_name=role_config.model,
+            reasoning_effort=role_config.reasoning_effort,
+            prompt=_build_prompt(normalized_node),
+            system_instruction=system_instruction,
+            max_output_tokens=120,
+            temperature=0.0,
+            max_attempts=1,
+        )
     if payload is None:
         return {
             "status": "unresolved",

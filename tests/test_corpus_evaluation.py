@@ -89,3 +89,14 @@ def test_evaluation_model_validates_judge_scores() -> None:
     assert result["total_score"] == 14
     assert result["normalized_score"] == 7.0
     assert result["citation_validity"] == 1.0
+
+
+def test_evaluation_judge_defaults_to_gpt_6_luna_through_openrouter_json(monkeypatch) -> None:
+    monkeypatch.setenv("GOOGLE_API_KEY", "test-google")
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-openrouter")
+
+    model = EvaluationModel.from_routing_config(None)
+
+    assert model.judge_role == PromptRoleConfig("openrouter_json", "openai/gpt-6-luna")
+    assert model.question_role == PromptRoleConfig("genai", "gemini-2.5-flash")
+    assert set(model.clients) == {"genai", "openrouter_json"}

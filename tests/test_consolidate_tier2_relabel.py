@@ -144,3 +144,39 @@ def test_append_decision_jsonl_writes_expected_fields(tmp_path) -> None:
     payload = json.loads(path.read_text(encoding="utf-8").strip())
     assert payload["new_label"] == "Trading Concept"
     assert payload["used_second_stage"] is False
+
+
+def test_classify_once_uses_decision_model_choice_and_probability(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict = {}
+
+    def fake_request(client, *, model_name, state, questions):
+        captured.update(model=model_name, state=state, questions=questions)
+        return {"label": {"type": "choice", "choice": "Trading Concept", "confidence": 0.5,
+                          "probabilities": {"Trading Concept": 0.81, "Concept": 0.19}}}
+
+    monkeypatch.setattr(t2, "request_decisions", fake_request)
+    role = t2.PromptRoleConfig(client="openrouter_decisions", model="typesafe/jev-1.13")
+
+    result = t2._classify_once({"openrouter_decisions": object()}, role_config=role, node=_node(), label_catalog=_catalog())
+
+    assert (result["status"], result["label"], result["confidence"]) == ("classified", "Trading Concept", 0.81)
+    assert captured["model"] == "typesafe/jev-1.13"
+    assert captured["state"] == t2._normalize_node_for_prompt(_node())
+    assert set(captured["questions"]["label"]["criteria"]) == set(_catalog()["labels"])
+
+
+def test_classify_once_reports_decision_model_failure_as_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    def failing_request(client, **kwargs):
+        raise RuntimeError("Decisions API returned 429: rate limit")
+
+    monkeypatch.setattr(t2, "request_decisions", failing_request)
+    role = t2.PromptRoleConfig(client="openrouter_decisions", model="typesafe/jev-1.13")
+
+    result = t2._classify_once({"openrouter_decisions": object()}, role_config=role, node=_node(), label_catalog=_catalog())
+
+    assert result["status"] == "unresolved"
+    assert "429" in result["reason"]
+
+
+def test_tier2_primary_defaults_to_the_jev_decision_model() -> None:
+    assert (t2.PRIMARY_CLIENT, t2.MODEL_NAME) == ("openrouter_decisions", "typesafe/jev-1.13")

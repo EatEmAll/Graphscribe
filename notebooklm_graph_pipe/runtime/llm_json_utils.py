@@ -8,15 +8,21 @@ import shutil
 import subprocess
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+import httpx
 from google import genai
 from google.genai import types
 from openai import OpenAI
 
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
+# Route decision requests only to providers that neither collect nor retain request data.
+OPENROUTER_DECISIONS_PROVIDER: dict[str, Any] = {"data_collection": "deny", "zdr": True}
+# The openrouter_json client asks for JSON output and uses only providers that do not collect request data.
+OPENROUTER_JSON_PROVIDER: dict[str, Any] = {"data_collection": "deny"}
 CLI_JSON_SCHEMA: dict[str, Any] = {"type": "object", "additionalProperties": True}
 CODEX_CLI_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -32,6 +38,36 @@ class SubscriptionCliClient:
     name: str
     executable: str
     timeout_seconds: float = DEFAULT_CLI_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True)
+class OpenRouterDecisionsClient:
+    """OpenRouter decision models (typed questions in, probabilities out) on the alpha Decisions API."""
+
+    api_key: str = field(repr=False)
+    timeout_seconds: float = 60.0
+
+
+def request_decisions(
+    client: OpenRouterDecisionsClient,
+    *,
+    model_name: str,
+    state: Any,
+    questions: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the answers object for one Decisions API request; raises on an HTTP error."""
+    response = httpx.post(
+        OPENROUTER_DECISIONS_URL,
+        json={"model": model_name, "state": state, "questions": questions, "provider": OPENROUTER_DECISIONS_PROVIDER},
+        headers={"Authorization": f"Bearer {client.api_key}"},
+        timeout=client.timeout_seconds,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"Decisions API returned {response.status_code}: {response.text[:300]}")
+    answers = response.json().get("answers")
+    if not isinstance(answers, dict):
+        raise RuntimeError("Decisions API response has no answers object.")
+    return answers
 
 
 @dataclass(frozen=True)
@@ -225,11 +261,17 @@ def build_single_prompt_clients(*client_names: str) -> dict[str, Any]:
                 raise RuntimeError("Set OPENAI_API_KEY environment variable.")
             clients[client_name] = build_openai_compatible_client(api_key=api_key)
             continue
-        if client_name == "openrouter":
+        if client_name in {"openrouter", "openrouter_json"}:
             api_key = os.environ.get("OPENROUTER_API_KEY", "")
             if not api_key:
                 raise RuntimeError("Set OPENROUTER_API_KEY environment variable.")
             clients[client_name] = build_openai_compatible_client(api_key=api_key, base_url=OPENROUTER_BASE_URL)
+            continue
+        if client_name == "openrouter_decisions":
+            api_key = os.environ.get("OPENROUTER_API_KEY", "")
+            if not api_key:
+                raise RuntimeError("Set OPENROUTER_API_KEY environment variable.")
+            clients[client_name] = OpenRouterDecisionsClient(api_key=api_key)
             continue
         if client_name in {"codex", "claude"}:
             executable = shutil.which(client_name)
@@ -277,6 +319,24 @@ def _generate_structured_response(
                 response_mime_type="application/json",
                 response_json_schema=response_schema,
             ),
+        )
+    if normalized_client == "openrouter_json":
+        # Mirrors the Gemini path: the role's schema when it has one, otherwise plain JSON mode.
+        text_format = (
+            {"type": "json_schema", "name": "response", "schema": response_schema, "strict": False}
+            if response_schema
+            else {"type": "json_object"}
+        )
+        return client.responses.create(
+            model=model_name,
+            input=[
+                {"role": "system", "content": system_instruction},
+                {"role": "user", "content": prompt},
+            ],
+            max_output_tokens=max_output_tokens,
+            temperature=temperature,
+            text={"format": text_format},
+            extra_body={"provider": OPENROUTER_JSON_PROVIDER},
         )
     if normalized_client in {"openai", "openrouter"}:
         return client.responses.create(
