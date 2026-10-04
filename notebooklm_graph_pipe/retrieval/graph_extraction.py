@@ -202,8 +202,10 @@ class GraphExtractionWorker:
                     max_concurrency=max_concurrency,
                     max_attempts=2,
                     # The timeout spans both attempts. Dense parents spend most of the output-token
-                    # cap on thinking, and half of them overran the 120-second default.
-                    timeout_seconds=360.0,
+                    # cap on thinking: deepseek-v4.1-flash calls took up to 441 seconds, and 6 of 54
+                    # in RatchetLab#572's rebuild reasoned to the cap and ended incomplete, so the
+                    # budget leaves room for the retry after one such runaway call.
+                    timeout_seconds=900.0,
                 )
             },
             cache_path=cache_path,

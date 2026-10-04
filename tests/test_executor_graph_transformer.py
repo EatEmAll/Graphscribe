@@ -87,6 +87,7 @@ def test_graph_extraction_defaults_to_deepseek_through_openrouter_json(monkeypat
     asyncio.run(worker.transformer.transform("Alpha uses Beta.", "parent-1"))
 
     assert built == [("openrouter_json",)]
+    assert worker.transformer.executor.policies[GRAPH_EXTRACTION_ROLE].timeout_seconds == 900.0
     assert captured[0]["model"] == "deepseek/deepseek-v4.1-flash"
     assert captured[0]["text"] == {
         "format": {"type": "json_schema", "name": "response", "schema": graph_extraction.GRAPH_SCHEMA, "strict": False}
