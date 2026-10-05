@@ -11,6 +11,7 @@ import inspect
 import json
 import os
 import pickle
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -22,11 +23,16 @@ from neo4j import GraphDatabase
 
 from notebooklm_graph_pipe.paths import CONSOLIDATION_CACHE_DIR
 from notebooklm_graph_pipe.runtime.graph_text_utils import coerce_text, normalize_name, sorted_unique_texts, token_set
-from notebooklm_graph_pipe.runtime.llm_json_utils import JsonDiskCache, build_single_prompt_clients, generate_json_payload, make_cache_key
+from notebooklm_graph_pipe.runtime.llm_json_utils import (
+    JsonDiskCache,
+    build_single_prompt_clients,
+    generate_json_payload,
+    make_cache_key,
+    request_decisions,
+)
 from notebooklm_graph_pipe.runtime.llm_routing import (
     TIER3_EMBEDDING_ROLE,
     TIER3_JUDGE_PRIMARY_ROLE,
-    TIER3_JUDGE_SECONDARY_ROLE,
     EmbeddingRoleConfig,
     PromptRoleConfig,
     resolve_embedding_role,
@@ -40,18 +46,20 @@ DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 EMBED_MODEL = os.environ.get("TIER3_EMBED_MODEL", "gemini-embedding-2")
-PRIMARY_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_PRIMARY", "openrouter")
+PRIMARY_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_PRIMARY", "openrouter_decisions")
 PRIMARY_JUDGE_MODEL = os.environ.get(
     "TIER3_JUDGE_MODEL_PRIMARY",
-    os.environ.get("TIER3_JUDGE_MODEL", "minimax/minimax-m3"),
+    os.environ.get("TIER3_JUDGE_MODEL", "typesafe/jev-1.13"),
 )
-SECOND_STAGE_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_SECOND_STAGE", "codex")
-SECOND_STAGE_JUDGE_MODEL = os.environ.get("TIER3_JUDGE_MODEL_SECOND_STAGE", "gpt-5.6-luna")
-SECOND_STAGE_JUDGE_REASONING_EFFORT = os.environ.get("TIER3_JUDGE_REASONING_EFFORT_SECOND_STAGE", "medium")
-LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("TIER3_LOW_CONFIDENCE_THRESHOLD", "0.72"))
+# A pair merges only when the judge's ALIAS probability reaches this threshold. ratchetlab#580 chose it for
+# typesafe/jev-1.13 on a calibration split at precision 0.97; another judge needs its own. There is no second stage.
+ALIAS_THRESHOLD = float(os.environ.get("TIER3_ALIAS_THRESHOLD", "0.65"))
 MODEL_MAX_ATTEMPTS = int(os.environ.get("TIER3_MODEL_MAX_ATTEMPTS", "3"))
 MODEL_RETRY_SLEEP_SECONDS = float(os.environ.get("TIER3_MODEL_RETRY_SLEEP_SECONDS", "1.0"))
 NEIGHBORS_PER_ENTITY = int(os.environ.get("TIER3_NEIGHBORS_PER_ENTITY", "12"))
+# Prompt-model judges: reasoning models spend their output budget on reasoning before the JSON verdict;
+# at 120 tokens minimax-m3 left most pairs unresolved (Graphscribe#19).
+JUDGE_MAX_OUTPUT_TOKENS = 2048
 
 DEFAULT_THRESHOLD = 0.85
 DEFAULT_EMBED_PROGRESS_EVERY = 100
@@ -69,6 +77,19 @@ LABEL_COMPATIBILITY_GROUPS = [
     {"Signal", "Indicator", "Market Feature"},
     {"Method", "Algorithm", "Model"},
 ]
+
+# Decision-model question for openrouter_decisions judges; the state is the normalized entity pair.
+DECISION_QUESTION = {
+    "same": {
+        "type": "noul",
+        "instructions": "Do entity A and entity B refer to the same entity or concept?",
+        "criteria": {
+            "true": "A and B clearly refer to the same entity or concept, for example a spelling variant, abbreviation or alias.",
+            "false": "A and B are different entities or concepts, or their labels or neighborhood evidence materially conflict.",
+        },
+    }
+}
+DECISION_STATE_FIELDS = ("name", "labels", "degree", "relation_types", "neighbor_labels", "description")
 
 JUDGE_SYSTEM = (
     "You are a high-precision knowledge graph deduplication expert. "
@@ -109,6 +130,15 @@ def _looks_alias_like(name_a: str, name_b: str) -> bool:
     acronym_a = "".join(token[0] for token in tokens_a if token)
     acronym_b = "".join(token[0] for token in tokens_b if token)
     return bool(acronym_a and acronym_b and {acronym_a, acronym_b} == {normalized_a.replace(" ", ""), normalized_b.replace(" ", "")})
+
+
+def _names_differ_only_in_digits(name_a: str, name_b: str) -> bool:
+    """True for names such as AR(1)/AR(2) or Iron Man/Iron Man 3, which a judge must never merge."""
+
+    def letters(name: str) -> str:
+        return re.sub(r"[^a-z]", "", re.sub(r"\d+", "", name.lower()))
+
+    return letters(name_a) == letters(name_b) and re.findall(r"\d+", name_a) != re.findall(r"\d+", name_b)
 
 
 def _labels_are_clearly_incompatible(labels_a: list[str], labels_b: list[str]) -> bool:
@@ -303,7 +333,7 @@ def _build_judge_cache_key(
     entity_b: dict[str, Any],
 ) -> str:
     return make_cache_key(
-        namespace="tier3_judge_v1",
+        namespace="tier3_judge_v2",
         payload={
             "client_name": client_name,
             "model_name": model_name,
@@ -312,7 +342,7 @@ def _build_judge_cache_key(
             "entity_a": entity_a,
             "entity_b": entity_b,
             "temperature": 0.0,
-            "max_output_tokens": 120,
+            "max_output_tokens": JUDGE_MAX_OUTPUT_TOKENS,
         },
     )
 
@@ -344,6 +374,16 @@ def _judge_once(
         if isinstance(cached_result, dict):
             return dict(cached_result)
 
+    base = {"client_name": role_config.client, "model_name": role_config.model, "stage": stage}
+    if role_config.client == "openrouter_decisions":
+        p_alias, error_message = _decide_alias(_resolve_client(clients, role_config.client), role_config.model, normalized_a, normalized_b)
+        if p_alias is None:
+            return {**base, "status": "unresolved", "p_alias": 0.0, "reason": error_message}
+        result = {**base, "status": "classified", "p_alias": p_alias, "reason": "decision model probability"}
+        if cache is not None:
+            cache.set(cache_key, result)
+        return result
+
     payload, error_message = generate_json_payload(
         _resolve_client(clients, role_config.client),
         client_name=role_config.client,
@@ -351,41 +391,43 @@ def _judge_once(
         reasoning_effort=role_config.reasoning_effort,
         prompt=_build_prompt(normalized_a, normalized_b),
         system_instruction=JUDGE_SYSTEM,
-        max_output_tokens=120,
+        max_output_tokens=JUDGE_MAX_OUTPUT_TOKENS,
         temperature=0.0,
         max_attempts=max(MODEL_MAX_ATTEMPTS, 1),
         retry_sleep_seconds=MODEL_RETRY_SLEEP_SECONDS,
     )
     if payload is None:
-        return {
-            "status": "unresolved",
-            "verdict": "DIFFERENT",
-            "confidence": 0.0,
-            "reason": error_message or "Invalid or empty JSON response",
-            "client_name": role_config.client,
-            "model_name": role_config.model,
-            "stage": stage,
-        }
+        return {**base, "status": "unresolved", "p_alias": 0.0, "reason": error_message or "Invalid or empty JSON response"}
 
     verdict = _coerce_text(payload.get("verdict")).upper()
-    if verdict not in {"ALIAS", "DIFFERENT"}:
-        verdict = "DIFFERENT"
     try:
         confidence = max(0.0, min(float(payload.get("confidence", 0.0)), 1.0))
     except (TypeError, ValueError):
         confidence = 0.0
     result = {
+        **base,
         "status": "classified",
-        "verdict": verdict,
-        "confidence": confidence,
+        "p_alias": confidence if verdict == "ALIAS" else 1.0 - confidence if verdict == "DIFFERENT" else 0.0,
         "reason": _coerce_text(payload.get("reason")),
-        "client_name": role_config.client,
-        "model_name": role_config.model,
-        "stage": stage,
     }
     if cache is not None:
         cache.set(cache_key, result)
     return result
+
+
+def _decide_alias(client: Any, model_name: str, entity_a: dict[str, Any], entity_b: dict[str, Any]) -> tuple[float | None, str]:
+    state = {
+        "entity_a": {field: entity_a[field] for field in DECISION_STATE_FIELDS},
+        "entity_b": {field: entity_b[field] for field in DECISION_STATE_FIELDS},
+    }
+    try:
+        answers = request_decisions(client, model_name=model_name, state=state, questions=DECISION_QUESTION)
+    except Exception as exc:
+        return None, f"{type(exc).__name__}: {exc}"
+    probability = (answers.get("same") or {}).get("noul")
+    if not isinstance(probability, (int, float)) or isinstance(probability, bool):
+        return None, "Decision model returned no probability."
+    return max(0.0, min(float(probability), 1.0)), ""
 
 
 def judge_pair(
@@ -393,60 +435,18 @@ def judge_pair(
     entity_a: dict[str, Any],
     entity_b: dict[str, Any],
     primary_role_config: PromptRoleConfig | None = None,
-    secondary_role_config: PromptRoleConfig | None = None,
     cache: JsonDiskCache | None = None,
 ) -> dict[str, Any]:
-    primary_role = primary_role_config or resolve_prompt_role(
+    """Judge one pair with the single Tier 3 judge; ALIAS only at or above ALIAS_THRESHOLD."""
+    role = primary_role_config or resolve_prompt_role(
         None,
         TIER3_JUDGE_PRIMARY_ROLE,
-        default_client="genai",
+        default_client=PRIMARY_JUDGE_CLIENT,
         default_model=PRIMARY_JUDGE_MODEL,
     )
-    secondary_role = secondary_role_config or resolve_prompt_role(
-        None,
-        TIER3_JUDGE_SECONDARY_ROLE,
-        default_client="genai",
-        default_model=SECOND_STAGE_JUDGE_MODEL,
-    )
-    primary = _judge_once(
-        clients,
-        role_config=primary_role,
-        entity_a=entity_a,
-        entity_b=entity_b,
-        stage="primary",
-        cache=cache,
-    )
-    needs_second_stage = (
-        primary["status"] == "unresolved"
-        or primary["confidence"] < LOW_CONFIDENCE_THRESHOLD
-    )
-    if not needs_second_stage:
-        return {
-            **primary,
-            "used_second_stage": False,
-            "attempted_second_stage": False,
-        }
-
-    secondary = _judge_once(
-        clients,
-        role_config=secondary_role,
-        entity_a=entity_a,
-        entity_b=entity_b,
-        stage="second_stage",
-        cache=cache,
-    )
-    if secondary["status"] == "classified":
-        return {
-            **secondary,
-            "used_second_stage": True,
-            "attempted_second_stage": True,
-        }
-    return {
-        **primary,
-        "verdict": "DIFFERENT",
-        "used_second_stage": False,
-        "attempted_second_stage": True,
-    }
+    result = _judge_once(clients, role_config=role, entity_a=entity_a, entity_b=entity_b, stage="primary", cache=cache)
+    alias = result["status"] == "classified" and result["p_alias"] >= ALIAS_THRESHOLD
+    return {**result, "verdict": "ALIAS" if alias else "DIFFERENT"}
 
 
 def _call_judge_pair(
@@ -455,7 +455,6 @@ def _call_judge_pair(
     entity_b: dict[str, Any],
     *,
     primary_role_config: PromptRoleConfig,
-    secondary_role_config: PromptRoleConfig,
     cache: JsonDiskCache | None,
 ) -> dict[str, Any]:
     signature = inspect.signature(judge_pair)
@@ -464,8 +463,6 @@ def _call_judge_pair(
     kwargs: dict[str, Any] = {}
     if supports_kwargs or "primary_role_config" in supported_names:
         kwargs["primary_role_config"] = primary_role_config
-    if supports_kwargs or "secondary_role_config" in supported_names:
-        kwargs["secondary_role_config"] = secondary_role_config
     if cache is not None and (supports_kwargs or "cache" in supported_names):
         kwargs["cache"] = cache
     return judge_pair(clients, entity_a, entity_b, **kwargs)
@@ -613,17 +610,9 @@ def run(
         default_client=PRIMARY_JUDGE_CLIENT,
         default_model=PRIMARY_JUDGE_MODEL,
     )
-    secondary_judge_role_config = resolve_prompt_role(
-        llm_routing_config,
-        TIER3_JUDGE_SECONDARY_ROLE,
-        default_client=SECOND_STAGE_JUDGE_CLIENT,
-        default_model=SECOND_STAGE_JUDGE_MODEL,
-        default_reasoning_effort=SECOND_STAGE_JUDGE_REASONING_EFFORT,
-    )
     clients = build_single_prompt_clients(
         embedding_role_config.client,
         primary_judge_role_config.client,
-        secondary_judge_role_config.client,
     )
     driver = GraphDatabase.driver(neo4j_uri, auth=(neo4j_user, neo4j_password))
     judge_cache = JsonDiskCache(judge_cache_file)
@@ -649,10 +638,9 @@ def run(
                     "embed_model": embedding_role_config.model,
                     "judge_client_name_primary": primary_judge_role_config.client,
                     "judge_model_primary": primary_judge_role_config.model,
-                    "judge_client_name_second_stage": secondary_judge_role_config.client,
-                    "judge_model_second_stage": secondary_judge_role_config.model,
                     "params": {
                         "threshold": threshold,
+                        "alias_threshold": ALIAS_THRESHOLD,
                         "max_candidates": max_candidates,
                         "max_merges": max_merges,
                         "sleep_seconds": sleep_seconds,
@@ -671,8 +659,7 @@ def run(
                     "relations_added": 0,
                     "kept_separate": 0,
                     "judge_counts": {"ALIAS": 0, "DIFFERENT": 0},
-                    "second_stage_judgements": 0,
-                    "second_stage_attempts": 0,
+                    "digit_guard_blocked": [],
                     "merge_cap_hit": False,
                     "alias_acceptance_rate": 0.0,
                     "judge_cache_hits": judge_cache.hits,
@@ -770,8 +757,7 @@ def run(
             merged_count = 0
             kept_count = 0
             judged_pairs = 0
-            second_stage_judgements = 0
-            second_stage_attempts = 0
+            digit_guard_blocked: list[list[str]] = []
             merge_cap_hit = False
             merged_eids: set[str] = set()
             judge_counts = {"ALIAS": 0, "DIFFERENT": 0}
@@ -789,17 +775,16 @@ def run(
                     entity_a,
                     entity_b,
                     primary_role_config=primary_judge_role_config,
-                    secondary_role_config=secondary_judge_role_config,
                     cache=judge_cache,
                 )
                 judged_pairs += 1
-                if verdict.get("attempted_second_stage"):
-                    second_stage_attempts += 1
-                if verdict.get("used_second_stage"):
-                    second_stage_judgements += 1
                 judge_counts[verdict["verdict"]] = judge_counts.get(verdict["verdict"], 0) + 1
 
-                if verdict["verdict"] == "ALIAS":
+                if verdict["verdict"] == "ALIAS" and _names_differ_only_in_digits(entity_a["name"], entity_b["name"]):
+                    print(f"  [{similarity:.3f}] '{entity_a['name']}' vs '{entity_b['name']}' -> ALIAS (REFUSED, names differ only in digits)")
+                    digit_guard_blocked.append([entity_a["name"], entity_b["name"]])
+                    kept_count += 1
+                elif verdict["verdict"] == "ALIAS":
                     if merged_count >= max_merges:
                         print(
                             f"  [{similarity:.3f}] '{entity_a['name']}' vs '{entity_b['name']}' -> ALIAS "
@@ -810,7 +795,7 @@ def run(
                     else:
                         print(
                             f"  [{similarity:.3f}] '{entity_a['name']}' vs '{entity_b['name']}' -> ALIAS "
-                            f"(confidence={verdict['confidence']:.2f}, model={verdict['model_name']})"
+                            f"(p_alias={verdict['p_alias']:.2f}, model={verdict['model_name']})"
                         )
                         if not dry_run:
                             canonical_name = _canonical_name(entity_a["name"], entity_b["name"])
@@ -821,7 +806,7 @@ def run(
                 else:
                     print(
                         f"  [{similarity:.3f}] '{entity_a['name']}' vs '{entity_b['name']}' -> DIFFERENT "
-                        f"(confidence={verdict['confidence']:.2f}, model={verdict['model_name']})"
+                        f"(p_alias={verdict['p_alias']:.2f}, model={verdict['model_name']})"
                     )
                     kept_count += 1
 
@@ -836,10 +821,9 @@ def run(
                 "embed_model": embedding_role_config.model,
                 "judge_client_name_primary": primary_judge_role_config.client,
                 "judge_model_primary": primary_judge_role_config.model,
-                "judge_client_name_second_stage": secondary_judge_role_config.client,
-                "judge_model_second_stage": secondary_judge_role_config.model,
                 "params": {
                     "threshold": threshold,
+                    "alias_threshold": ALIAS_THRESHOLD,
                     "max_candidates": max_candidates,
                     "max_merges": max_merges,
                     "sleep_seconds": sleep_seconds,
@@ -858,8 +842,7 @@ def run(
                 "relations_added": 0,
                 "kept_separate": kept_count,
                 "judge_counts": judge_counts,
-                "second_stage_judgements": second_stage_judgements,
-                "second_stage_attempts": second_stage_attempts,
+                "digit_guard_blocked": digit_guard_blocked,
                 "merge_cap_hit": merge_cap_hit,
                 "alias_acceptance_rate": alias_acceptance_rate,
                 "judge_cache_hits": judge_cache.hits,

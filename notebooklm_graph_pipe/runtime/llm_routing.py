@@ -29,7 +29,6 @@ GRAPH_EXTRACTION_ROLE = "single_prompt.graph_extraction"
 EVALUATION_JUDGE_ROLE = "single_prompt.evaluation_judge"
 EVALUATION_QUESTION_ROLE = "single_prompt.evaluation_question_generation"
 TIER3_JUDGE_PRIMARY_ROLE = "single_prompt.tier3_judge_primary"
-TIER3_JUDGE_SECONDARY_ROLE = "single_prompt.tier3_judge_secondary"
 
 TIER3_EMBEDDING_ROLE = "embeddings.tier3"
 GRAPH_BUILD_EMBEDDING_ROLE = "embeddings.graph_build"

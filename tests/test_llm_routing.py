@@ -125,7 +125,7 @@ def test_resolve_prompt_role_accepts_subscription_client_effort(tmp_path: Path) 
         tmp_path,
         {
             "single_prompt": {
-                "tier3_judge_secondary": {
+                "tier2_secondary": {
                     "client": "codex",
                     "model": "gpt-5.6-luna",
                     "reasoning_effort": "medium",
@@ -136,7 +136,7 @@ def test_resolve_prompt_role_accepts_subscription_client_effort(tmp_path: Path) 
 
     resolved = routing.resolve_prompt_role(
         config_path,
-        routing.TIER3_JUDGE_SECONDARY_ROLE,
+        routing.TIER2_SECONDARY_ROLE,
         default_client="genai",
         default_model="gemini-3-flash-preview",
     )
