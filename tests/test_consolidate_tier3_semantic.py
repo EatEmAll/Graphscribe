@@ -6,25 +6,25 @@ import pytest
 import notebooklm_graph_pipe.consolidation.tier3_semantic as t3
 
 
-class _DummyResponse:
-    def __init__(self, text: str) -> None:
-        self.text = text
+class _DummyResponses:
+    """Stands in for an OpenRouter Responses client: one queued output per request."""
 
-
-class _DummyModels:
     def __init__(self, outputs):
         self._outputs = iter(outputs)
 
-    def generate_content(self, **kwargs):
+    def create(self, **kwargs):
         output = next(self._outputs)
         if isinstance(output, Exception):
             raise output
-        return _DummyResponse(output)
+        return type("Response", (), {"output_text": output})()
 
 
 class _DummyClient:
     def __init__(self, outputs) -> None:
-        self.models = _DummyModels(outputs)
+        self.responses = _DummyResponses(outputs)
+
+
+PROMPT_ROLE = t3.PromptRoleConfig(client="openrouter_json", model="minimax/minimax-m3")
 
 
 def _entity(name: str, labels: list[str], taxonomy_neighbors: list[str] | None = None) -> dict:
@@ -45,20 +45,23 @@ def test_labels_are_clearly_incompatible() -> None:
     assert t3._labels_are_clearly_incompatible(["Metric"], ["Financial Metric"]) is False
     assert t3._labels_are_clearly_incompatible(["Concept"], ["Asset"]) is False
 
-def test_judge_pair_uses_second_stage_for_low_confidence(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(t3, "LOW_CONFIDENCE_THRESHOLD", 0.72)
+def test_judge_pair_merges_only_at_or_above_the_alias_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(t3, "ALIAS_THRESHOLD", 0.8)
     client = _DummyClient(
         [
-            json.dumps({"verdict": "ALIAS", "confidence": 0.21, "reason": "weak"}),
-            json.dumps({"verdict": "ALIAS", "confidence": 0.93, "reason": "strong"}),
+            json.dumps({"verdict": "ALIAS", "confidence": 0.79, "reason": "weak"}),
+            json.dumps({"verdict": "ALIAS", "confidence": 0.8, "reason": "strong"}),
+            json.dumps({"verdict": "DIFFERENT", "confidence": 0.1, "reason": "unsure"}),
         ]
     )
+    pairs = [("P&L", "Profit And Loss"), ("PnL", "Profit And Loss"), ("P/L", "Profit And Loss")]
 
-    result = t3.judge_pair(client, _entity("P&L", ["Financial Metric"]), _entity("Profit And Loss", ["Financial Metric"]))
+    results = [t3.judge_pair(client, _entity(a, ["Financial Metric"]), _entity(b, ["Financial Metric"]), primary_role_config=PROMPT_ROLE)
+               for a, b in pairs]
 
-    assert result["verdict"] == "ALIAS"
-    assert result["used_second_stage"] is True
-    assert result["model_name"] == t3.SECOND_STAGE_JUDGE_MODEL
+    assert [r["verdict"] for r in results] == ["DIFFERENT", "ALIAS", "ALIAS"]
+    assert results[2]["p_alias"] == pytest.approx(0.9)
+    assert all("used_second_stage" not in r for r in results)
 
 
 def test_judge_pair_retries_transient_primary_failure(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -71,25 +74,18 @@ def test_judge_pair_retries_transient_primary_failure(monkeypatch: pytest.Monkey
         ]
     )
 
-    result = t3.judge_pair(client, _entity("Leverage", ["Trading Concept"]), _entity("Liquidity", ["Trading Concept"]))
+    result = t3.judge_pair(client, _entity("Leverage", ["Trading Concept"]), _entity("Liquidity", ["Trading Concept"]), primary_role_config=PROMPT_ROLE)
 
     assert result["status"] == "classified"
     assert result["verdict"] == "DIFFERENT"
 
 
-def test_judge_pair_falls_back_to_primary_when_second_stage_is_invalid() -> None:
-    client = _DummyClient(
-        [
-            json.dumps({"verdict": "DIFFERENT", "confidence": 0.2, "reason": "weak primary"}),
-            "",
-        ]
-    )
+def test_judge_pair_keeps_an_unresolved_pair_separate() -> None:
+    client = _DummyClient([""] * 3)
 
-    result = t3.judge_pair(client, _entity("Leverage", ["Trading Concept"]), _entity("Liquidity", ["Trading Concept"]))
+    result = t3.judge_pair(client, _entity("Leverage", ["Trading Concept"]), _entity("Liquidity", ["Trading Concept"]), primary_role_config=PROMPT_ROLE)
 
-    assert result["verdict"] == "DIFFERENT"
-    assert result["used_second_stage"] is False
-    assert result["attempted_second_stage"] is True
+    assert (result["status"], result["verdict"], result["p_alias"]) == ("unresolved", "DIFFERENT", 0.0)
 
 
 def test_judge_pair_reuses_persistent_cache(tmp_path) -> None:
@@ -105,6 +101,7 @@ def test_judge_pair_reuses_persistent_cache(tmp_path) -> None:
         first_client,
         _entity("Leverage", ["Trading Concept"]),
         _entity("Liquidity", ["Trading Concept"]),
+        primary_role_config=PROMPT_ROLE,
         cache=cache,
     )
     cache.save()
@@ -114,12 +111,13 @@ def test_judge_pair_reuses_persistent_cache(tmp_path) -> None:
         second_client,
         _entity("Leverage", ["Trading Concept"]),
         _entity("Liquidity", ["Trading Concept"]),
+        primary_role_config=PROMPT_ROLE,
         cache=t3.JsonDiskCache(cache_path),
     )
 
     assert first["verdict"] == "DIFFERENT"
     assert second["verdict"] == "DIFFERENT"
-    assert second["confidence"] == pytest.approx(0.91)
+    assert second["p_alias"] == pytest.approx(0.09)
 
 
 def test_should_skip_pair_skips_existing_taxonomy_or_incompatible_labels() -> None:
@@ -158,15 +156,19 @@ def test_run_merges_aliases_and_never_adds_relations(monkeypatch: pytest.MonkeyP
             _entity("P&L", ["Financial Metric"]),
             _entity("Profit And Loss", ["Financial Metric"]),
             _entity("AAPL", ["Asset"]),
+            _entity("AR(1) Model", ["Model"]),
+            _entity("AR(2) Model", ["Model"]),
         ],
     )
     monkeypatch.setattr(
         t3,
         "embed_batch",
         lambda client, texts, cache_file: [
-            np.array([1.0, 0.0]),
-            np.array([0.99, 0.01]),
-            np.array([0.0, 1.0]),
+            np.array([1.0, 0.0, 0.0]),
+            np.array([0.99, 0.01, 0.0]),
+            np.array([0.0, 1.0, 0.0]),
+            np.array([0.0, 0.0, 1.0]),
+            np.array([0.0, 0.01, 0.99]),
         ],
     )
     monkeypatch.setattr(
@@ -174,13 +176,11 @@ def test_run_merges_aliases_and_never_adds_relations(monkeypatch: pytest.MonkeyP
         "judge_pair",
         lambda client, entity_a, entity_b, cache=None: {
             "status": "classified",
-            "verdict": "ALIAS" if {"P&L", "Profit And Loss"} == {entity_a["name"], entity_b["name"]} else "DIFFERENT",
-            "confidence": 0.95,
+            "verdict": "ALIAS" if {entity_a["name"], entity_b["name"]} in ({"P&L", "Profit And Loss"}, {"AR(1) Model", "AR(2) Model"}) else "DIFFERENT",
+            "p_alias": 0.95,
             "reason": "test",
             "model_name": t3.PRIMARY_JUDGE_MODEL,
             "stage": "primary",
-            "used_second_stage": False,
-            "attempted_second_stage": False,
         },
     )
     monkeypatch.setattr(t3, "merge_pair", lambda session, eid_a, eid_b, canonical_name: merges.append((eid_a, eid_b, canonical_name)))
@@ -201,9 +201,9 @@ def test_run_merges_aliases_and_never_adds_relations(monkeypatch: pytest.MonkeyP
 
     assert summary["confirmed_merges"] == 1
     assert summary["relations_added"] == 0
-    assert summary["judge_counts"]["ALIAS"] == 1
-    assert summary["second_stage_attempts"] == 0
-    assert merges and merges[0][2] == "P&L"
+    assert summary["judge_counts"]["ALIAS"] == 2
+    assert summary["digit_guard_blocked"] == [["AR(1) Model", "AR(2) Model"]]
+    assert merges == [("eid-P&L", "eid-Profit And Loss", "P&L")]
 
 
 class _EmbedRecorder:
@@ -247,7 +247,7 @@ def test_run_defaults_route_gemini_embeddings_and_the_openrouter_primary_judge(m
                      neo4j_uri="bolt://127.0.0.1:1", neo4j_password="unused")
 
     assert (summary["embed_client_name"], summary["embed_model"]) == ("genai", "gemini-embedding-2")
-    assert (summary["judge_client_name_primary"], summary["judge_model_primary"]) == ("openrouter_json", "minimax/minimax-m3")
+    assert (summary["judge_client_name_primary"], summary["judge_model_primary"]) == ("openrouter_decisions", "typesafe/jev-1.13")
 
 
 class _ResponsesRecorder:
@@ -261,16 +261,62 @@ class _ResponsesRecorder:
         return type("Response", (), {"output_text": self._text})()
 
 
-def test_primary_judge_requests_json_with_room_for_reasoning() -> None:
+def test_prompt_model_judge_requests_json_with_room_for_reasoning() -> None:
     client = _ResponsesRecorder(json.dumps({"verdict": "ALIAS", "confidence": 0.9, "reason": "same"}))
-    role = t3.PromptRoleConfig(client=t3.PRIMARY_JUDGE_CLIENT, model=t3.PRIMARY_JUDGE_MODEL)
+    role = t3.PromptRoleConfig(client="openrouter_json", model="minimax/minimax-m3")
 
     result = t3._judge_once({role.client: client}, role_config=role, entity_a=_entity("P&L", ["Financial Metric"]),
                             entity_b=_entity("Profit And Loss", ["Financial Metric"]))
 
     assert result["status"] == "classified"
-    assert (role.client, role.model) == ("openrouter_json", "minimax/minimax-m3")
     request = client.calls[0]
     assert request["max_output_tokens"] == 2048
     assert request["text"] == {"format": {"type": "json_object"}}
     assert request["extra_body"] == {"provider": {"data_collection": "deny"}}
+
+
+def test_names_differ_only_in_digits() -> None:
+    assert t3._names_differ_only_in_digits("AR(1)", "AR(2)") is True
+    assert t3._names_differ_only_in_digits("Iron Man", "Iron Man 3") is True
+    assert t3._names_differ_only_in_digits("S&P 500", "SP500") is False
+    assert t3._names_differ_only_in_digits("Add Objective Method", "add_objective_method") is False
+
+
+def test_decision_judge_sends_the_pair_and_reads_the_alias_probability(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict] = []
+
+    def fake_request(client, *, model_name, state, questions):
+        calls.append({"model": model_name, "state": state, "questions": questions})
+        return {"same": {"noul": 0.97}}
+
+    monkeypatch.setattr(t3, "request_decisions", fake_request)
+    role = t3.PromptRoleConfig(client="openrouter_decisions", model="liquid/d1")
+
+    result = t3._judge_once({"openrouter_decisions": object()}, role_config=role, entity_a=_entity("P&L", ["Financial Metric"]),
+                            entity_b=_entity("Profit And Loss", ["Financial Metric"]))
+
+    assert (result["status"], result["p_alias"]) == ("classified", 0.97)
+    assert calls[0]["questions"] == t3.DECISION_QUESTION
+    assert list(calls[0]["state"]["entity_a"]) == list(t3.DECISION_STATE_FIELDS)
+    assert calls[0]["state"]["entity_a"]["name"] == "P&L"
+
+
+def test_decision_judge_without_a_probability_is_unresolved(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(t3, "request_decisions", lambda client, **kwargs: {"same": {}})
+    role = t3.PromptRoleConfig(client="openrouter_decisions", model="liquid/d1")
+
+    result = t3.judge_pair({"openrouter_decisions": object()}, _entity("A", ["Model"]), _entity("B", ["Model"]), primary_role_config=role)
+
+    assert (result["status"], result["verdict"]) == ("unresolved", "DIFFERENT")
+
+
+def test_default_judge_merges_at_the_calibrated_jev_threshold(monkeypatch: pytest.MonkeyPatch) -> None:
+    probabilities = iter([0.65, 0.64])
+    monkeypatch.setattr(t3, "request_decisions", lambda client, **kwargs: {"same": {"noul": next(probabilities)}})
+    clients = {"openrouter_decisions": object()}
+
+    verdicts = [t3.judge_pair(clients, _entity("P&L", ["Financial Metric"]), _entity("Profit And Loss", ["Financial Metric"]))["verdict"]
+                for _ in range(2)]
+
+    assert (t3.PRIMARY_JUDGE_CLIENT, t3.PRIMARY_JUDGE_MODEL, t3.ALIAS_THRESHOLD) == ("openrouter_decisions", "typesafe/jev-1.13", 0.65)
+    assert verdicts == ["ALIAS", "DIFFERENT"]

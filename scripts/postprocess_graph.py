@@ -29,7 +29,6 @@ from notebooklm_graph_pipe.runtime.llm_routing import (
     TIER2_SECONDARY_ROLE,
     TIER3_EMBEDDING_ROLE,
     TIER3_JUDGE_PRIMARY_ROLE,
-    TIER3_JUDGE_SECONDARY_ROLE,
     missing_required_env_vars,
     resolve_agent_role,
     resolve_embedding_role,
@@ -116,8 +115,7 @@ def _required_consolidation_api_envs(config: ConsolidationConfig) -> list[str]:
         resolve_prompt_role(config.llm_routing_config, TIER2_SECONDARY_ROLE, default_client="codex", default_model="gpt-5.6-luna", default_reasoning_effort="low"),
         resolve_prompt_role(config.llm_routing_config, TAXONOMY_PRIMARY_ROLE, default_client="openrouter", default_model="minimax/minimax-m3"),
         resolve_prompt_role(config.llm_routing_config, TAXONOMY_SECONDARY_ROLE, default_client="genai", default_model="gemini-3.1-pro-preview"),
-        resolve_prompt_role(config.llm_routing_config, TIER3_JUDGE_PRIMARY_ROLE, default_client="openrouter_json", default_model="minimax/minimax-m3"),
-        resolve_prompt_role(config.llm_routing_config, TIER3_JUDGE_SECONDARY_ROLE, default_client="codex", default_model="gpt-5.6-luna", default_reasoning_effort="medium"),
+        resolve_prompt_role(config.llm_routing_config, TIER3_JUDGE_PRIMARY_ROLE, default_client="openrouter_decisions", default_model="typesafe/jev-1.13"),
     ]
     embedding_role = resolve_embedding_role(
         config.llm_routing_config,

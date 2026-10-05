@@ -188,8 +188,7 @@ def test_preflight_consolidation_uses_routed_agent_executables(monkeypatch, tmp_
             "tier2_secondary": {"client": "openai", "model": "gpt-5.4"},
             "taxonomy_primary": {"client": "openai", "model": "gpt-5.4-mini"},
             "taxonomy_secondary": {"client": "openai", "model": "gpt-5.4"},
-            "tier3_judge_primary": {"client": "openai", "model": "gpt-5.4-mini"},
-            "tier3_judge_secondary": {"client": "openai", "model": "gpt-5.4"}
+            "tier3_judge_primary": {"client": "openai", "model": "gpt-5.4-mini"}
           },
           "embeddings": {
             "tier3": {"client": "openai", "model": "text-embedding-3-small"}
