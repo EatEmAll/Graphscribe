@@ -247,4 +247,30 @@ def test_run_defaults_route_gemini_embeddings_and_the_openrouter_primary_judge(m
                      neo4j_uri="bolt://127.0.0.1:1", neo4j_password="unused")
 
     assert (summary["embed_client_name"], summary["embed_model"]) == ("genai", "gemini-embedding-2")
-    assert (summary["judge_client_name_primary"], summary["judge_model_primary"]) == ("openrouter", "minimax/minimax-m3")
+    assert (summary["judge_client_name_primary"], summary["judge_model_primary"]) == ("openrouter_json", "minimax/minimax-m3")
+
+
+class _ResponsesRecorder:
+    def __init__(self, text: str) -> None:
+        self.calls: list[dict] = []
+        self.responses = self
+        self._text = text
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return type("Response", (), {"output_text": self._text})()
+
+
+def test_primary_judge_requests_json_with_room_for_reasoning() -> None:
+    client = _ResponsesRecorder(json.dumps({"verdict": "ALIAS", "confidence": 0.9, "reason": "same"}))
+    role = t3.PromptRoleConfig(client=t3.PRIMARY_JUDGE_CLIENT, model=t3.PRIMARY_JUDGE_MODEL)
+
+    result = t3._judge_once({role.client: client}, role_config=role, entity_a=_entity("P&L", ["Financial Metric"]),
+                            entity_b=_entity("Profit And Loss", ["Financial Metric"]))
+
+    assert result["status"] == "classified"
+    assert (role.client, role.model) == ("openrouter_json", "minimax/minimax-m3")
+    request = client.calls[0]
+    assert request["max_output_tokens"] == 2048
+    assert request["text"] == {"format": {"type": "json_object"}}
+    assert request["extra_body"] == {"provider": {"data_collection": "deny"}}

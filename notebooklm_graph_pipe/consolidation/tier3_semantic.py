@@ -40,7 +40,7 @@ DEFAULT_NEO4J_DATABASE = os.environ.get("NEO4J_DATABASE", "neo4j")
 
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 EMBED_MODEL = os.environ.get("TIER3_EMBED_MODEL", "gemini-embedding-2")
-PRIMARY_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_PRIMARY", "openrouter")
+PRIMARY_JUDGE_CLIENT = os.environ.get("TIER3_JUDGE_CLIENT_PRIMARY", "openrouter_json")
 PRIMARY_JUDGE_MODEL = os.environ.get(
     "TIER3_JUDGE_MODEL_PRIMARY",
     os.environ.get("TIER3_JUDGE_MODEL", "minimax/minimax-m3"),
@@ -52,6 +52,9 @@ LOW_CONFIDENCE_THRESHOLD = float(os.environ.get("TIER3_LOW_CONFIDENCE_THRESHOLD"
 MODEL_MAX_ATTEMPTS = int(os.environ.get("TIER3_MODEL_MAX_ATTEMPTS", "3"))
 MODEL_RETRY_SLEEP_SECONDS = float(os.environ.get("TIER3_MODEL_RETRY_SLEEP_SECONDS", "1.0"))
 NEIGHBORS_PER_ENTITY = int(os.environ.get("TIER3_NEIGHBORS_PER_ENTITY", "12"))
+# Reasoning models spend their output budget on reasoning before the JSON verdict; at 120 tokens
+# minimax-m3 left most pairs unresolved (Graphscribe#19).
+JUDGE_MAX_OUTPUT_TOKENS = 2048
 
 DEFAULT_THRESHOLD = 0.85
 DEFAULT_EMBED_PROGRESS_EVERY = 100
@@ -312,7 +315,7 @@ def _build_judge_cache_key(
             "entity_a": entity_a,
             "entity_b": entity_b,
             "temperature": 0.0,
-            "max_output_tokens": 120,
+            "max_output_tokens": JUDGE_MAX_OUTPUT_TOKENS,
         },
     )
 
@@ -351,7 +354,7 @@ def _judge_once(
         reasoning_effort=role_config.reasoning_effort,
         prompt=_build_prompt(normalized_a, normalized_b),
         system_instruction=JUDGE_SYSTEM,
-        max_output_tokens=120,
+        max_output_tokens=JUDGE_MAX_OUTPUT_TOKENS,
         temperature=0.0,
         max_attempts=max(MODEL_MAX_ATTEMPTS, 1),
         retry_sleep_seconds=MODEL_RETRY_SLEEP_SECONDS,
