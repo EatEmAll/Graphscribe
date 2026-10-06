@@ -234,6 +234,41 @@ class CorpusService:
             for source_key, source in sorted(entry.manifest.sources.items())
         ]
 
+    def list_sources(
+        self,
+        key: str,
+        *,
+        query: str | None = None,
+        offset: int = 0,
+        limit: int = 50,
+    ) -> dict[str, Any]:
+        """Return one page of active sources with titles, optionally filtered by a substring."""
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100.")
+        if offset < 0:
+            raise ValueError("offset cannot be negative.")
+        entry = self.registry.get(key)
+        sources = sorted(entry.manifest.sources.items())
+        titles = self.runtimes.get(entry).backend.document_titles([source.document_id for _, source in sources])
+        rows = [
+            {
+                "source_key": source_key,
+                "document_id": source.document_id,
+                "title": titles.get(source.document_id, {}).get("title", ""),
+                "source_uri": titles.get(source.document_id, {}).get("source_uri", ""),
+                "status": source.status,
+            }
+            for source_key, source in sources
+        ]
+        needle = (query or "").strip().casefold()
+        if needle:
+            rows = [
+                row
+                for row in rows
+                if any(needle in row[field].casefold() for field in ("title", "source_uri", "source_key", "document_id"))
+            ]
+        return {"total": len(rows), "offset": offset, "limit": limit, "sources": rows[offset : offset + limit]}
+
     def get_document(self, key: str, document_id: str) -> dict[str, Any]:
         documents = self.list_documents(key)
         for document in documents:

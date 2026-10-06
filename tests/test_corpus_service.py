@@ -396,3 +396,58 @@ def test_staged_measurement_requires_write_authority_and_bounded_questions() -> 
     assert response.json()["questions"] == [
         {"question_id": "Q1", "text": "What changed?", "category": "general"}
     ]
+
+
+def _titled_service(titles):
+    manifest = CorpusManifest(
+        corpus_id("demo"),
+        "demo",
+        "Demo",
+        {"uri": "bolt://test"},
+        sources={
+            f"documents/{name}.md": SourceManifestEntry(name, f"rev-{name}", "sum", "markdown", "1")
+            for name in ("doc-a", "doc-b", "doc-c")
+        },
+    )
+    requested = []
+
+    class Backend:
+        def document_titles(self, document_ids):
+            requested.append(list(document_ids))
+            return {key: value for key, value in titles.items() if key in document_ids}
+
+    registry = SimpleNamespace(get=lambda key: SimpleNamespace(manifest=manifest))
+    runtimes = SimpleNamespace(get=lambda entry: SimpleNamespace(backend=Backend()))
+    return CorpusService(registry, runtimes, SimpleNamespace()), requested
+
+
+def test_source_list_returns_titles_and_filters_and_pages() -> None:
+    service, requested = _titled_service({
+        "doc-a": {"title": "Time-Series Momentum", "source_uri": "https://example.org/tsmom.pdf"},
+        "doc-b": {"title": "Post-Earnings Announcement Drift", "source_uri": "https://example.org/pead"},
+    })
+
+    page = service.list_sources("demo", limit=2)
+    assert page["total"] == 3 and page["offset"] == 0 and page["limit"] == 2
+    assert page["sources"] == [
+        {"source_key": "documents/doc-a.md", "document_id": "doc-a", "title": "Time-Series Momentum",
+         "source_uri": "https://example.org/tsmom.pdf", "status": "ready"},
+        {"source_key": "documents/doc-b.md", "document_id": "doc-b",
+         "title": "Post-Earnings Announcement Drift", "source_uri": "https://example.org/pead", "status": "ready"},
+    ]
+    assert requested[0] == ["doc-a", "doc-b", "doc-c"]
+    assert service.list_sources("demo", offset=2)["sources"][0] == {
+        "source_key": "documents/doc-c.md", "document_id": "doc-c", "title": "", "source_uri": "",
+        "status": "ready",
+    }
+    matched = service.list_sources("demo", query="earnings ANNOUNCEMENT")
+    assert matched["total"] == 1 and [row["document_id"] for row in matched["sources"]] == ["doc-b"]
+    assert service.list_sources("demo", query="tsmom.pdf")["sources"][0]["document_id"] == "doc-a"
+    assert service.list_sources("demo", query="absent")["sources"] == []
+
+
+@pytest.mark.parametrize("arguments", [{"limit": 0}, {"limit": 101}, {"offset": -1}])
+def test_source_list_rejects_out_of_range_paging(arguments) -> None:
+    service, _ = _titled_service({})
+    with pytest.raises(ValueError):
+        service.list_sources("demo", **arguments)

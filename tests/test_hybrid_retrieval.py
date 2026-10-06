@@ -159,6 +159,81 @@ def test_lexical_backend_does_not_collide_with_driver_query_argument() -> None:
     assert "query" not in calls[0][1]
 
 
+LUCENE_SPECIALS = set('+-&|!(){}[]^"~*?:\\/')
+
+
+def _unescaped_lucene_syntax(text: str) -> list[str]:
+    """Return query-syntax characters and bare operators that Lucene's classic parser would interpret."""
+    found: list[str] = []
+    escaped = False
+    for character in text:
+        if escaped:
+            escaped = False
+        elif character == "\\":
+            escaped = True
+        elif character in LUCENE_SPECIALS:
+            found.append(character)
+    found.extend(word for word in text.split() if word in {"AND", "OR", "NOT"})
+    return found
+
+
+def _recording_driver(calls, rows=()):
+    class Result(list):
+        def single(self):
+            return {"count": 0}
+
+    class Session:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def run(self, query, **parameters):
+            calls.append((query, parameters))
+            return Result(rows)
+
+    class Driver:
+        def session(self, **kwargs):
+            return Session()
+
+    return Driver()
+
+
+@pytest.mark.parametrize(
+    "question",
+    [
+        "Does momentum/reversal survive costs?",
+        "What is the 1:12 horizon?",
+        'What is "time-series momentum?',
+        "Which factors (value, size work?",
+        "Is AND OR NOT a strategy? -drift +carry ~fuzzy* [2020 TO 2021] {x} ^2 && || ! \\",
+    ],
+)
+def test_lexical_backend_neutralizes_lucene_query_syntax(question: str) -> None:
+    calls = []
+    backend = Neo4jRetrievalBackend(_recording_driver(calls), "neo4j", "corpus-id")
+
+    backend.lexical_search(question, 5)
+    backend.search_community_reports(question, [1.0, 0.0], limit=1)
+
+    lexical_text = calls[0][1]["search_text"]
+    community_text = next(
+        parameters["search_text"] for query, parameters in calls if "community_report_keyword_v1" in query
+    )
+    for text in (lexical_text, community_text):
+        assert _unescaped_lucene_syntax(text) == []
+        assert {"momentum", "horizon", "factors", "strategy"} & set(text.lower().replace("\\", " ").split())
+
+
+def test_lexical_backend_skips_queries_without_searchable_terms() -> None:
+    calls = []
+    backend = Neo4jRetrievalBackend(_recording_driver(calls), "neo4j", "corpus-id")
+
+    assert backend.lexical_search('?? :: "" ()', 5) == []
+    assert calls == []
+
+
 def test_vector_backend_widens_global_query_until_corpus_results_are_found() -> None:
     query_limits = []
 
@@ -389,3 +464,14 @@ def test_cross_encoder_reranker_loads_the_pinned_id_and_revision(monkeypatch: py
     CrossEncoderReranker().model
 
     assert loaded == [("cross-encoder/ms-marco-MiniLM-L6-v2", "233902d25c440f23af6f7d6e94d2946bac0bee0a")]
+
+
+def test_document_titles_reads_only_this_corpus_documents() -> None:
+    calls = []
+    rows = [{"document_id": "doc-a", "title": "Alpha", "source_uri": "a.md"}]
+    titles = Neo4jRetrievalBackend(_recording_driver(calls, rows), "neo4j", "corpus-id").document_titles(["doc-a"])
+
+    assert titles == {"doc-a": {"title": "Alpha", "source_uri": "a.md"}}
+    query, parameters = calls[0]
+    assert "Corpus {id: $corpus_id}" in query and "HAS_DOCUMENT" in query
+    assert parameters == {"corpus_id": "corpus-id", "document_ids": ["doc-a"]}

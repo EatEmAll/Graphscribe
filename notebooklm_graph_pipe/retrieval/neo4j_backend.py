@@ -5,6 +5,23 @@ from typing import Any, Sequence
 
 from .models import Candidate
 
+_LUCENE_SPECIAL = re.compile(r'([+\-&|!(){}\[\]^"~*?:\\/])')
+_LUCENE_OPERATOR = re.compile(r"\b(AND|OR|NOT)\b")
+
+
+def lucene_query_text(text: str) -> str:
+    """Return ``text`` as literal fulltext search terms for Lucene's classic query parser.
+
+    Natural-language questions often contain query syntax (``/``, ``:``, quotes, parentheses).
+    Escaping every special character and lowercasing the uppercase boolean operators makes
+    the parser treat them as plain text, so a question can never fail the whole call.
+    Returns an empty string when no searchable term remains.
+    """
+    if not re.search(r"\w", text):
+        return ""
+    escaped = _LUCENE_SPECIAL.sub(r"\\\1", text)
+    return _LUCENE_OPERATOR.sub(lambda match: match.group(1).lower(), escaped)
+
 
 class Neo4jRetrievalBackend:
     def __init__(
@@ -189,6 +206,9 @@ class Neo4jRetrievalBackend:
                 query_limit = min(total_indexed, query_limit * 4)
 
     def lexical_search(self, query: str, limit: int, filters: dict[str, Any] | None = None) -> list[Candidate]:
+        search_text = lucene_query_text(query)
+        if not search_text:
+            return []
         filter_values = self._filters(filters)
         retrieval_match = self._retrieval_match()
         projection = self._candidate_projection()
@@ -210,7 +230,7 @@ class Neo4jRetrievalBackend:
                         ORDER BY score DESC
                         LIMIT $limit
                         """,
-                        search_text=query,
+                        search_text=search_text,
                         query_limit=query_limit,
                         limit=limit,
                         corpus_id=self.corpus_id,
@@ -373,6 +393,26 @@ class Neo4jRetrievalBackend:
             )
             return {str(row["parent_id"]): dict(row) for row in rows}
 
+    def document_titles(self, document_ids: Sequence[str]) -> dict[str, dict[str, str]]:
+        """Map each of this corpus's named documents to its title and source URI."""
+        with self._session() as session:
+            rows = session.run(
+                """
+                MATCH (:Corpus {id: $corpus_id})-[:HAS_DOCUMENT]->(document:Document)
+                WHERE document.id IN $document_ids
+                RETURN document.id AS document_id, document.title AS title, document.source_uri AS source_uri
+                """,
+                corpus_id=self.corpus_id,
+                document_ids=list(document_ids),
+            )
+            return {
+                str(row["document_id"]): {
+                    "title": str(row["title"] or ""),
+                    "source_uri": str(row["source_uri"] or ""),
+                }
+                for row in rows
+            }
+
     def community_reports(self, limit: int = 200) -> list[dict[str, Any]]:
         if not 1 <= limit <= 1000:
             raise ValueError("Community report limit must be between 1 and 1000.")
@@ -409,6 +449,10 @@ class Neo4jRetrievalBackend:
     ) -> list[dict[str, Any]]:
         if not 1 <= limit <= 50:
             raise ValueError("Community report search limit must be between 1 and 50.")
+        search_text = lucene_query_text(query)
+        if not search_text:
+            # Keep the vector channel; this escaped token analyzes to no terms and matches nothing.
+            search_text = "\\?"
         with self._session() as session:
             overfetch = max(limit * 4, limit)
             total_indexed: int | None = None
@@ -423,7 +467,7 @@ class Neo4jRetrievalBackend:
                             RETURN report, score, 'vector' AS channel
                             UNION ALL
                             CALL db.index.fulltext.queryNodes(
-                                'community_report_keyword_v1', $query, {limit: $overfetch}
+                                'community_report_keyword_v1', $search_text, {limit: $overfetch}
                             ) YIELD node AS report, score
                             RETURN report, score, 'lexical' AS channel
                         }
@@ -444,7 +488,7 @@ class Neo4jRetrievalBackend:
                         LIMIT $limit
                         """,
                         corpus_id=self.corpus_id,
-                        query=query,
+                        search_text=search_text,
                         embedding=list(embedding),
                         overfetch=overfetch,
                         limit=limit,

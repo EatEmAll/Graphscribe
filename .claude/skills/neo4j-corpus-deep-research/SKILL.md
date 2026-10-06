@@ -9,7 +9,7 @@ Treat `corpus_answer` as the high-context, cited reader and `graph_neighbors` or
 
 ## Workflow
 
-1. Select the requested corpus with `corpus_list` and state its key.
+1. Select the requested corpus with `corpus_list` and state its key. Check whether a titled source is present with `source_list` and a title fragment as `query`, not `corpus_get`.
 2. Ask `corpus_answer` for a direct cited answer and 5-10 concrete entities, aliases, related subtopics, ambiguities, and overly generic seeds.
 3. Keep specific, source-supported seeds; drop generic hubs.
 4. Expand promising seeds by one graph hop. Use two hops only when the first hop remains relevant and bounded.
@@ -21,6 +21,7 @@ Treat `corpus_answer` as the high-context, cited reader and `graph_neighbors` or
 
 - A graph relationship is a discovery lead, not sufficient evidence by itself.
 - Claims in the final answer require citations returned by `corpus_answer` or `corpus_search`.
+- `corpus_search` passages are cut to `max_passage_chars` (default 2000); raise it with a smaller `top_k` to read a few passages in full.
 - Distinguish graph-discovered hypotheses from source-supported conclusions.
 - Never write to Neo4j unless the user explicitly asks.
 

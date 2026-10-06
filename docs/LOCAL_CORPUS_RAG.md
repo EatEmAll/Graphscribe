@@ -127,6 +127,13 @@ Candidates carry `rrf_score`, `reranker_score`, and per-channel `channel_ranks` 
 
 The stdio MCP exposes `corpus_list`, `corpus_get`, `corpus_search`, `corpus_answer`, `source_list`, `source_get`, `graph_neighbors`, and `sync_status`.
 
+The MCP tools are shaped for agent clients with a 25K-token tool-result limit; each tool description states its payload size and recommended call pattern.
+
+- Lexical retrieval escapes Lucene query syntax, so any natural-language question is searched literally. A question with no searchable term skips the lexical channel instead of failing.
+- `corpus_search` returns each passage's text once, in `results[].text`, bounded by `max_passage_chars` (default 2000) and `max_total_chars` across all results (default 24000). `text_chars` and `text_truncated` report each cut and `omitted_results` counts results dropped by the total bound; `contexts` carry citation metadata without text. A default call returns about 40K characters, roughly 15K tokens. The REST `/search` response is unchanged and still carries full passage and context text.
+- `source_list` returns one page (`offset`, `limit` up to 100, default 50) of `source_key`, `document_id`, `title`, `source_uri`, and `status`, with the total matching count. `query` keeps sources whose title, source URI, source key, or document id contains it, ignoring case, so a client can check whether a titled source is present with one small call.
+- Start with `corpus_answer` for a cited answer, read supporting passages with a focused `corpus_search`, and explore entities with `graph_neighbors`. `corpus_get` returns the whole manifest, which grows with the corpus.
+
 ## Evaluation
 
 Compare vector/full-text retrieval against graph-enhanced retrieval with a fixed question set:
